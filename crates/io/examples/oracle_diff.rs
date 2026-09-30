@@ -88,10 +88,10 @@ fn main() {
             }
         }
         for rec in file.layers() {
-            if let Some(b) = rec.block(b"lfx2").or(rec.block(b"lmfx")) {
-                if let Ok((vd, _)) = photocraft_psd::descriptor::VersionedDescriptor::parse_prefix(&b.data[4..]) {
-                    walk(&vd.descriptor, 1);
-                }
+            if let Some(b) = rec.block(b"lfx2").or(rec.block(b"lmfx"))
+                && let Ok((vd, _)) = photocraft_psd::descriptor::VersionedDescriptor::parse_prefix(&b.data[4..])
+            {
+                walk(&vd.descriptor, 1);
             }
         }
     }

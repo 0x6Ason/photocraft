@@ -455,7 +455,8 @@ fn composite_layer(layer: &Layer, clipped: &[Layer], backdrop: &mut Buffer, cx: 
         for c in clipped.iter().filter(|c| c.visible) {
             composite_atop(c, &mut content, cx);
         }
-        effects::composite_with_effects(layer, &content, backdrop, &cx.light, layer_bounds(layer, cx.canvas));
+        let maps = effect_maps(layer, cx);
+        effects::composite_with_effects(layer, &content, backdrop, &maps, layer_bounds(layer, cx.canvas));
         return;
     }
     if let Some((mut content, stroke)) = shape_parts(layer, clipped, rect, cx) {
@@ -497,6 +498,121 @@ fn shape_parts(layer: &Layer, clipped: &[Layer], rect: Rect, cx: &Ctx) -> Option
     Some((f, s))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Layer-effect map cache
+
+/// Order-independent identity of a layer's pixels, masks, effects and (for groups) children.
+/// Pixels are identified by their copy-on-write tile pointers; cache entries pin a clone of the
+/// layer so those tiles (and their addresses) stay alive while the entry exists.
+fn layer_identity(layer: &Layer, h: &mut std::collections::hash_map::DefaultHasher) {
+    use std::hash::{Hash, Hasher};
+    fn surface_fp(s: &Surface) -> u64 {
+        s.tiles().fold(s.tile_count() as u64, |acc, (c, t)| {
+            let mut x = (std::sync::Arc::as_ptr(t) as usize as u64) ^ ((c.tx as u64) << 40) ^ ((c.ty as u32 as u64) << 8);
+            x = x.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            acc.wrapping_add(x ^ (x >> 29))
+        })
+    }
+    layer.id.0.hash(h);
+    layer.visible.hash(h);
+    layer.opacity.to_bits().hash(h);
+    layer.fill_opacity.to_bits().hash(h);
+    match &layer.content {
+        LayerContent::Group(g) => {
+            for c in &g.children {
+                layer_identity(c, h);
+            }
+        }
+        LayerContent::Fill(f) => format!("{f:?}").hash(h),
+        LayerContent::Adjustment(a) => format!("{a:?}").hash(h),
+        _ => layer.surface().map_or(0, surface_fp).hash(h),
+    }
+    if let Some(m) = &layer.mask {
+        (surface_fp(&m.surface), m.enabled, m.density.to_bits(), m.feather.to_bits()).hash(h);
+    }
+    if let Some(vm) = &layer.vector_mask {
+        format!("{vm:?}").hash(h);
+    }
+    format!("{:?}", layer.effects).hash(h);
+    h.write_u8(0xfe);
+}
+
+struct FxEntry {
+    maps: std::sync::Arc<effects::FxMaps>,
+    _pin: Layer,
+    bytes: usize,
+}
+
+/// Global cache of effect maps (bounded by bytes). Tiles rendered in parallel share one build per
+/// layer state via a per-key `OnceLock`.
+type FxSlot = std::sync::Arc<std::sync::OnceLock<FxEntry>>;
+struct FxCache {
+    map: std::collections::HashMap<u64, FxSlot>,
+    order: std::collections::VecDeque<u64>,
+    bytes: usize,
+}
+
+const FX_CACHE_BUDGET: usize = 768 << 20;
+
+fn fx_cache() -> &'static std::sync::Mutex<FxCache> {
+    static C: std::sync::OnceLock<std::sync::Mutex<FxCache>> = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(FxCache { map: Default::default(), order: Default::default(), bytes: 0 }))
+}
+
+/// The layer's effect maps over its whole region (layer bounds grown by the effect reach, within
+/// the canvas grown likewise), built once per layer state and shared by every tile.
+fn effect_maps(layer: &Layer, cx: &Ctx) -> std::sync::Arc<effects::FxMaps> {
+    use std::hash::{Hash, Hasher};
+    let m = effects::margin(layer);
+    let region = layer_bounds(layer, cx.canvas).inflate(m).intersect(&cx.canvas.inflate(m));
+    if std::env::var_os("PHOTOCRAFT_FX_NOCACHE").is_some() {
+        let shape = render_content(layer, region, cx).map(|b| b.px.iter().map(|p| p[3]).collect()).unwrap_or_default();
+        return std::sync::Arc::new(effects::build_maps(layer, shape, region, &cx.light));
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    layer_identity(layer, &mut h);
+    (region.x0, region.y0, region.x1, region.y1).hash(&mut h);
+    (cx.light.angle.to_bits(), cx.light.altitude.to_bits()).hash(&mut h);
+    let key = h.finish();
+    let slot = {
+        let mut c = fx_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = c.map.get(&key) {
+            s.clone()
+        } else {
+            let s: FxSlot = Default::default();
+            c.map.insert(key, s.clone());
+            c.order.push_back(key);
+            s
+        }
+    };
+    let entry = slot.get_or_init(|| {
+        let shape: Vec<f32> = if region.is_empty() {
+            Vec::new()
+        } else {
+            render_content(layer, region, cx).map(|b| b.px.iter().map(|p| p[3]).collect()).unwrap_or_else(|| vec![0.0; region.width() as usize * region.height() as usize])
+        };
+        let maps = effects::build_maps(layer, shape, region, &cx.light);
+        let bytes = maps.bytes();
+        // Counted exactly once, when the entry is built.
+        fx_cache().lock().unwrap_or_else(|e| e.into_inner()).bytes += bytes;
+        FxEntry { maps: std::sync::Arc::new(maps), _pin: layer.clone(), bytes }
+    });
+    let maps = entry.maps.clone();
+    // Evict the oldest entries over budget (never the one just used).
+    let mut c = fx_cache().lock().unwrap_or_else(|e| e.into_inner());
+    while c.bytes > FX_CACHE_BUDGET && c.order.len() > 1 {
+        let Some(old) = c.order.pop_front() else { break };
+        if old == key {
+            c.order.push_back(old);
+            continue;
+        }
+        if let Some(s) = c.map.remove(&old) {
+            c.bytes = c.bytes.saturating_sub(s.get().map_or(0, |e| e.bytes));
+        }
+    }
+    maps
+}
+
 /// Composite `layer` onto `base` restricted to the base's alpha (clipping mask semantics).
 fn composite_atop(layer: &Layer, base: &mut Buffer, cx: &Ctx) {
     let rect = base.rect;
@@ -520,7 +636,8 @@ fn composite_atop(layer: &Layer, base: &mut Buffer, cx: &Ctx) {
         let big = rect.inflate(effects::margin(layer));
         let Some(content) = render_content(layer, big, cx) else { return };
         let mut opaque = Buffer { rect, px: base.px.iter().map(|p| [p[0], p[1], p[2], 1.0]).collect() };
-        effects::composite_with_effects(layer, &content, &mut opaque, &cx.light, layer_bounds(layer, cx.canvas));
+        let maps = effect_maps(layer, cx);
+        effects::composite_with_effects(layer, &content, &mut opaque, &maps, layer_bounds(layer, cx.canvas));
         for (p, o) in base.px.iter_mut().zip(&opaque.px) {
             if p[3] > 0.0 {
                 *p = [o[0], o[1], o[2], p[3]];

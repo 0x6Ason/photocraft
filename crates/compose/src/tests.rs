@@ -629,3 +629,28 @@ fn vector_mask_combines_with_pixel_mask() {
     assert!(close4(px(&d, 1, 1), [0.0, 0.0, 0.0, 1.0]));
     assert!(close4(px(&d, 6, 1), [1.0; 4]));
 }
+
+#[test]
+fn effect_maps_are_cached_and_invalidated_by_pixel_changes() {
+    let mut doc = doc_white(64, 64);
+    let mut l = solid_layer("fx", Rect::new(16, 16, 48, 48), [1.0, 0.0, 0.0, 1.0]);
+    l.effects.items.push(photocraft_doc::Effect::default_drop_shadow());
+    doc.layers.push(l);
+    let cx = Ctx { canvas: doc.bounds(), transfer: adjust::Transfer::Srgb, light: doc.global_light };
+    let a = effect_maps(&doc.layers[1], &cx);
+    let b = effect_maps(&doc.layers[1], &cx);
+    assert!(std::sync::Arc::ptr_eq(&a, &b), "second request hits the cache");
+    let first = flatten(&doc);
+    // Editing the layer's pixels changes its tiles, so the maps are rebuilt.
+    doc.layers[1].surface_mut().unwrap().fill_rect(Rect::new(8, 8, 20, 20), &[0.0, 0.0, 1.0, 1.0]);
+    let c = effect_maps(&doc.layers[1], &cx);
+    assert!(!std::sync::Arc::ptr_eq(&a, &c), "pixel edit invalidates");
+    // Cached rendering equals a fresh build (tiled and full renders agree too).
+    let again = flatten(&doc);
+    let region = doc.bounds();
+    let tiled = render_tiled(&doc, region, 16);
+    for (p, q) in again.px.iter().zip(&tiled.px) {
+        assert!(close4(*p, *q));
+    }
+    assert_ne!(first.px, again.px);
+}

@@ -3300,6 +3300,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "photocraft-cms"
+version = "0.1.0"
+dependencies = [
+ "moxcms",
+ "rayon",
+]
+
+[[package]]
 name = "photocraft-codecs"
 version = "0.1.0"
 dependencies = [

@@ -500,12 +500,109 @@ fn bevel_maps(shape: &Map, b: &Bevel, light: &GlobalLight) -> (Map, Map, bool) {
     (apply_contour(hi, &b.gloss_contour), apply_contour(sh, &b.gloss_contour), outer)
 }
 
+/// Effect maps derived from a layer's shape (its alpha), computed once over the layer's whole
+/// region and cropped per render tile. They depend only on the shape, the effect settings and the
+/// global light, never on the backdrop, so they can be cached across tiles and edits.
+pub struct FxMaps {
+    rect: Rect,
+    shape: Map,
+    /// Per enabled effect (in `items` order): the maps it paints through.
+    per: Vec<Vec<Map>>,
+    outer_bevel: Vec<bool>,
+    din: Option<Vec<f32>>,
+    dout: Option<Vec<f32>>,
+    /// Shape layers: distance outside the vector outline (from local coverage).
+    vdout: Option<Vec<f32>>,
+}
+
+impl FxMaps {
+    /// Approximate heap size (for cache budgeting).
+    pub fn bytes(&self) -> usize {
+        let n = self.shape.v.len();
+        let maps: usize = self.per.iter().map(Vec::len).sum();
+        (1 + maps + usize::from(self.din.is_some()) + usize::from(self.dout.is_some()) + usize::from(self.vdout.is_some())) * n * 4
+    }
+
+    fn crop_vec(&self, v: &[f32], to: Rect, fill: f32) -> Vec<f32> {
+        let (w, h) = (to.width() as usize, to.height() as usize);
+        let mut out = vec![fill; w * h];
+        let r = self.rect;
+        let inter = r.intersect(&to);
+        if inter.is_empty() {
+            return out;
+        }
+        let sw = r.width() as usize;
+        for y in inter.y0..inter.y1 {
+            let s0 = (y - r.y0) as usize * sw + (inter.x0 - r.x0) as usize;
+            let d0 = (y - to.y0) as usize * w + (inter.x0 - to.x0) as usize;
+            let n = inter.width() as usize;
+            out[d0..d0 + n].copy_from_slice(&v[s0..s0 + n]);
+        }
+        out
+    }
+
+    fn crop(&self, m: &Map, to: Rect, fill: f32) -> Map {
+        Map { w: to.width() as usize, h: to.height() as usize, v: self.crop_vec(&m.v, to, fill) }
+    }
+}
+
+fn satin_map(shape: &Map, s: &photocraft_doc::effects::Satin) -> Map {
+    let (dx, dy) = offset(s.angle, s.distance);
+    let mut a = shape.shifted(dx, dy, 0.0);
+    let mut b = shape.shifted(-dx, -dy, 0.0);
+    blur(&mut a, s.size);
+    blur(&mut b, s.size);
+    let mut m = Map { w: shape.w, h: shape.h, v: a.v.iter().zip(&b.v).map(|(x, y)| (x - y).abs()).collect() };
+    if s.invert {
+        m = m.map(|v| 1.0 - v);
+    }
+    let mut m = apply_contour(m, &s.contour);
+    for (v, a) in m.v.iter_mut().zip(&shape.v) {
+        *v *= a;
+    }
+    m
+}
+
+/// Build every effect map for `layer` from its alpha `shape` over `rect`.
+pub fn build_maps(layer: &Layer, shape: Vec<f32>, rect: Rect, light: &GlobalLight) -> FxMaps {
+    let (w, h) = (rect.width() as usize, rect.height() as usize);
+    let shape = Map { w, h, v: shape };
+    let items: Vec<&Effect> = layer.effects.items.iter().filter(|e| e.enabled()).collect();
+    let mut outer_bevel = vec![false; items.len()];
+    let per: Vec<Vec<Map>> = items
+        .iter()
+        .enumerate()
+        .map(|(i, e)| match e {
+            Effect::DropShadow(s) => vec![shadow_map(&shape, s, light, false)],
+            Effect::InnerShadow(s) => vec![shadow_map(&shape, s, light, true)],
+            Effect::OuterGlow(g) => vec![glow_map(&shape, g, false)],
+            Effect::InnerGlow(g) => vec![glow_map(&shape, g, true)],
+            Effect::Satin(s) => vec![satin_map(&shape, s)],
+            Effect::BevelEmboss(b) => {
+                let (hi, sh, outer) = bevel_maps(&shape, b, light);
+                outer_bevel[i] = outer;
+                vec![hi, sh]
+            }
+            _ => Vec::new(),
+        })
+        .collect();
+    let has_stroke = items.iter().any(|e| matches!(e, Effect::Stroke(_)));
+    let vector_shape = matches!(layer.content, photocraft_doc::LayerContent::Shape(_));
+    let (din, dout) = if has_stroke { (Some(dist_inside(&shape)), Some(dist_outside(&shape))) } else { (None, None) };
+    let vdout = (has_stroke && vector_shape).then(|| dist_outside(&local_coverage(&shape)));
+    FxMaps { rect, shape, per, outer_bevel, din, dout, vdout }
+}
+
+/// Far outside any shape (distance fill for cropped distance fields).
+const FAR: f32 = 1.0e9;
+
 /// Composites `content` (the layer's own pixels over `big`, alpha already
 /// masked, clipped layers applied) plus its effects into `backdrop`.
-pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Buffer, light: &GlobalLight, layer_bounds: Rect) {
+pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Buffer, maps: &FxMaps, layer_bounds: Rect) {
     let big = content.rect;
     let (w, h) = (big.width() as usize, big.height() as usize);
     let shape = Map { w, h, v: content.px.iter().map(|p| p[3]).collect() };
+    let fx = |i: usize, k: usize| maps.crop(&maps.per[i][k], big, 0.0);
     // Layer bounds (gradients aligned with the layer use the whole layer,
     // independent of the render rect).
     let sb = layer_bounds;
@@ -521,11 +618,11 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
     let items: Vec<&Effect> = layer.effects.items.iter().filter(|e| e.enabled()).collect();
     let vector_shape = matches!(layer.content, photocraft_doc::LayerContent::Shape(_));
     // Multiple instances: the first listed is on top, so paint in reverse.
-    let rev = || items.iter().rev().copied();
+    let rev = || items.iter().copied().enumerate().rev();
 
-    for e in rev() {
+    for (i, e) in rev() {
         if let Effect::DropShadow(s) = e {
-            let mut m = shadow_map(&shape, s, light, false);
+            let mut m = fx(i, 0);
             if s.knocks_out {
                 for (v, a) in m.v.iter_mut().zip(&shape.v) {
                     *v *= 1.0 - a;
@@ -534,9 +631,9 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
             paint_color(&mut work, &m, rgb(&s.color), s.common.blend, s.common.opacity);
         }
     }
-    for e in rev() {
+    for (i, e) in rev() {
         if let Effect::OuterGlow(g) = e {
-            let m = glow_map(&shape, g, false);
+            let m = fx(i, 0);
             paint_fx(&mut work, &m, &g.paint, sb, big, g.common.blend, g.common.opacity);
         }
     }
@@ -545,43 +642,31 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
     let fill = layer.fill_opacity;
     let mut lay = Buffer { rect: big, px: content.px.iter().map(|p| [p[0], p[1], p[2], p[3] * fill]).collect() };
     let full = shape.clone();
-    for e in rev() {
+    for (_, e) in rev() {
         if let Effect::GradientOverlay { common, gradient, .. } = e {
             paint_fx(&mut lay, &full, &FxPaint::Gradient(gradient.clone()), sb, big, common.blend, common.opacity)
         }
     }
-    for e in rev() {
+    for (_, e) in rev() {
         if let Effect::ColorOverlay { common, color } = e {
             paint_color(&mut lay, &full, rgb(color), common.blend, common.opacity);
         }
     }
-    for e in rev() {
+    for (i, e) in rev() {
         if let Effect::Satin(s) = e {
-            let (dx, dy) = offset(s.angle, s.distance);
-            let mut a = shape.shifted(dx, dy, 0.0);
-            let mut b = shape.shifted(-dx, -dy, 0.0);
-            blur(&mut a, s.size);
-            blur(&mut b, s.size);
-            let mut m = Map { w, h, v: a.v.iter().zip(&b.v).map(|(x, y)| (x - y).abs()).collect() };
-            if s.invert {
-                m = m.map(|v| 1.0 - v);
-            }
-            let mut m = apply_contour(m, &s.contour);
-            for (v, a) in m.v.iter_mut().zip(&shape.v) {
-                *v *= a;
-            }
+            let m = fx(i, 0);
             paint_color(&mut lay, &m, rgb(&s.color), s.common.blend, s.common.opacity);
         }
     }
-    for e in rev() {
+    for (i, e) in rev() {
         if let Effect::InnerGlow(g) = e {
-            let m = glow_map(&shape, g, true);
+            let m = fx(i, 0);
             paint_fx(&mut lay, &m, &g.paint, sb, big, g.common.blend, g.common.opacity);
         }
     }
-    for e in rev() {
+    for (i, e) in rev() {
         if let Effect::InnerShadow(s) = e {
-            let m = shadow_map(&shape, s, light, true);
+            let m = fx(i, 0);
             paint_color(&mut lay, &m, rgb(&s.color), s.common.blend, s.common.opacity);
         }
     }
@@ -589,14 +674,16 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
     // (top) instance is processed first; inside parts are painted over it,
     // bottom instance first.
     let strokes: Vec<&photocraft_doc::StrokeFx> = items.iter().filter_map(|e| if let Effect::Stroke(s) = e { Some(s) } else { None }).collect();
-    let (din, dout) = if strokes.is_empty() { (Vec::new(), Vec::new()) } else { (dist_inside(&shape), dist_outside(&shape)) };
+    let (din, dout) = match (&maps.din, &maps.dout) {
+        (Some(a), Some(b)) if !strokes.is_empty() => (maps.crop_vec(a, big, 0.0), maps.crop_vec(b, big, FAR)),
+        _ => (Vec::new(), Vec::new()),
+    };
     let widths = |st: &photocraft_doc::StrokeFx| match st.position {
         StrokePosition::Outside => (0.0, st.size),
         StrokePosition::Inside => (st.size, 0.0),
         StrokePosition::Center => (st.size / 2.0, st.size / 2.0),
     };
-    let vcov = if vector_shape && !strokes.is_empty() { Some(local_coverage(&shape)) } else { None };
-    let vdout = vcov.as_ref().map(dist_outside);
+    let vdout = maps.vdout.as_ref().filter(|_| vector_shape && !strokes.is_empty()).map(|v| maps.crop_vec(v, big, FAR));
     for st in strokes.iter().copied() {
         let (_, out_w) = widths(st);
         if out_w <= 0.0 {
@@ -631,9 +718,9 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
         }
         paint_fx(&mut lay, &m, &st.paint, sb, big, st.common.blend, st.common.opacity);
     }
-    for e in rev() {
+    for (i, e) in rev() {
         if let Effect::BevelEmboss(b) = e {
-            let (hi, sh, outer) = bevel_maps(&shape, b, light);
+            let (hi, sh, outer) = (fx(i, 0), fx(i, 1), maps.outer_bevel[i]);
             let dst = if outer { &mut work } else { &mut lay };
             paint_color(dst, &hi, rgb(&b.highlight_color), b.highlight.blend, b.highlight.opacity);
             paint_color(dst, &sh, rgb(&b.shadow_color), b.shadow.blend, b.shadow.opacity);
