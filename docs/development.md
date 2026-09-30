@@ -179,3 +179,19 @@ cargo run --release -p photocraft-ui-egui --example snapshot -- \
 `--script` is a list of control-protocol calls (`[method, params]`), applied in order.
 Input calls (`ui.key`, `ui.type`, `ui.click`) now reply only after the app has processed the events,
 so a following `ui.inspect` observes their effect.
+
+
+## Rendering fidelity (PSD oracle)
+
+`cargo test --release -p photocraft-io --test corpus -- --nocapture` compares our composite of every
+corpus PSD with Photoshop's own merged image (PASS ≤ 2/255). To dig into one file:
+
+```sh
+cargo run --release -p photocraft-io --example oracle_diff -- corpus/psd/<file>.psd 0 png /tmp/diff.png
+```
+
+writes ours | Photoshop | a diff heatmap side by side; `col`, `row` and `DUMP_FX=1` print samples and raw
+effect descriptors. Findings so far: fill-layer gradients are framed by the layer's mask bounds;
+Photoshop's gradient Smoothness is a Catmull-Rom blend and "Perceptual" interpolation is Oklab
+(baked into dense stops on import, `crates/io/src/gradient_bake.rs`); a shape layer's vector
+stroke is drawn above its clipped layers.

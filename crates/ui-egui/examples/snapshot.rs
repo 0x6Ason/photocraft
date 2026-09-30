@@ -55,7 +55,10 @@ fn main() {
     });
     harness.run_steps(4);
     let ctx = harness.ctx.clone();
+    let timing = std::env::var_os("SNAPSHOT_TIMING").is_some();
     for (method, params) in script {
+        let t0 = std::time::Instant::now();
+        let label = format!("{method} {}", params.get("command").and_then(Value::as_str).unwrap_or(""));
         let (req, _rx) = ControlRequest::new(&method, params);
         let outcome = handle(harness.state_mut(), &ctx, &req);
         if let Outcome::Done(v) = &outcome
@@ -75,6 +78,9 @@ fn main() {
             harness.step();
         }
         harness.run_steps(4);
+        if timing {
+            eprintln!("{:>8.1} ms  {label}", t0.elapsed().as_secs_f64() * 1000.0);
+        }
     }
     // Let fade animations settle.
     for _ in 0..12 {

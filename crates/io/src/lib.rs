@@ -20,6 +20,7 @@
 mod adjust_map;
 pub mod effects_map;
 pub mod blocks;
+mod gradient_bake;
 mod flat;
 mod pixels;
 mod psd_export;

@@ -129,22 +129,35 @@ pub fn render_layer(layer: &Layer, rect: Rect) -> Buffer {
 
 /// Downscaled RGBA8 render of the document (nearest-neighbour sampling) for thumbnails or navigators.
 pub fn thumbnail(doc: &Document, max_side: u32) -> Rgba8Image {
+    // Composite once (tile-parallel), then area-average down. Rendering per thumbnail pixel
+    // would redo layer effects for every sample.
     let b = doc.bounds();
     let scale = (max_side as f32 / b.width().max(b.height()).max(1) as f32).min(1.0);
     let w = ((b.width() as f32 * scale).round() as u32).max(1);
     let h = ((b.height() as f32 * scale).round() as u32).max(1);
+    let full = flatten(doc);
+    let (fw, fh) = (b.width() as usize, b.height() as usize);
     let mut img = Rgba8Image::new(w, h);
-    let full = if scale >= 1.0 { Some(flatten(doc)) } else { None };
-    for ty in 0..h {
-        for tx in 0..w {
-            let x = ((tx as f32 + 0.5) / scale) as i32;
-            let y = ((ty as f32 + 0.5) / scale) as i32;
-            let p = match &full {
-                Some(f) => f.get(x.min(b.x1 - 1), y.min(b.y1 - 1)),
-                None => render(doc, Rect::from_xywh(x, y, 1, 1)).px[0],
-            };
-            let o = ((ty * w + tx) * 4) as usize;
-            for (dst, v) in img.pixels[o..o + 4].iter_mut().zip(p) {
+    for ty in 0..h as usize {
+        let (y0, y1) = (ty * fh / h as usize, ((ty + 1) * fh / h as usize).max(ty * fh / h as usize + 1).min(fh));
+        for tx in 0..w as usize {
+            let (x0, x1) = (tx * fw / w as usize, ((tx + 1) * fw / w as usize).max(tx * fw / w as usize + 1).min(fw));
+            // Premultiplied average so transparent pixels don't darken edges.
+            let mut acc = [0.0f32; 4];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = full.px[y * fw + x];
+                    for c in 0..3 {
+                        acc[c] += p[c] * p[3];
+                    }
+                    acc[3] += p[3];
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)).max(1) as f32;
+            let a = acc[3] / n;
+            let px = if acc[3] > 0.0 { [acc[0] / acc[3], acc[1] / acc[3], acc[2] / acc[3], a] } else { [0.0; 4] };
+            let o = (ty * w as usize + tx) * 4;
+            for (dst, v) in img.pixels[o..o + 4].iter_mut().zip(px) {
                 *dst = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
         }
@@ -235,7 +248,7 @@ fn render_content(layer: &Layer, rect: Rect, cx: &Ctx) -> Option<Buffer> {
         LayerContent::Fill(f) => match &layer.fill_cache {
             // Photoshop's own rendering, valid while the fill is unchanged.
             Some(c) if c.fill == *f => surface_to_buffer(&c.surface, rect),
-            _ => render_fill(f, rect, cx.canvas),
+            _ => render_fill(f, rect, fill_frame(layer, cx.canvas)),
         },
         LayerContent::Adjustment(_) => return None,
         _ => match layer.surface() {
@@ -257,6 +270,33 @@ pub fn surface_to_buffer(s: &Surface, rect: Rect) -> Buffer {
     Buffer { rect, px }
 }
 
+/// The frame a fill layer's gradient is laid out in ("Align with layer", Photoshop's default):
+/// the layer's bounds, i.e. the area its masks reveal: a hide-all pixel mask's painted area, or
+/// the vector mask's path; otherwise the canvas.
+pub fn fill_frame(layer: &Layer, canvas: Rect) -> Rect {
+    let mut frame = canvas;
+    if let Some(m) = &layer.mask
+        && m.enabled
+        && m.surface.default_pixel().first().is_some_and(|v| *v <= 0.0)
+    {
+        let b = m.surface.content_bounds().intersect(&canvas);
+        if !b.is_empty() {
+            frame = b;
+        }
+    }
+    if let Some(vm) = &layer.vector_mask
+        && vm.enabled
+        && !vm.path.inverted
+        && let Some((x0, y0, x1, y1)) = vm.path.control_bounds()
+    {
+        let b = Rect::new(x0.floor() as i32, y0.floor() as i32, x1.ceil() as i32, y1.ceil() as i32).intersect(&frame);
+        if !b.is_empty() {
+            frame = b;
+        }
+    }
+    frame
+}
+
 fn render_fill(f: &Fill, rect: Rect, canvas: Rect) -> Buffer {
     match f {
         Fill::Solid(c) => {
@@ -264,7 +304,7 @@ fn render_fill(f: &Fill, rect: Rect, canvas: Rect) -> Buffer {
             Buffer::filled(rect, [rgb[0], rgb[1], rgb[2], c.alpha])
         }
         Fill::Gradient { stops, angle, scale, style, reverse } => {
-            // Gradient geometry relative to the canvas, independent of the render rect.
+            // Gradient geometry relative to the layer's frame, independent of the render rect.
             let mut b = Buffer::transparent(rect);
             for y in rect.y0..rect.y1 {
                 for x in rect.x0..rect.x1 {
@@ -418,11 +458,43 @@ fn composite_layer(layer: &Layer, clipped: &[Layer], backdrop: &mut Buffer, cx: 
         effects::composite_with_effects(layer, &content, backdrop, &cx.light, layer_bounds(layer, cx.canvas));
         return;
     }
+    if let Some((mut content, stroke)) = shape_parts(layer, clipped, rect, cx) {
+        for c in clipped.iter().filter(|c| c.visible) {
+            composite_atop(c, &mut content, cx);
+        }
+        for (p, s) in content.px.iter_mut().zip(&stroke.px) {
+            *p = psblend::composite(BlendMode::Normal, *p, *s, 1.0);
+        }
+        blend_into(backdrop, &content, layer.blend, opacity);
+        return;
+    }
     let Some(mut content) = render_content(layer, rect, cx) else { return };
     for c in clipped.iter().filter(|c| c.visible) {
         composite_atop(c, &mut content, cx);
     }
     blend_into(backdrop, &content, layer.blend, opacity);
+}
+
+/// A stroked shape layer with visible clipped layers: Photoshop draws the shape's vector stroke
+/// above the clipped layers, so the base content is the fill alone and the stroke is laid on top
+/// after clipping. Returns (fill, stroke) buffers over `rect`, masks applied.
+fn shape_parts(layer: &Layer, clipped: &[Layer], rect: Rect, cx: &Ctx) -> Option<(Buffer, Buffer)> {
+    let LayerContent::Shape(sh) = &layer.content else { return None };
+    if sh.stroke.is_none() || !clipped.iter().any(|c| c.visible) {
+        return None;
+    }
+    let fmt = photocraft_color::PixelFormat::RGBA8;
+    let fill_only = photocraft_doc::vector::ShapeLayer { stroke: None, cache: None, ..sh.clone() };
+    let stroke_only = photocraft_doc::vector::ShapeLayer { fill: None, cache: None, ..sh.clone() };
+    let mut f = surface_to_buffer(&photocraft_vector::render_shape(&fill_only, fmt, cx.canvas.intersect(&rect)), rect);
+    let mut s = surface_to_buffer(&photocraft_vector::render_shape(&stroke_only, fmt, cx.canvas.intersect(&rect)), rect);
+    if let Some(m) = mask_vals(layer, rect) {
+        for ((a, b), k) in f.px.iter_mut().zip(s.px.iter_mut()).zip(&m) {
+            a[3] *= k;
+            b[3] *= k;
+        }
+    }
+    Some((f, s))
 }
 
 /// Composite `layer` onto `base` restricted to the base's alpha (clipping mask semantics).

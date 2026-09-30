@@ -67,8 +67,112 @@ pub(crate) fn conv_sep(src: &Image, out: Rect, kx: &[f32], ky: &[f32], alpha: bo
 }
 
 pub(crate) fn gaussian(src: &Image, out: Rect, ctx: &Ctx, radius: f32) -> Vec<f32> {
-    let k = gaussian_kernel(radius);
-    conv_sep(src, out, &k, &k, ctx.alpha)
+    // Exact kernel for small radii; beyond that three box passes approximate the Gaussian with
+    // cost independent of the radius (Kovesi, "Fast almost-Gaussian filtering", 2010).
+    if radius <= 4.0 {
+        let k = gaussian_kernel(radius);
+        return conv_sep(src, out, &k, &k, ctx.alpha);
+    }
+    gaussian_boxes(src, out, ctx.alpha, radius)
+}
+
+/// Box widths (odd) whose `n`-fold convolution has standard deviation `sigma`.
+fn boxes_for_gauss(sigma: f32, n: usize) -> Vec<usize> {
+    let nf = n as f32;
+    let w_ideal = (12.0 * sigma * sigma / nf + 1.0).sqrt();
+    let mut wl = w_ideal.floor() as i32;
+    if wl % 2 == 0 {
+        wl -= 1;
+    }
+    let wl = wl.max(1);
+    let wu = wl + 2;
+    let m_ideal = (12.0 * sigma * sigma - nf * (wl * wl) as f32 - 4.0 * nf * wl as f32 - 3.0 * nf) / (-4.0 * wl as f32 - 4.0);
+    let m = m_ideal.round().clamp(0.0, nf) as usize;
+    (0..n).map(|i| if i < m { wl as usize } else { wu as usize }).collect()
+}
+
+/// Running-sum box blur of every row of an interleaved `w × h × n` buffer (edges clamped).
+fn box_rows(buf: &mut [f32], w: usize, n: usize, r: usize) {
+    if r == 0 || w == 0 {
+        return;
+    }
+    let norm = 1.0 / (2 * r + 1) as f32;
+    let blur_row = |row: &mut [f32]| {
+        let src = row.to_vec();
+        let at = |x: isize, c: usize| src[(x.clamp(0, w as isize - 1) as usize) * n + c];
+        for c in 0..n {
+            let mut acc: f32 = (-(r as isize)..=r as isize).map(|x| at(x, c)).sum();
+            for x in 0..w {
+                row[x * n + c] = acc * norm;
+                acc += at(x as isize + r as isize + 1, c) - at(x as isize - r as isize, c);
+            }
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        buf.par_chunks_mut(w * n).for_each(blur_row);
+    }
+    #[cfg(target_arch = "wasm32")]
+    buf.chunks_mut(w * n).for_each(blur_row);
+}
+
+fn transpose(buf: &[f32], w: usize, h: usize, n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; buf.len()];
+    const B: usize = 32; // cache-friendly blocks
+    for by in (0..h).step_by(B) {
+        for bx in (0..w).step_by(B) {
+            for y in by..(by + B).min(h) {
+                for x in bx..(bx + B).min(w) {
+                    let (s, d) = ((y * w + x) * n, (x * h + y) * n);
+                    out[d..d + n].copy_from_slice(&buf[s..s + n]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Gaussian blur by three box passes per axis over a premultiplied window.
+fn gaussian_boxes(src: &Image, out: Rect, alpha: bool, sigma: f32) -> Vec<f32> {
+    let n = src.ch;
+    let boxes = boxes_for_gauss(sigma, 3);
+    let margin: i32 = boxes.iter().map(|w| (*w as i32 - 1) / 2).sum::<i32>() + 1;
+    let win = Rect::new(out.x0 - margin, out.y0 - margin, out.x1 + margin, out.y1 + margin);
+    let (ww, wh) = (win.width() as usize, win.height() as usize);
+    let mut p = vec![0.0f32; ww * wh * n];
+    let fill = |yy: usize, row: &mut [f32]| {
+        let y = win.y0 + yy as i32;
+        for (xx, px) in row.chunks_exact_mut(n).enumerate() {
+            for (c, v) in px.iter_mut().enumerate() {
+                *v = src.get(win.x0 + xx as i32, y, c);
+            }
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        p.par_chunks_mut(ww * n).enumerate().for_each(|(y, row)| fill(y, row));
+    }
+    #[cfg(target_arch = "wasm32")]
+    p.chunks_mut(ww * n).enumerate().for_each(|(y, row)| fill(y, row));
+    premultiply(&mut p, n, alpha);
+    for w in &boxes {
+        box_rows(&mut p, ww, n, (w - 1) / 2);
+    }
+    let mut t = transpose(&p, ww, wh, n);
+    for w in &boxes {
+        box_rows(&mut t, wh, n, (w - 1) / 2);
+    }
+    let p = transpose(&t, wh, ww, n);
+    let (ow, oh) = (out.width() as usize, out.height() as usize);
+    let mut res = vec![0.0f32; ow * oh * n];
+    for y in 0..oh {
+        let s = ((y + margin as usize) * ww + margin as usize) * n;
+        res[y * ow * n..(y + 1) * ow * n].copy_from_slice(&p[s..s + ow * n]);
+    }
+    unpremultiply(&mut res, n, alpha);
+    res
 }
 
 pub(crate) fn boxed(src: &Image, out: Rect, ctx: &Ctx, radius: f32) -> Vec<f32> {
@@ -191,4 +295,30 @@ pub(crate) fn surface(src: &Image, out: Rect, ctx: &Ctx, radius: f32, threshold:
         }
     }
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn box_gaussian_matches_exact_kernel() {
+        // A hard vertical edge (premultiplied RGBA-ish, 2 channels) blurred with σ = 12.
+        let src_rect = Rect::new(-60, -60, 180, 68);
+        let mut img = Image::new(src_rect, 2);
+        for y in src_rect.y0..src_rect.y1 {
+            for x in src_rect.x0..src_rect.x1 {
+                let i = ((y - src_rect.y0) as usize * src_rect.width() as usize + (x - src_rect.x0) as usize) * 2;
+                img.data[i] = if x < 60 { 1.0 } else { 0.0 };
+                img.data[i + 1] = 1.0;
+            }
+        }
+        let out = Rect::new(0, 0, 120, 8);
+        let k = gaussian_kernel(12.0);
+        let exact = conv_sep(&img, out, &k, &k, true);
+        let fast = gaussian_boxes(&img, out, true, 12.0);
+        let err = exact.iter().zip(&fast).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(err < 0.02, "max error {err}");
+        assert_eq!(boxes_for_gauss(10.0, 3).len(), 3);
+    }
 }

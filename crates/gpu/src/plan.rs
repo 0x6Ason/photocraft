@@ -193,6 +193,13 @@ impl<'a> Planner<'a> {
         self.check(layer)?;
         let opacity = layer.opacity * layer.fill_opacity;
         let visible_clipped: Vec<&'a Layer> = clipped.iter().filter(|c| c.visible).collect();
+        if let LayerContent::Shape(sh) = &layer.content
+            && sh.stroke.is_some()
+            && !visible_clipped.is_empty()
+        {
+            // The vector stroke goes above the clipped layers (CPU path splits fill and stroke).
+            return Err(Unsupported(format!("stroked shape `{}` with clipped layers", layer.name)));
+        }
 
         if let LayerContent::Group(g) = &layer.content
             && layer.blend == BlendMode::PassThrough
@@ -261,7 +268,7 @@ impl<'a> Planner<'a> {
                 p.mask = mask_use(layer);
                 match &layer.fill_cache {
                     Some(c) if c.fill == *f => self.surface_tex(&mut p, layer.id, &c.surface),
-                    _ => self.fill(&mut p, f),
+                    _ => self.fill(&mut p, f, photocraft_compose::fill_frame(layer, self.canvas)),
                 }
                 Ok(self.emit(p))
             }
@@ -284,7 +291,7 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn fill(&self, p: &mut Pass<'a>, f: &Fill) {
+    fn fill(&self, p: &mut Pass<'a>, f: &Fill, frame: photocraft_geom::Rect) {
         match f {
             Fill::Solid(c) => {
                 let rgb = c.to_rgb();
@@ -300,7 +307,7 @@ impl<'a> Planner<'a> {
                     photocraft_doc::GradientStyle::Diamond => 4.0,
                 };
                 p.params[0] = [*angle, *scale, if *reverse { 1.0 } else { 0.0 }, style_i];
-                let c = self.canvas;
+                let c = frame;
                 p.params[1] = [c.x0 as f32, c.y0 as f32, c.width() as f32, c.height() as f32];
                 let conv: Vec<(f32, [f32; 4])> = stops
                     .iter()

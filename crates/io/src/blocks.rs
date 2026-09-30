@@ -148,8 +148,11 @@ pub(crate) fn gradient_style_value(s: GradientStyle) -> Value {
 /// Colour stops and opacity stops of a gradient.
 pub(crate) type Stops = (Vec<(f32, Color)>, Vec<(f32, f32)>);
 
-pub(crate) fn gradient_stops(grad: &Descriptor) -> Stops {
+/// Stops of a `Grdn` descriptor, baked to Photoshop's interpolation (smoothness `Intr`, stop
+/// midpoints, and the parent's `gs99` interpolation method when given).
+pub(crate) fn gradient_stops_with(grad: &Descriptor, method: Option<&[u8]>) -> Stops {
     let mut stops = Vec::new();
+    let mut mids = Vec::new();
     let mut opacity = Vec::new();
     if let Some(Value::List(items)) = grad.get("Clrs") {
         for it in items {
@@ -157,10 +160,17 @@ pub(crate) fn gradient_stops(grad: &Descriptor) -> Stops {
                 let loc = num(s.get("Lctn")).unwrap_or(0.0) as f32 / 4096.0;
                 if let Some(c) = get_desc(s, "Clr ").and_then(color_from_desc) {
                     stops.push((loc, c));
+                    mids.push(num(s.get("Mdpn")).unwrap_or(50.0) as f32 / 100.0);
                 }
             }
         }
     }
+    // Midpoint k applies to the segment after stop k.
+    let mut order: Vec<usize> = (0..stops.len()).collect();
+    order.sort_by(|a, b| stops[*a].0.total_cmp(&stops[*b].0));
+    let mids: Vec<f32> = order.iter().skip(1).map(|i| mids[*i]).collect();
+    let smooth = num(grad.get("Intr")).map_or(0.0, |v| (v / 4096.0) as f32);
+    let stops = if stops.len() >= 2 { crate::gradient_bake::bake(stops, &mids, smooth, crate::gradient_bake::Method::from_code(method)) } else { stops };
     if let Some(Value::List(items)) = grad.get("Trns") {
         for it in items {
             if let Value::Descriptor(s) = it {
@@ -201,7 +211,8 @@ pub(crate) fn gradient_desc(stops: &[(f32, Color)], opacity: &[(f32, f32)]) -> D
     Descriptor::new("Grdn")
         .with("Nm  ", Value::Text(UnicodeString::new_nul("Custom")))
         .with("GrdF", Value::Enumerated { type_id: Id::new("GrdF"), value: Id::new("CstS") })
-        .with("Intr", Value::Double(4096.0))
+        // Our stops interpolate linearly (Photoshop smoothness is baked into them on import).
+        .with("Intr", Value::Double(0.0))
         .with("Clrs", Value::List(clrs))
         .with("Trns", Value::List(trns))
 }
@@ -221,7 +232,7 @@ pub fn fill_from_desc(key: &[u8; 4], d: &Descriptor) -> Option<Fill> {
         b"GdFl" => {
             let angle = num(d.get("Angl")).unwrap_or(90.0) as f32;
             let scale = num(d.get("Scl ")).map_or(1.0, |v| v as f32 / 100.0);
-            let (mut stops, _) = get_desc(d, "Grad").map(gradient_stops).unwrap_or_default();
+            let (mut stops, _) = get_desc(d, "Grad").map(|g| gradient_stops_with(g, enum_of(d, "gs99"))).unwrap_or_default();
             if stops.is_empty() {
                 stops = vec![(0.0, Color::BLACK), (1.0, Color::WHITE)];
             }
