@@ -20,15 +20,15 @@ crates/
   geom color raster          L0 foundation (runtime pixel formats, COW tiles, blend math)
   psd codecs                 L0 standalone format crates (no workspace deps; publishable)
   doc                        L1 document model (layers, masks, adjustments, effects: pure data)
-  ops paint                  L2 history/undo, brush engine
-  compose                    L3 CPU reference compositor (the oracle for GPU work)
+  ops paint algo text        L2 history, brush engine, imaging algorithms, text engine
+  compose gpu format         L3 CPU compositor (the oracle), wgpu compositor, .pcraft native format
   io                         L4 document <-> PSD / flat formats
   engine                     L5 Session + command registry (every action is a command)
-  ui-egui                    L6 egui shell (thin: all actions go through the engine)
+  ui-egui automation         L6 egui shell (thin: all actions go through the engine); MCP server
   testkit                    test helpers
 apps/
   photocraft                 desktop app (eframe/wgpu), TCP control server
-  photocraft-cli             headless CLI
+  photocraft-cli             headless CLI (convert/info/run/batch/commands/mcp)
 xtask/                       cargo xtask layers | wasm | ci | stats | corpus
 ```
 
@@ -53,10 +53,16 @@ cargo xtask layers
 cargo xtask wasm            # if you touched L0–L6
 ```
 
-Parallel agents: use your own target dir (`CARGO_TARGET_DIR=target/agent-<name>`) to avoid the Cargo build lock, and edit only the crates you own. Keep every `Cargo.toml` valid at all times: the `crates/*` glob means one broken manifest breaks everyone's build.
+Parallel agents: use your own target dir (`CARGO_TARGET_DIR=target/agent-<name>`) to avoid the Cargo build lock, and edit only the crates you own. Keep every `Cargo.toml` valid at all times: the `crates/*` glob means one broken manifest breaks everyone's build. **Create or rewrite manifests atomically**: write to a temp file outside `crates/`, then `mv` it into place.
 
 ## 5. Where things are tracked
 
 - `plan/` (local, gitignored): research, parity plan, execution plan, estimates.
 - `docs/roadmap.md`: milestones M0–M12 and their status.
 - `log/` (local, gitignored): the dev log.
+
+## 6. Keeping the native format complete
+
+`photocraft-format` deliberately fails to compile when a `photocraft-doc` struct gains a field, so
+nothing is silently dropped from `.pcraft` saves. When you add a doc field, add it to
+`crates/format/src/manifest.rs` and `convert.rs` with `#[serde(default)]` so older files still load.

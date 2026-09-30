@@ -26,6 +26,8 @@ pub struct PsdExportOptions {
 
 struct Ex {
     fmt: PixelFormat,
+    /// Document resolution (for generated type-layer data).
+    dpi: f32,
     mask_fmt: PixelFormat,
     cc: usize,
     cmyk: bool,
@@ -250,10 +252,13 @@ impl Ex {
                 if let Some(f) = &sh.fill {
                     fill_rule(&mut raw, &mut regenerated, f);
                 }
-                set_principal(&mut raw, &[b"vsms", b"vmsk"], sh.psd_raw.as_ref());
+                let (w, h) = (self.canvas.width(), self.canvas.height());
+                crate::vector_map::shape_blocks(sh, &mut raw, w, h, self.dpi);
             }
             LayerContent::Text(t) => {
-                set_principal(&mut raw, &[b"TySh"], t.psd_raw.as_ref());
+                // Text layers without PSD data (created here) get a generated TySh.
+                let generated = t.psd_raw.is_none().then(|| std::sync::Arc::new(photocraft_text::psd::build_tysh(t, self.dpi, None)));
+                set_principal(&mut raw, &[b"TySh"], t.psd_raw.as_ref().or(generated.as_ref()));
                 if !raw.iter().any(|(k, _)| k == b"TySh") {
                     self.warnings.push(format!("layer \"{}\": text layer written as pixels (no TySh data)", l.name));
                 }
@@ -266,7 +271,33 @@ impl Ex {
             }
             LayerContent::Raster(_) | LayerContent::Group(_) => {}
         }
+        if !matches!(l.content, LayerContent::Shape(_)) {
+            self.vector_mask_block(l, &mut raw);
+        }
         regenerated.into_iter().chain(raw).map(|(k, d)| TaggedBlock::new(k, d)).collect()
+    }
+
+    /// Keeps, regenerates or removes the `vmsk`/`vsms` block of a non-shape layer.
+    fn vector_mask_block(&mut self, l: &Layer, raw: &mut Vec<([u8; 4], Vec<u8>)>) {
+        let (w, h) = (self.canvas.width(), self.canvas.height());
+        let pos = raw.iter().position(|(k, _)| k == b"vsms" || k == b"vmsk");
+        match (&l.vector_mask, pos) {
+            (None, Some(_)) => raw.retain(|(k, _)| k != b"vsms" && k != b"vmsk"),
+            (None, None) => {}
+            (Some(vm), Some(i)) if crate::vector_map::vector_mask_block_matches(&raw[i].1, vm, w, h) => {}
+            (Some(vm), pos) => {
+                let data = crate::vector_map::vector_mask_bytes(vm, w, h);
+                match pos {
+                    Some(i) => raw[i].1 = data,
+                    None => raw.push((*b"vmsk", data)),
+                }
+            }
+        }
+        if let Some(vm) = &l.vector_mask
+            && (vm.density < 1.0 || vm.feather != 0.0)
+        {
+            self.warnings.push(format!("layer \"{}\": vector mask density/feather are not written to PSD", l.name));
+        }
     }
 
     /// Pixels for a fill layer: Photoshop's cached rendering while valid,
@@ -406,6 +437,7 @@ pub fn document_to_psd_with(doc: &Document, opts: &PsdExportOptions) -> (PsdFile
     let version = if opts.force_psb || big { Version::Psb } else { Version::Psd };
     let mut ex = Ex {
         fmt,
+        dpi: doc.resolution_dpi,
         mask_fmt: PixelFormat::new(ColorMode::Grayscale, sample, false),
         cc,
         cmyk: fmt.mode == ColorMode::Cmyk,
@@ -505,6 +537,43 @@ pub fn document_to_psd_with(doc: &Document, opts: &PsdExportOptions) -> (PsdFile
         resources.push(ImageResource::new(1006, pascal_names_resource(&names)));
         resources.push(ImageResource::new(1045, unicode_names_resource(&names)));
     }
+    // Paths: saved paths (2000+), the work path (1025), the clipping path name (2999).
+    {
+        use crate::vector_map::{CLIPPING_PATH, WORK_PATH, path_from_resource, path_to_records};
+        let (w, h) = (doc.size.width, doc.size.height);
+        let max = (*crate::vector_map::SAVED_PATHS.end() - *crate::vector_map::SAVED_PATHS.start() + 1) as usize;
+        if doc.paths.len() > max {
+            ex.warnings.push(format!("only {max} saved paths fit in PSD; the rest were dropped"));
+        }
+        for (i, p) in doc.paths.iter().take(max).enumerate() {
+            let data = match &p.psd_raw {
+                Some(r) if path_from_resource(r, w, h).as_ref() == Some(&p.path) => r.to_vec(),
+                _ => path_to_records(&p.path, w, h).to_bytes(),
+            };
+            let mut r = ImageResource::new(crate::vector_map::SAVED_PATHS.start() + i as u16, data);
+            r.name = legacy_name(&p.name);
+            resources.push(r);
+        }
+        if let Some(wp) = &doc.work_path {
+            resources.push(ImageResource::new(WORK_PATH, path_to_records(wp, w, h).to_bytes()));
+        }
+        let raw_clip = doc.metadata.psd_resources.iter().find(|(id, _, _)| *id == CLIPPING_PATH);
+        let raw_name = raw_clip.map(|(_, _, d)| {
+            let n = usize::from(d.first().copied().unwrap_or(0));
+            d.get(1..1 + n).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default()
+        });
+        if let Some(c) = &doc.clipping_path
+            && raw_name.as_deref() != Some(c.name.as_str())
+        {
+            // Pascal name, then flatness as 16.16 fixed (best effort; see vector_map docs).
+            let mut data = vec![0u8];
+            let name = legacy_name(&c.name);
+            data[0] = name.len() as u8;
+            data.extend_from_slice(&name);
+            data.extend_from_slice(&((c.flatness.max(0.0) * 65536.0) as u32).to_be_bytes());
+            resources.push(ImageResource::new(CLIPPING_PATH, data));
+        }
+    }
     if let Some(x) = &doc.metadata.xmp {
         resources.push(ImageResource::new(ids::XMP, x.as_bytes().to_vec()));
     }
@@ -518,6 +587,14 @@ pub fn document_to_psd_with(doc: &Document, opts: &PsdExportOptions) -> (PsdFile
         global_blocks.push(tb);
     }
     for (id, name, data) in &doc.metadata.psd_resources {
+        // A preserved clipping-path resource is only valid while it names the current one.
+        if *id == crate::vector_map::CLIPPING_PATH {
+            let n = usize::from(data.first().copied().unwrap_or(0));
+            let raw_name = data.get(1..1 + n).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+            if doc.clipping_path.as_ref().is_none_or(|c| c.name != raw_name) {
+                continue;
+            }
+        }
         let mut r = ImageResource::new(*id, data.to_vec());
         r.name = legacy_name(name);
         resources.push(r);

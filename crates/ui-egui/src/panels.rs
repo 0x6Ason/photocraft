@@ -12,11 +12,43 @@ use crate::{PhotocraftApp, icons, widgets};
 // ----------------------------------------------------------------------------- toolbar
 
 /// Tool groups separated by hairlines, Photoshop order.
-const TOOL_GROUPS: &[&[Tool]] = &[&[Tool::Move], &[Tool::RectMarquee, Tool::EllipseMarquee], &[Tool::Eyedropper], &[Tool::Brush, Tool::Eraser], &[Tool::Hand, Tool::Zoom]];
+/// Photoshop toolbar: divider-separated sections of slots; each slot is a flyout group whose button
+/// shows the group's last-used tool.
+const TOOL_SECTIONS: &[&[&[Tool]]] = &[
+    &[&[Tool::Move]],
+    &[&[Tool::RectMarquee, Tool::EllipseMarquee], &[Tool::Lasso, Tool::PolygonLasso], &[Tool::ObjectSelection, Tool::QuickSelection, Tool::MagicWand], &[Tool::Crop], &[Tool::Eyedropper]],
+    &[
+        &[Tool::SpotHealing, Tool::Healing],
+        &[Tool::Brush],
+        &[Tool::CloneStamp],
+        &[Tool::HistoryBrush],
+        &[Tool::Eraser],
+        &[Tool::Gradient, Tool::PaintBucket],
+        &[Tool::Blur, Tool::Sharpen, Tool::Smudge],
+        &[Tool::Dodge, Tool::Burn, Tool::Sponge],
+    ],
+    &[&[Tool::Pen], &[Tool::Type], &[Tool::PathSelection], &[Tool::Rectangle, Tool::EllipseShape, Tool::Triangle, Tool::Polygon, Tool::Line]],
+    &[&[Tool::Hand], &[Tool::Zoom]],
+];
+
+/// The tool a slot shows: the current tool if it belongs to the slot, else the last one used.
+fn slot_tool(ui: &egui::Ui, current: Tool, slot: &[Tool], key: egui::Id) -> Tool {
+    if slot.contains(&current) {
+        ui.data_mut(|d| d.insert_temp(key, current));
+        return current;
+    }
+    ui.data(|d| d.get_temp::<Tool>(key)).filter(|t| slot.contains(t)).unwrap_or(slot[0])
+}
 
 pub fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
-    let (w, bx, m) = if t.pro { (40.0, 30.0, 5i8) } else { (50.0, 36.0, 7i8) };
+    let (w1, bx, m) = if t.pro { (40.0, 30.0, 5i8) } else { (50.0, 36.0, 7i8) };
+    // Photoshop switches to a double-column toolbar when the window is too short.
+    let slots: usize = TOOL_SECTIONS.iter().map(|g| g.len()).sum();
+    let needed = slots as f32 * (bx + 3.0) + TOOL_SECTIONS.len() as f32 * 9.0 + 190.0;
+    let avail_h = ui.ctx().content_rect().height() - 130.0;
+    let double = needed > avail_h;
+    let w = if double { w1 + bx + 2.0 } else { w1 };
     egui::Panel::left("toolbar").resizable(false).exact_size(w).frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(m, 8))).show(ui, |ui| {
         if t.pro {
             let r = ui.max_rect();
@@ -41,26 +73,76 @@ pub fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             mesh.add_triangle(0, 2, 3);
             ui.painter().add(mesh);
         }
-        ui.spacing_mut().item_spacing = vec2(0.0, 3.0);
-        for (gi, group) in TOOL_GROUPS.iter().enumerate() {
-            if gi > 0 {
+        ui.spacing_mut().item_spacing = vec2(2.0, 3.0);
+        let flyout_id = egui::Id::new("tool-flyout");
+        let mut slot_index = 0usize;
+        for (si, section) in TOOL_SECTIONS.iter().enumerate() {
+            if si > 0 {
                 ui.add_space(4.0);
-                let (r, _) = ui.allocate_exact_size(vec2(bx, 1.0), Sense::hover());
+                let (r, _) = ui.allocate_exact_size(vec2(if double { bx * 2.0 + 2.0 } else { bx }, 1.0), Sense::hover());
                 ui.painter().line_segment([r.left_center() + vec2(8.0, 0.0), r.right_center() - vec2(8.0, 0.0)], Stroke::new(1.0, t.separator));
                 ui.add_space(4.0);
             }
-            for &tool in *group {
-                let sel = app.ui.tool == tool;
-                let resp = icons::button(ui, icons::tool_icon(tool), bx, sel, &format!("{}  ({})", tool.label(), tool.key()));
-                if t.pro && group.len() > 1 {
-                    // Photoshop's little corner triangle marks a tool group.
-                    let r = resp.rect;
-                    let tri = vec![r.right_bottom() + vec2(-2.0, -2.0), r.right_bottom() + vec2(-6.0, -2.0), r.right_bottom() + vec2(-2.0, -6.0)];
-                    ui.painter().add(egui::Shape::convex_polygon(tri, t.text_faint, Stroke::NONE));
-                }
-                if resp.clicked() {
-                    app.ui.tool = tool;
-                }
+            let rows: Vec<&[&[Tool]]> = if double { section.chunks(2).collect() } else { section.chunks(1).collect() };
+            for row in rows {
+                ui.horizontal(|ui| {
+                    for slot in row.iter() {
+                        let key = egui::Id::new(("tool-slot", slot_index));
+                        slot_index += 1;
+                        let tool = slot_tool(ui, app.ui.tool, slot, key);
+                        let sel = slot.contains(&app.ui.tool);
+                        let tip = if tool.key() == '\0' { tool.label().to_string() } else { format!("{}  ({})", tool.label(), tool.key()) };
+                        let resp = icons::button(ui, icons::tool_icon(tool), bx, sel, &tip);
+                        if slot.len() > 1 {
+                            let r = resp.rect;
+                            let tri = vec![r.right_bottom() + vec2(-2.0, -2.0), r.right_bottom() + vec2(-6.0, -2.0), r.right_bottom() + vec2(-2.0, -6.0)];
+                            ui.painter().add(egui::Shape::convex_polygon(tri, t.text_faint, Stroke::NONE));
+                        }
+                        if resp.clicked() {
+                            app.ui.tool = tool;
+                        }
+                        // Right-click or long-press opens the flyout (Photoshop).
+                        let long_press = resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.press_start_time().is_some_and(|t0| i.time - t0 > 0.35));
+                        if slot.len() > 1 && (resp.secondary_clicked() || long_press) {
+                            ui.data_mut(|d| d.insert_temp(flyout_id, (key, resp.rect)));
+                        }
+                        if slot.len() > 1 && long_press {
+                            ui.ctx().request_repaint();
+                        }
+                        if let Some((open_key, anchor)) = ui.data(|d| d.get_temp::<(egui::Id, Rect)>(flyout_id))
+                            && open_key == key
+                        {
+                            let area = egui::Area::new(key.with("flyout")).order(egui::Order::Foreground).fixed_pos(anchor.right_top() + vec2(6.0, 0.0)).show(ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    let label_w = slot.iter().map(|it| ui.painter().layout_no_wrap(it.label().to_string(), egui::FontId::proportional(12.5), t.text).size().x).fold(0.0f32, f32::max);
+                                    let fw = (label_w + 42.0 + 40.0).max(180.0);
+                                    for &item in slot.iter() {
+                                        let (r, ir) = ui.allocate_exact_size(vec2(fw, 26.0), Sense::click());
+                                        if ir.hovered() {
+                                            ui.painter().rect_filled(r, 3.0, t.hover);
+                                        }
+                                        if item == tool {
+                                            ui.painter().rect_filled(Rect::from_center_size(pos2(r.left() + 8.0, r.center().y), vec2(4.0, 4.0)), 0.0, t.text);
+                                        }
+                                        icons::paint(ui, Rect::from_center_size(pos2(r.left() + 26.0, r.center().y), vec2(18.0, 18.0)), icons::tool_icon(item), 14.0, t.icon);
+                                        ui.painter().text(pos2(r.left() + 42.0, r.center().y), Align2::LEFT_CENTER, item.label(), egui::FontId::proportional(12.5), t.text);
+                                        if item.key() != '\0' {
+                                            ui.painter().text(pos2(r.right() - 8.0, r.center().y), Align2::RIGHT_CENTER, item.key().to_string(), egui::FontId::proportional(12.0), t.text_dim);
+                                        }
+                                        if ir.clicked() {
+                                            app.ui.tool = item;
+                                            ui.data_mut(|d| d.remove::<(egui::Id, Rect)>(flyout_id));
+                                        }
+                                    }
+                                });
+                            });
+                            let clicked_outside = ui.input(|i| i.pointer.any_click()) && !area.response.hovered() && !resp.hovered();
+                            if clicked_outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                ui.data_mut(|d| d.remove::<(egui::Id, Rect)>(flyout_id));
+                            }
+                        }
+                    }
+                });
             }
         }
         ui.add_space(14.0);
@@ -160,10 +242,22 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 icons::paint(ui, r, "chevron-down", 10.0, t.text_faint);
             }
             widgets::vline(ui, 22.0);
+            if app.ui.transform.is_some() {
+                crate::transform_tool::options_bar(app, ui);
+                return;
+            }
+            let tool = app.ui.tool;
+            if (tool.is_brushlike() && !matches!(tool, Tool::Brush | Tool::Eraser)) || tool == Tool::QuickSelection {
+                brush_preset_chip(ui, &mut app.session.tools.brush);
+                widgets::vline(ui, 22.0);
+            }
+            if crate::retouch_ui::options_bar(app, ui, tool) || crate::vector_ui::options_bar(app, ui, tool) {
+                return;
+            }
             let b = &mut app.session.tools.brush;
             match app.ui.tool {
                 Tool::Brush | Tool::Eraser if t.pro => {
-                    brush_preset_chip(ui, b.size, b.hardness);
+                    brush_preset_chip(ui, b);
                     widgets::vline(ui, 22.0);
                     opt_label(ui, "Mode");
                     let mut mode = BlendMode::Normal;
@@ -235,8 +329,87 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     let mut style = 0u8;
                     widgets::dropdown(ui, "marquee-style", &mut style, &[(0u8, "Normal"), (1, "Fixed Ratio"), (2, "Fixed Size")], 96.0);
                     widgets::vline(ui, 22.0);
-                    let _ = widgets::secondary_button(ui, "Select and Mask…", 0.0);
+                    if widgets::secondary_button(ui, "Select and Mask…", 0.0).clicked() {
+                        let _ = crate::menus::invoke(app, ui.ctx(), "select.selectAndMask", json!({}));
+                    }
                 }
+                Tool::Lasso | Tool::PolygonLasso if t.pro => {
+                    selection_mode_buttons(app, ui);
+                    widgets::vline(ui, 22.0);
+                    opt_label(ui, "Feather");
+                    widgets::value_field(ui, &mut app.ui.tool_options.feather, 0.0..=1000.0, "px", 62.0);
+                    widgets::checkbox(ui, &mut app.ui.tool_options.anti_alias, "Anti-alias");
+                    widgets::vline(ui, 22.0);
+                    if widgets::secondary_button(ui, "Select and Mask…", 0.0).clicked() {
+                        let _ = crate::menus::invoke(app, ui.ctx(), "select.selectAndMask", json!({}));
+                    }
+                    if app.ui.tool == Tool::PolygonLasso && !app.ui.polygon.is_empty() {
+                        hint(ui, "Click the first point or press ↵ to close · Esc cancels");
+                    }
+                }
+                Tool::MagicWand if t.pro => {
+                    selection_mode_buttons(app, ui);
+                    widgets::vline(ui, 22.0);
+                    opt_label(ui, "Tolerance");
+                    widgets::value_field(ui, &mut app.ui.tool_options.tolerance, 0.0..=255.0, "", 58.0);
+                    widgets::checkbox(ui, &mut app.ui.tool_options.anti_alias, "Anti-alias");
+                    widgets::checkbox(ui, &mut app.ui.tool_options.contiguous, "Contiguous");
+                    widgets::checkbox(ui, &mut app.ui.tool_options.sample_all_layers, "Sample All Layers");
+                    widgets::vline(ui, 22.0);
+                    if widgets::secondary_button(ui, "Select Subject", 0.0).clicked() {
+                        let _ = app.run("select.subject", json!({}));
+                    }
+                    if widgets::secondary_button(ui, "Select and Mask…", 0.0).clicked() {
+                        let _ = crate::menus::invoke(app, ui.ctx(), "select.selectAndMask", json!({}));
+                    }
+                }
+                Tool::PaintBucket if t.pro => {
+                    opt_label(ui, "Fill");
+                    let mut src = 0u8;
+                    widgets::dropdown(ui, "bucket-src", &mut src, &[(0u8, "Foreground"), (1, "Pattern")], 100.0);
+                    opt_label(ui, "Opacity");
+                    widgets::value_field(ui, &mut app.ui.tool_options.fill_opacity, 1.0..=100.0, "%", 62.0);
+                    opt_label(ui, "Tolerance");
+                    widgets::value_field(ui, &mut app.ui.tool_options.tolerance, 0.0..=255.0, "", 58.0);
+                    widgets::checkbox(ui, &mut app.ui.tool_options.anti_alias, "Anti-alias");
+                    widgets::checkbox(ui, &mut app.ui.tool_options.contiguous, "Contiguous");
+                    widgets::checkbox(ui, &mut app.ui.tool_options.sample_all_layers, "All Layers");
+                }
+                Tool::Gradient if t.pro => {
+                    gradient_swatch(ui, app.session.tools.foreground, app.session.tools.background);
+                    widgets::vline(ui, 22.0);
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (style, icon, tip) in [("linear", "blend", "Linear Gradient"), ("radial", "circle", "Radial Gradient"), ("angle", "rotate-cw", "Angle Gradient"), ("reflected", "arrow-left-right", "Reflected Gradient"), ("diamond", "diamond", "Diamond Gradient")] {
+                        if icons::button(ui, icon, 24.0, app.ui.tool_options.gradient_style == style, tip).clicked() {
+                            app.ui.tool_options.gradient_style = style.into();
+                        }
+                    }
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    widgets::vline(ui, 22.0);
+                    opt_label(ui, "Opacity");
+                    widgets::value_field(ui, &mut app.ui.tool_options.fill_opacity, 1.0..=100.0, "%", 62.0);
+                    widgets::checkbox(ui, &mut app.ui.tool_options.gradient_reverse, "Reverse");
+                    let mut dither = true;
+                    widgets::checkbox(ui, &mut dither, "Dither");
+                }
+                Tool::Crop if t.pro => {
+                    let mut ratio = 0u8;
+                    widgets::dropdown(ui, "crop-ratio", &mut ratio, &[(0u8, "Ratio"), (1, "1 : 1 (Square)"), (2, "4 : 5 (8 : 10)"), (3, "16 : 9"), (4, "Original Ratio")], 120.0);
+                    widgets::vline(ui, 22.0);
+                    let _ = widgets::secondary_button(ui, "Clear", 0.0);
+                    let _ = icons::button(ui, "grid-3x3", 24.0, true, "Overlay: Rule of Thirds");
+                    let mut del = true;
+                    widgets::checkbox(ui, &mut del, "Delete Cropped Pixels");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icons::button(ui, "check", 26.0, false, "Commit current crop operation  (↵)").clicked() {
+                            crate::canvas::commit_crop(app);
+                        }
+                        if icons::button(ui, "ban", 26.0, false, "Cancel current crop operation  (Esc)").clicked() {
+                            app.ui.crop_rect = None;
+                        }
+                    });
+                }
+                Tool::Type if t.pro => crate::type_tool::options_bar(app, ui),
                 Tool::Move if t.pro => {
                     let mut auto = false;
                     widgets::checkbox(ui, &mut auto, "Auto-Select:");
@@ -270,6 +443,14 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     }
                 }
                 Tool::Hand => hint(ui, "Drag to pan  ·  hold Space with any tool"),
+                Tool::Lasso | Tool::PolygonLasso => hint(ui, "Drag (lasso) or click points (polygonal) · ⇧ add · ⌥ subtract"),
+                Tool::MagicWand => hint(ui, "Click to select similar colours"),
+                Tool::Crop => hint(ui, "Drag a crop box · ↵ commits · Esc cancels"),
+                Tool::Gradient => hint(ui, "Drag to draw a gradient"),
+                Tool::PaintBucket => hint(ui, "Click to fill similar colours"),
+                Tool::Type => hint(ui, "Click to add text"),
+                // Retouching and smart-selection tools draw their bar in `retouch_ui::options_bar`.
+                _ => {}
             }
         });
     });
@@ -344,7 +525,7 @@ pub fn right_dock(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     }
     // Narrow icon rail (always visible) that toggles panels.
     let (rw, rb) = if t.pro { (36.0, 28.0) } else { (44.0, 32.0) };
-    egui::Panel::right("rail").resizable(false).exact_size(rw).frame(egui::Frame::NONE.fill(if t.pro { t.chrome } else { t.chrome }).inner_margin(egui::Margin::symmetric(4, 8))).show(ui, |ui| {
+    egui::Panel::right("rail").resizable(false).exact_size(rw).frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(4, 8))).show(ui, |ui| {
         let r = ui.max_rect();
         ui.painter().line_segment([r.left_top() - vec2(6.0, 8.0), r.left_bottom() + vec2(-6.0, 8.0)], Stroke::new(1.0, t.separator));
         ui.spacing_mut().item_spacing.y = 4.0;
@@ -375,7 +556,7 @@ pub fn right_dock(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 
 fn dock_panels(app: &mut PhotocraftApp, ui: &mut egui::Ui, p: &crate::state::Panels, t: &Tokens) {
     let p = p.clone();
-    if !(p.layers || p.history || p.color || p.navigator) {
+    if !(p.layers || p.history || p.color || p.navigator || (t.pro && p.properties)) {
         return;
     }
     let margin = if t.pro { 2 } else { 8 };
@@ -397,23 +578,34 @@ fn dock_panels(app: &mut PhotocraftApp, ui: &mut egui::Ui, p: &crate::state::Pan
             }
             if t.pro && p.properties {
                 let mut sel = app.ui.dock_tabs.properties;
-                widgets::card(ui, "properties", &["Properties", "Adjustments"], &mut sel, |ui, tab| if tab == 0 { properties_body(app, ui) } else { adjustments_grid(app, ui) });
+                // Leave Layers at least ~240 px; Properties scrolls within what remains.
+                let reserve = if p.layers { 240.0 } else { 40.0 };
+                let max_h = (ui.available_height() - reserve - 40.0).max(70.0);
+                widgets::card(ui, "properties", &["Properties", "Adjustments"], &mut sel, |ui, tab| {
+                    egui::ScrollArea::vertical().id_salt("props-scroll").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| if tab == 0 { properties_body(app, ui) } else { adjustments_grid(app, ui) });
+                });
                 app.ui.dock_tabs.properties = sel;
             }
             if p.navigator {
-                let mut sel = 0;
-                widgets::card(ui, "navigator", &["Navigator", "Histogram"], &mut sel, |ui, tab| if tab == 0 { navigator(app, ui) } else { empty(ui, "Histogram arrives with the GPU pipeline (M5)") });
+                let mut sel = app.ui.dock_tabs.navigator;
+                widgets::card(ui, "navigator", &["Navigator", "Histogram", "Info"], &mut sel, |ui, tab| match tab {
+                    0 => navigator(app, ui),
+                    1 => crate::tone::histogram_panel(app, ui),
+                    _ => info_panel(app, ui),
+                });
+                app.ui.dock_tabs.navigator = sel;
             }
             if p.history {
-                let mut sel = 0;
-                widgets::card(ui, "history", &["History"], &mut sel, |ui, _| history(app, ui));
+                let mut sel = app.ui.dock_tabs.history;
+                widgets::card(ui, "history", &["History", "Actions"], &mut sel, |ui, tab| if tab == 0 { history(app, ui) } else { crate::actions::panel(app, ui) });
+                app.ui.dock_tabs.history = sel;
             }
             if p.layers {
                 let mut sel = app.ui.dock_tabs.layers;
                 widgets::card(ui, "layers", &["Layers", "Channels", "Paths"], &mut sel, |ui, tab| match tab {
                     0 => layers(app, ui),
                     1 => channels(app, ui),
-                    _ => empty(ui, "No paths"),
+                    _ => crate::vector_ui::paths_panel(app, ui),
                 });
                 app.ui.dock_tabs.layers = sel;
             }
@@ -425,6 +617,62 @@ fn dock_panels(app: &mut PhotocraftApp, ui: &mut egui::Ui, p: &crate::state::Pan
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| draw(app, ui));
         }
     });
+}
+
+/// Photoshop's Info panel: colour under the pointer (RGB and CMYK), position, selection size.
+fn info_panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get(ui.ctx());
+    let Some(st) = app.session.active() else {
+        empty(ui, "No document");
+        return;
+    };
+    let (rev, size) = (st.revision, st.doc.size);
+    let sel = st.doc.selection.as_ref().map(|m| m.content_bounds());
+    let pos = app.hover_doc.map(|p| (p[0].floor() as i32, p[1].floor() as i32)).filter(|(x, y)| *x >= 0 && *y >= 0 && *x < size.width as i32 && *y < size.height as i32);
+    let rgba = pos.and_then(|(x, y)| {
+        if let Some(((cx, cy, cr), v)) = app.info_sample
+            && (cx, cy, cr) == (x, y, rev)
+        {
+            return Some(v);
+        }
+        let v: Vec<f32> = serde_json::from_value(app.session.execute("document.pixel", json!({"x": x, "y": y})).ok()?).ok()?;
+        let v = [v[0], v[1], v[2], v[3]];
+        app.info_sample = Some(((x, y, rev), v));
+        Some(v)
+    });
+    let mono = theme::mono(11.5);
+    let row = |ui: &mut egui::Ui, k: &str, v: String| {
+        ui.horizontal(|ui| {
+            ui.add_sized([18.0, 16.0], egui::Label::new(RichText::new(k).color(t.text_dim).size(11.5)));
+            ui.label(RichText::new(v).font(mono.clone()).color(t.text));
+        });
+    };
+    ui.columns(2, |cols| {
+        let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as i32;
+        let dash = || "—".to_string();
+        row(&mut cols[0], "R:", rgba.map_or_else(dash, |c| q(c[0]).to_string()));
+        row(&mut cols[0], "G:", rgba.map_or_else(dash, |c| q(c[1]).to_string()));
+        row(&mut cols[0], "B:", rgba.map_or_else(dash, |c| q(c[2]).to_string()));
+        // Naive device CMYK (no ICC profile yet), in percent like Photoshop's readout.
+        let cmyk = rgba.map(|c| {
+            let k = 1.0 - c[0].max(c[1]).max(c[2]);
+            let f = |v: f32| if k >= 1.0 { 0.0 } else { (1.0 - v - k) / (1.0 - k) };
+            [f(c[0]), f(c[1]), f(c[2]), k].map(|v| (v * 100.0).round() as i32)
+        });
+        for (i, k) in ["C:", "M:", "Y:", "K:"].iter().enumerate() {
+            row(&mut cols[1], k, cmyk.map_or_else(dash, |c| format!("{}%", c[i])));
+        }
+    });
+    widgets::hairline(ui);
+    ui.columns(2, |cols| {
+        let dash = || "—".to_string();
+        row(&mut cols[0], "X:", pos.map_or_else(dash, |p| p.0.to_string()));
+        row(&mut cols[0], "Y:", pos.map_or_else(dash, |p| p.1.to_string()));
+        row(&mut cols[1], "W:", sel.map_or_else(dash, |r| r.width().to_string()));
+        row(&mut cols[1], "H:", sel.map_or_else(dash, |r| r.height().to_string()));
+    });
+    widgets::hairline(ui);
+    ui.label(RichText::new(format!("Doc: {} × {} px", size.width, size.height)).color(t.text_dim).size(11.5));
 }
 
 fn navigator(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
@@ -577,8 +825,15 @@ fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             icons::paint(ui, Rect::from_center_size(r.left_center() + vec2(11.0, 0.0), vec2(14.0, 14.0)), "search", 11.0, t.text_faint);
             ui.painter().text(r.left_center() + vec2(22.0, 0.0), Align2::LEFT_CENTER, "Kind", egui::FontId::proportional(11.5), t.text_dim);
             ui.add_space(4.0);
-            for (icon, tip) in [("image", "Pixel layers"), ("contrast", "Adjustment layers"), ("type", "Type layers"), ("square", "Shape layers"), ("app-window", "Smart objects")] {
-                let _ = icons::button(ui, icon, 22.0, false, tip);
+            for (kind, icon, tip) in [("pixel", "image", "Filter for pixel layers"), ("adjustment", "contrast", "Filter for adjustment layers"), ("type", "type", "Filter for type layers"), ("shape", "square", "Filter for shape layers"), ("smart", "app-window", "Filter for smart objects")] {
+                let on = app.ui.layer_filter.iter().any(|k| k == kind);
+                if icons::button(ui, icon, 22.0, on, tip).clicked() {
+                    if on {
+                        app.ui.layer_filter.retain(|k| k != kind);
+                    } else {
+                        app.ui.layer_filter.push(kind.to_string());
+                    }
+                }
             }
         });
         ui.add_space(4.0);
@@ -602,14 +857,24 @@ fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             label(ui, if t.pro { "Lock:" } else { "Lock" });
             if t.pro {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                for (icon, tip) in [("grid-3x3", "Lock transparent pixels"), ("brush", "Lock image pixels"), ("move", "Lock position"), ("scan", "Prevent auto-nesting"), ("lock", "Lock all")] {
-                    let on = icon == "lock" && (l.locks.all || l.locks.transparency || l.locks.position);
-                    let _ = icons::button(ui, icon, 20.0, on, tip);
+                let lk = l.locks;
+                for (key, icon, tip, on) in [
+                    ("transparency", "grid-3x3", "Lock transparent pixels", lk.transparency),
+                    ("pixels", "brush", "Lock image pixels", lk.pixels),
+                    ("position", "move", "Lock position", lk.position),
+                    ("artboard", "scan", "Prevent auto-nesting in and out of Artboards and Frames", lk.artboard),
+                    ("all", "lock", "Lock all", lk.all),
+                ] {
+                    if icons::button(ui, icon, 20.0, on, tip).clicked() {
+                        actions.push(("layer.setProps".into(), json!({"layer": l.id.0, "locks": { key: !on }})));
+                    }
                 }
             }
             if !t.pro {
                 let locked = l.locks.transparency || l.locks.position || l.locks.all;
-                let _ = icons::button(ui, if locked { "lock" } else { "lock-open" }, 22.0, locked, "Lock layer");
+                if icons::button(ui, if locked { "lock" } else { "lock-open" }, 22.0, locked, "Lock layer").clicked() {
+                    actions.push(("layer.setProps".into(), json!({"layer": l.id.0, "locks": {"all": !l.locks.all}})));
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut f = l.fill_opacity * 100.0;
@@ -628,7 +893,21 @@ fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let fill = t.pro && ui.available_height() > footer + 60.0;
     let rows_h = if fill { ui.available_height() - footer } else { f32::INFINITY };
     egui::ScrollArea::vertical().id_salt("layer-rows").max_height(rows_h).min_scrolled_height(if fill { rows_h } else { 0.0 }).auto_shrink([false, !fill]).show(ui, |ui| {
+        let filter = app.ui.layer_filter.clone();
         for (_, depth, l) in rows.iter().rev() {
+            if !filter.is_empty() {
+                let kind = match &l.content {
+                    LayerContent::Raster(_) => "pixel",
+                    LayerContent::Adjustment(_) | LayerContent::Fill(_) => "adjustment",
+                    LayerContent::Text(_) => "type",
+                    LayerContent::Shape(_) => "shape",
+                    LayerContent::Smart(_) => "smart",
+                    LayerContent::Group(_) => "",
+                };
+                if !filter.iter().any(|k| k == kind) {
+                    continue;
+                }
+            }
             layer_row(app, &ctx, ui, &doc, l, *depth, active == Some(l.id), &mut actions);
             if !l.effects.items.is_empty() {
                 effect_rows(app, ui, l, *depth);
@@ -700,6 +979,10 @@ fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         });
     });
     for (id, p) in actions {
+        if id == "ui.maskTarget" {
+            app.ui.mask_target = p.as_bool().unwrap_or(false);
+            continue;
+        }
         let _ = app.run(&id, p);
     }
 }
@@ -742,12 +1025,27 @@ fn layer_row(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &mut egui::Ui, do
     let thumb = Rect::from_min_size(pos2(x, rect.center().y - ts / 2.0), vec2(ts, ts));
     draw_layer_thumb(app, ctx, ui, doc, l, thumb, selected);
     x += ts + 6.0;
+    let mut mask_rect = None;
     if let Some(m) = &l.mask {
-        let mr = Rect::from_min_size(pos2(x, rect.center().y - 17.0), vec2(34.0, 34.0));
+        let mr = Rect::from_min_size(pos2(x, rect.center().y - ts / 2.0), vec2(ts, ts));
         let tex = app.mask_thumb(ctx, doc, l.id, m);
         painter.image(tex, mr, Rect::from_min_max(egui::Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-        painter.rect_stroke(mr, 4.0, Stroke::new(1.0, t.field_border), StrokeKind::Inside);
-        x += 40.0;
+        painter.rect_stroke(mr, if t.pro { 0.0 } else { 4.0 }, Stroke::new(1.0, if t.pro { Color32::from_gray(20) } else { t.field_border }), StrokeKind::Outside);
+        mask_rect = Some(mr);
+        x += ts + 6.0;
+    }
+    // Photoshop frames the targeted thumbnail (pixels or mask) of the selected layer with corner brackets.
+    if selected {
+        let target = if app.ui.mask_target { mask_rect } else { Some(thumb) };
+        if let Some(r) = target.filter(|_| l.mask.is_some() || !app.ui.mask_target) {
+            let r = r.expand(3.0);
+            let k = 6.0;
+            let st = Stroke::new(1.5, t.text);
+            for (c, dx, dy) in [(r.left_top(), 1.0, 1.0), (r.right_top(), -1.0, 1.0), (r.right_bottom(), -1.0, -1.0), (r.left_bottom(), 1.0, -1.0)] {
+                painter.line_segment([c, c + vec2(k * dx, 0.0)], st);
+                painter.line_segment([c, c + vec2(0.0, k * dy)], st);
+            }
+        }
     }
     let name_color = if l.visible { t.text } else { t.text_faint };
     let font = if selected && !t.pro { theme::medium(13.0) } else { egui::FontId::proportional(if t.pro { 12.0 } else { 13.0 }) };
@@ -778,6 +1076,16 @@ fn layer_row(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &mut egui::Ui, do
     }
     if resp.clicked() && !eye_resp.clicked() {
         actions.push(("layer.select".into(), json!({"layer": l.id.0})));
+        // Clicking a thumbnail picks what painting targets; adjustment/fill layers target their mask.
+        let pos = resp.interact_pointer_pos();
+        let on_mask = mask_rect.zip(pos).is_some_and(|(r, p)| r.expand(2.0).contains(p));
+        let on_thumb = pos.is_some_and(|p| thumb.expand(2.0).contains(p));
+        let content_less = matches!(l.content, LayerContent::Adjustment(_) | LayerContent::Fill(_));
+        if on_mask || (content_less && l.mask.is_some()) {
+            actions.push(("ui.maskTarget".into(), json!(true)));
+        } else if on_thumb || !selected {
+            actions.push(("ui.maskTarget".into(), json!(false)));
+        }
     }
     // Double-click the name to rename in place (Photoshop ergonomics).
     let rename_id = egui::Id::new(("rename", l.id.0));
@@ -848,6 +1156,11 @@ fn draw_layer_thumb(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &egui::Ui,
             let icon = if l.is_group() { "folder" } else { "contrast" };
             icons::paint(ui, rect, icon, 18.0, t.icon);
         }
+        LayerContent::Text(_) => {
+            // Photoshop: type layers show a "T" tile rather than a pixel thumbnail.
+            p.rect_filled(rect, if t.pro { 0.0 } else { 6.0 }, Color32::from_gray(if t.pro { 222 } else { 236 }));
+            icons::paint(ui, rect, "type", 20.0, Color32::from_gray(40));
+        }
         LayerContent::Fill(f) => {
             let c = match f {
                 photocraft_doc::Fill::Solid(c) => c.to_rgba8(),
@@ -871,22 +1184,32 @@ fn channels(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         empty(ui, "No document");
         return;
     };
-    let names: Vec<&str> = match st.doc.mode {
+    let doc = st.doc.clone();
+    let names: Vec<&str> = match doc.mode {
         photocraft_doc::ColorMode::Cmyk => vec!["CMYK", "Cyan", "Magenta", "Yellow", "Black"],
         photocraft_doc::ColorMode::Grayscale => vec!["Gray"],
         photocraft_doc::ColorMode::Lab => vec!["Lab", "Lightness", "a", "b"],
         _ => vec!["RGB", "Red", "Green", "Blue"],
     };
     let t = Tokens::get(ui.ctx());
+    let ctx = ui.ctx().clone();
+    let thumbs = app.channel_thumbs(&ctx);
     for (i, n) in names.iter().enumerate() {
-        ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
-            icons::paint(ui, r, "eye", 15.0, t.icon);
-            ui.label(RichText::new(*n).color(t.text));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(format!("⌘{}", i + 2)).font(theme::mono(11.0)).color(t.text_faint));
-            });
-        });
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
+        if i == 0 || resp.hovered() {
+            ui.painter().rect_filled(rect, 0.0, if i == 0 { t.row_selected.gamma_multiply(if t.pro { 1.0 } else { 0.0 }) } else { t.hover.gamma_multiply(0.4) });
+        }
+        icons::paint(ui, Rect::from_min_size(pos2(rect.left() + 6.0, rect.center().y - 9.0), vec2(18.0, 18.0)), "eye", 13.0, t.icon);
+        let thumb = Rect::from_min_size(pos2(rect.left() + 34.0, rect.center().y - 14.0), vec2(28.0, 28.0));
+        if let Some(tex) = thumbs.get(i.min(thumbs.len().saturating_sub(1))) {
+            ui.painter().image(*tex, thumb, Rect::from_min_max(egui::Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        ui.painter().rect_stroke(thumb, 0.0, Stroke::new(1.0, t.separator), StrokeKind::Outside);
+        ui.painter().text(pos2(thumb.right() + 10.0, rect.center().y), Align2::LEFT_CENTER, *n, egui::FontId::proportional(12.0), t.text);
+        ui.painter().text(pos2(rect.right() - 8.0, rect.center().y), Align2::RIGHT_CENTER, format!("⌘{}", i + 2), theme::mono(11.0), t.text_faint);
+        if t.pro {
+            ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, t.separator));
+        }
     }
 }
 
@@ -896,6 +1219,7 @@ fn history(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         empty(ui, "No document");
         return;
     };
+    let doc = st.doc.clone();
     let entries = st.history.entries();
     let current = entries.len() - 1;
     let redo: Vec<String> = {
@@ -911,20 +1235,59 @@ fn history(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         }
         v
     };
+    // Snapshot row (Photoshop shows the document's opening state with a thumbnail).
+    {
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
+        let thumb = Rect::from_min_size(pos2(rect.left() + 28.0, rect.center().y - 14.0), vec2(28.0, 28.0));
+        let ctx = ui.ctx().clone();
+        if let Some(layer) = doc.layers.first() {
+            widgets::checker(ui.painter(), thumb, 4.0);
+            let tex = app.layer_thumb(&ctx, &doc, layer);
+            ui.painter().image(tex, thumb, Rect::from_min_max(egui::Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        ui.painter().rect_stroke(thumb, 0.0, Stroke::new(1.0, t.separator), StrokeKind::Outside);
+        ui.painter().text(pos2(thumb.right() + 8.0, rect.center().y), Align2::LEFT_CENTER, &doc.name, egui::FontId::proportional(12.0), t.text);
+        ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, t.separator));
+    }
     let mut target: Option<isize> = None;
     let all = entries.iter().map(|e| (e.clone(), false)).chain(redo.iter().map(|e| (e.clone(), true)));
-    for (i, (e, is_redo)) in all.enumerate() {
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
-        if i == current {
-            ui.painter().rect_filled(rect, t.radius_sm, t.accent_soft);
-        } else if resp.hovered() {
-            ui.painter().rect_filled(rect, t.radius_sm, t.hover);
+    // Leave room for Layers below (the dock gives Layers a height budget).
+    let reserve = if app.ui.panels.layers { 250.0 } else { 0.0 };
+    let max_h = (ui.available_height() - reserve - 40.0).clamp(60.0, 360.0);
+    egui::ScrollArea::vertical().id_salt("history-rows").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+        for (i, (e, is_redo)) in all.enumerate() {
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+            if i == current {
+                ui.painter().rect_filled(rect, if t.pro { 0.0 } else { t.radius_sm }, if t.pro { t.row_selected } else { t.accent_soft });
+            } else if resp.hovered() {
+                ui.painter().rect_filled(rect, 0.0, t.hover.gamma_multiply(0.5));
+            }
+            let icon = match e.as_str() {
+                s if s.contains("Brush") || s.contains("Eraser") => "brush",
+                s if s.contains("Layer") => "layers",
+                s if s.contains("Select") || s.contains("Marquee") || s.contains("Deselect") || s.contains("Lasso") => "square-dashed",
+                s if s.contains("Fill") => "paint-bucket",
+                "Open" => "image",
+                _ => "sliders-horizontal",
+            };
+            let color = if is_redo { t.text_faint } else { t.text };
+            icons::paint(ui, Rect::from_center_size(pos2(rect.left() + 42.0, rect.center().y), vec2(16.0, 16.0)), icon, 12.0, if is_redo { t.text_faint } else { t.icon });
+            ui.painter().text(pos2(rect.left() + 58.0, rect.center().y), Align2::LEFT_CENTER, &e, egui::FontId::proportional(12.0), color);
+            if resp.clicked() {
+                target = Some(i as isize - current as isize);
+            }
         }
-        let color = if is_redo { t.text_faint } else { t.text };
-        ui.painter().text(rect.left_center() + vec2(10.0, 0.0), Align2::LEFT_CENTER, &e, egui::FontId::proportional(12.5), color);
-        if resp.clicked() {
-            target = Some(i as isize - current as isize);
-        }
+    });
+    if t.pro {
+        widgets::hairline(ui);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let _ = icons::button(ui, "trash", 24.0, false, "Delete current state");
+                let _ = icons::button(ui, "scan", 24.0, false, "Create new snapshot");
+                let _ = icons::button(ui, "file-plus", 24.0, false, "Create new document from current state");
+            });
+        });
     }
     if let Some(delta) = target {
         let (cmd, n) = if delta < 0 { ("edit.undo", -delta) } else { ("edit.redo", delta) };
@@ -1045,7 +1408,13 @@ fn adjustment_controls(app: &mut PhotocraftApp, ui: &mut egui::Ui, id: LayerId, 
     let mut commit = false;
     let mut live = false;
     let hue = widgets::hue_stops();
-    for &(key, label, min, max, default) in adjustment_sliders(kind) {
+    let tone = matches!(kind, "levels" | "curves");
+    if kind == "levels" {
+        crate::tone::levels_editor(app, ui, id);
+    } else if kind == "curves" {
+        crate::tone::curves_editor(app, ui, id);
+    }
+    for &(key, label, min, max, default) in if tone { &[][..] } else { adjustment_sliders(kind) } {
         let mut v = values.get(key).and_then(Value::as_f64).unwrap_or(default as f64) as f32;
         let gradient = if key == "hue" { Some(&hue[..]) } else { None };
         let unit = match key {
@@ -1070,7 +1439,7 @@ fn adjustment_controls(app: &mut PhotocraftApp, ui: &mut egui::Ui, id: LayerId, 
         }
         ui.add_space(4.0);
     }
-    if adjustment_sliders(kind).is_empty() && kind != "invert" {
+    if adjustment_sliders(kind).is_empty() && !tone && kind != "invert" {
         ui.label(RichText::new("Detailed controls for this adjustment arrive in milestone M7.").color(t.text_faint));
     }
     if live {
@@ -1145,6 +1514,8 @@ fn properties_body(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             LayerContent::Adjustment(_) => "sliders-horizontal",
             LayerContent::Group(_) => "folder",
             LayerContent::Fill(_) => "paint-bucket",
+            LayerContent::Text(_) => "type",
+            LayerContent::Shape(_) => "pentagon",
             _ => "image",
         };
         let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
@@ -1162,6 +1533,12 @@ fn properties_body(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         adjustment_controls(app, ui, id, adj);
     } else {
         layer_controls(app, ui, &layer);
+        if matches!(layer.content, LayerContent::Text(_)) {
+            crate::type_tool::type_properties(app, ui);
+        }
+        if matches!(layer.content, LayerContent::Shape(_)) {
+            crate::vector_ui::shape_properties(app, ui, id);
+        }
     }
 }
 
@@ -1307,42 +1684,73 @@ fn hsva_srgb(h: egui::ecolor::Hsva) -> [f32; 4] {
     [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
 }
 
-#[cfg(test)]
-mod color_tests {
-    use super::*;
-
-    #[test]
-    fn srgb_hsva_roundtrip() {
-        for c in [[0.847, 0.271, 0.180, 1.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0], [0.2, 0.6, 0.4, 1.0]] {
-            let back = hsva_srgb(srgb_hsva(c));
-            for i in 0..3 {
-                assert!((back[i] - c[i]).abs() <= 1.0 / 255.0, "{c:?} -> {back:?}");
-            }
-        }
+/// Photoshop's brush preset picker chip: a soft/hard round tip preview with the size underneath.
+/// Draw a round brush tip preview (hard core fading to a soft edge).
+fn brush_tip(p: &egui::Painter, c: egui::Pos2, rad: f32, hardness: f32, color: Color32) {
+    let inner = rad * hardness.clamp(0.05, 1.0);
+    let steps = 8;
+    for k in (0..=steps).rev() {
+        let f = k as f32 / steps as f32;
+        let rr = inner + (rad - inner) * f;
+        let a = if hardness >= 0.99 { 1.0 } else { (1.0 - f).powf(1.5) };
+        p.circle_filled(c, rr, color.gamma_multiply(a));
     }
 }
 
-/// Photoshop's brush preset picker chip: a soft/hard round tip preview with the size underneath.
-fn brush_preset_chip(ui: &mut egui::Ui, size: f32, hardness: f32) {
+/// Options-bar brush chip; opens Photoshop's Brush Preset Picker (size, hardness, preset tips).
+fn brush_preset_chip(ui: &mut egui::Ui, b: &mut photocraft_engine::BrushSettings) {
     let t = Tokens::get(ui.ctx());
     let (r, resp) = ui.allocate_exact_size(vec2(44.0, 30.0), Sense::click());
     if resp.hovered() {
         ui.painter().rect_filled(r, t.radius_sm, t.hover);
     }
     let c = pos2(r.left() + 14.0, r.top() + 11.0);
-    // soft edge: concentric circles fading out
-    let rad = 7.0;
-    let inner = rad * hardness.clamp(0.05, 1.0);
-    let steps = 6;
-    for k in (0..=steps).rev() {
-        let f = k as f32 / steps as f32;
-        let rr = inner + (rad - inner) * f;
-        let a = if hardness >= 0.99 { 255 } else { (255.0 * (1.0 - f).powf(1.5)) as u8 };
-        ui.painter().circle_filled(c, rr, Color32::from_white_alpha(a));
-    }
-    ui.painter().text(pos2(c.x, r.bottom() - 5.0), Align2::CENTER_CENTER, format!("{}", size.round() as i64), egui::FontId::proportional(9.5), t.text_dim);
+    brush_tip(ui.painter(), c, 7.0, b.hardness, Color32::WHITE);
+    ui.painter().text(pos2(c.x, r.bottom() - 5.0), Align2::CENTER_CENTER, format!("{}", b.size.round() as i64), egui::FontId::proportional(9.5), t.text_dim);
     icons::paint(ui, Rect::from_center_size(pos2(r.right() - 9.0, c.y), vec2(10.0, 10.0)), "chevron-down", 9.0, t.text_faint);
-    resp.on_hover_text("Brush preset picker (size and hardness in the options bar and with [ ])");
+    let resp = resp.on_hover_text("Brush Preset picker");
+    egui::Popup::from_toggle_button_response(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        ui.set_width(260.0);
+        // Size: value field plus a logarithmic slider (small sizes get most of the travel).
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Size").color(t.text_dim));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut size = b.size;
+                if widgets::value_field(ui, &mut size, 1.0..=5000.0, "px", 72.0).changed() {
+                    b.size = size.round().clamp(1.0, 5000.0);
+                }
+            });
+        });
+        let mut lv = b.size.max(1.0).ln();
+        if widgets::slider(ui, &mut lv, 0.0..=5000f32.ln(), None).changed() {
+            b.size = lv.exp().round().clamp(1.0, 5000.0);
+        }
+        let mut hard = b.hardness * 100.0;
+        if widgets::slider_row(ui, "Hardness", &mut hard, 0.0..=100.0, "%", None).changed() {
+            b.hardness = (hard / 100.0).clamp(0.0, 1.0);
+        }
+        ui.add_space(6.0);
+        widgets::hairline(ui);
+        ui.add_space(6.0);
+        ui.label(RichText::new("General Brushes").color(t.text_dim).size(11.5));
+        // Photoshop's default round presets: soft and hard at common sizes.
+        let presets: [(f32, f32); 12] = [(1.0, 1.0), (3.0, 1.0), (5.0, 1.0), (9.0, 1.0), (13.0, 1.0), (19.0, 1.0), (5.0, 0.0), (9.0, 0.0), (13.0, 0.0), (17.0, 0.0), (45.0, 0.0), (65.0, 0.0)];
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            for (sz, hd) in presets {
+                let (cell, cr) = ui.allocate_exact_size(vec2(38.0, 44.0), Sense::click());
+                let on = (b.size - sz).abs() < 0.5 && (b.hardness - hd).abs() < 0.01;
+                ui.painter().rect_filled(cell, 3.0, if on { t.accent_soft } else if cr.hovered() { t.hover } else { t.field });
+                let rad = (sz / 2.0).clamp(1.0, 13.0);
+                brush_tip(ui.painter(), pos2(cell.center().x, cell.top() + 17.0), rad, hd, t.text);
+                ui.painter().text(pos2(cell.center().x, cell.bottom() - 7.0), Align2::CENTER_CENTER, format!("{}", sz as i64), egui::FontId::proportional(9.5), t.text_dim);
+                if cr.on_hover_text(format!("{} Round {sz:.0} px", if hd >= 1.0 { "Hard" } else { "Soft" })).clicked() {
+                    b.size = sz;
+                    b.hardness = hd;
+                }
+            }
+        });
+    });
 }
 
 /// Drag a layer row to reorder: drop on the upper/lower half to place above/below, or on the middle
@@ -1424,6 +1832,48 @@ fn effect_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, l: &Layer, depth: usi
         ui.painter().text(pos2(x, rect.center().y), Align2::LEFT_CENTER, name, egui::FontId::proportional(11.5), if on { t.text_dim } else { t.text_faint });
         if resp.double_clicked() {
             crate::layer_style::open(app, kind);
+        }
+    }
+}
+
+/// New / add / subtract / intersect selection buttons (shared by selection tools).
+fn selection_mode_buttons(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    ui.spacing_mut().item_spacing.x = 2.0;
+    for (i, (icon, tip)) in [("square", "New selection"), ("plus", "Add to selection  (⇧)"), ("minus", "Subtract from selection  (⌥)"), ("squares-subtract", "Intersect with selection  (⇧⌥)")].iter().enumerate() {
+        if icons::button(ui, icon, 24.0, app.ui.selection_mode == i as u8, tip).clicked() {
+            app.ui.selection_mode = i as u8;
+        }
+    }
+    ui.spacing_mut().item_spacing.x = 8.0;
+}
+
+/// Gradient picker swatch (foreground → background), Photoshop options-bar style.
+fn gradient_swatch(ui: &mut egui::Ui, a: [f32; 4], b: [f32; 4]) {
+    let t = Tokens::get(ui.ctx());
+    let (r, resp) = ui.allocate_exact_size(vec2(96.0, 20.0), Sense::click());
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(r.left_top(), c32(a));
+    mesh.colored_vertex(r.right_top(), c32(b));
+    mesh.colored_vertex(r.right_bottom(), c32(b));
+    mesh.colored_vertex(r.left_bottom(), c32(a));
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    ui.painter().add(mesh);
+    ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, t.field_border), StrokeKind::Outside);
+    let _ = resp.on_hover_text("Click to edit the gradient");
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+
+    #[test]
+    fn srgb_hsva_roundtrip() {
+        for c in [[0.847, 0.271, 0.180, 1.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0], [0.2, 0.6, 0.4, 1.0]] {
+            let back = hsva_srgb(srgb_hsva(c));
+            for i in 0..3 {
+                assert!((back[i] - c[i]).abs() <= 1.0 / 255.0, "{c:?} -> {back:?}");
+            }
         }
     }
 }

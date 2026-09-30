@@ -1,0 +1,494 @@
+// Photocraft GPU compositor kernels.
+//
+// Every pass renders one chunk of the canvas into a straight-alpha RGBA16F accumulator, reading
+// its inputs with `textureLoad` at the same pixel. The functions mirror `photocraft-compose`
+// (the CPU reference) operation for operation; keep them in sync.
+
+struct Chunk {
+    origin: vec2<i32>,
+    size: vec2<i32>,
+};
+
+struct Op {
+    mode: i32,
+    kind: i32,
+    flags: u32,
+    _pad0: u32,
+    opacity: f32,
+    mask_density: f32,
+    mask_default: f32,
+    _pad1: f32,
+    tex_origin: vec2<i32>,
+    tex_size: vec2<i32>,
+    mask_origin: vec2<i32>,
+    mask_size: vec2<i32>,
+    color: vec4<f32>,
+    p0: vec4<f32>,
+    p1: vec4<f32>,
+    p2: vec4<f32>,
+    p3: vec4<f32>,
+};
+
+const F_MASK: u32 = 1u;          // layer has an enabled mask
+const F_MASK_TEX: u32 = 2u;      // mask pixels live in `mask_tex`
+const F_TEX: u32 = 4u;           // layer pixels live in `layer_tex`
+const F_GRADIENT: u32 = 8u;      // gradient fill (stops in `lut_tex`)
+
+@group(0) @binding(0) var<uniform> chunk: Chunk;
+@group(0) @binding(1) var<uniform> op: Op;
+@group(1) @binding(0) var tex_a: texture_2d<f32>;
+@group(1) @binding(1) var tex_b: texture_2d<f32>;
+@group(1) @binding(2) var layer_tex: texture_2d<f32>;
+@group(1) @binding(3) var mask_tex: texture_2d<f32>;
+@group(1) @binding(4) var lut_tex: texture_2d<f32>;
+
+struct VOut { @builtin(position) pos: vec4<f32> };
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> VOut {
+    let uv = vec2(f32((vi << 1u) & 2u), f32(vi & 2u));
+    return VOut(vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0));
+}
+
+fn local(pos: vec4<f32>) -> vec2<i32> { return vec2<i32>(floor(pos.xy)); }
+fn doc_px(p: vec2<i32>) -> vec2<i32> { return chunk.origin + p; }
+
+fn inside(p: vec2<i32>, size: vec2<i32>) -> bool {
+    return p.x >= 0 && p.y >= 0 && p.x < size.x && p.y < size.y;
+}
+
+// Rust's f32::round (half away from zero) for non-negative inputs.
+fn round_half_up(x: f32) -> f32 { return floor(x + 0.5); }
+fn rem_euclid(x: f32, m: f32) -> f32 { return x - floor(x / m) * m; }
+
+fn mask_value(d: vec2<i32>) -> f32 {
+    if ((op.flags & F_MASK) == 0u) {
+        return 1.0;
+    }
+    var v = op.mask_default;
+    if ((op.flags & F_MASK_TEX) != 0u) {
+        let m = d - op.mask_origin;
+        if (inside(m, op.mask_size)) {
+            v = textureLoad(mask_tex, m, 0).r;
+        }
+    }
+    return 1.0 - op.mask_density * (1.0 - v);
+}
+
+fn lut(row: i32, v: f32) -> f32 {
+    let x = clamp(v, 0.0, 1.0) * 4095.0;
+    let i = i32(floor(x));
+    let j = min(i + 1, 4095);
+    let f = x - f32(i);
+    return textureLoad(lut_tex, vec2(i, row), 0).r * (1.0 - f) + textureLoad(lut_tex, vec2(j, row), 0).r * f;
+}
+
+fn gray(c: vec3<f32>) -> f32 { return 0.299 * c.r + 0.587 * c.g + 0.114 * c.b; }
+
+// ---- blend modes (photocraft_color::blend + compose::psblend) ------------------------------
+
+const M_NORMAL: i32 = 1;
+const M_DISSOLVE: i32 = 2;
+
+fn color_burn(cb: f32, cs: f32) -> f32 {
+    if (cb >= 1.0) { return 1.0; }
+    if (cs <= 0.0) { return 0.0; }
+    return 1.0 - min((1.0 - cb) / cs, 1.0);
+}
+fn color_dodge(cb: f32, cs: f32) -> f32 {
+    if (cb <= 0.0) { return 0.0; }
+    if (cs >= 1.0) { return 1.0; }
+    return min(cb / (1.0 - cs), 1.0);
+}
+fn hard_light(cb: f32, cs: f32) -> f32 {
+    if (cs <= 0.5) { return cb * 2.0 * cs; }
+    let s = 2.0 * cs - 1.0;
+    return cb + s - cb * s;
+}
+fn soft_light_ps(cb: f32, cs: f32) -> f32 {
+    if (cs <= 0.5) { return 2.0 * cb * cs + cb * cb * (1.0 - 2.0 * cs); }
+    return 2.0 * cb * (1.0 - cs) + sqrt(max(cb, 0.0)) * (2.0 * cs - 1.0);
+}
+fn vivid_light_ps(cb: f32, cs: f32) -> f32 {
+    if (cs <= 0.5) {
+        if (cs <= 0.0) { return 0.0; }
+        return 1.0 - min((1.0 - cb) / (2.0 * cs), 1.0);
+    }
+    if (cs >= 1.0) { return 1.0; }
+    return min(cb / (2.0 * (1.0 - cs)), 1.0);
+}
+fn vivid_light_generic(cb: f32, cs: f32) -> f32 {
+    if (cs <= 0.5) {
+        if (cb >= 1.0) { return 1.0; }
+        if (cs <= 0.0) { return 0.0; }
+        return 1.0 - min((1.0 - cb) / (2.0 * cs), 1.0);
+    }
+    if (cb <= 0.0) { return 0.0; }
+    if (cs >= 1.0) { return 1.0; }
+    return min(cb / (2.0 * (1.0 - cs)), 1.0);
+}
+
+fn blend_channel(mode: i32, cb: f32, cs: f32) -> f32 {
+    switch mode {
+        case 3: { return min(cb, cs); }                         // Darken
+        case 4: { return cb * cs; }                             // Multiply
+        case 5: { return color_burn(cb, cs); }                  // ColorBurn
+        case 6: { return max(cb + cs - 1.0, 0.0); }             // LinearBurn
+        case 8: { return max(cb, cs); }                         // Lighten
+        case 9: { return cb + cs - cb * cs; }                   // Screen
+        case 10: { return color_dodge(cb, cs); }                // ColorDodge
+        case 11: { return min(cb + cs, 1.0); }                  // LinearDodge
+        case 13: { return hard_light(cs, cb); }                 // Overlay
+        case 14: { return soft_light_ps(cb, cs); }              // SoftLight
+        case 15: { return hard_light(cb, cs); }                 // HardLight
+        case 16: { return vivid_light_ps(cb, cs); }             // VividLight (Photoshop)
+        case 17: { return clamp(cb + 2.0 * cs - 1.0, 0.0, 1.0); } // LinearLight
+        case 18: {                                              // PinLight
+            if (cs <= 0.5) { return min(cb, 2.0 * cs); }
+            return max(cb, 2.0 * cs - 1.0);
+        }
+        case 19: {                                              // HardMix (Photoshop)
+            return select(0.0, 1.0, vivid_light_generic(cb, cs) >= 0.5 - 1e-6);
+        }
+        case 20: { return abs(cb - cs); }                       // Difference
+        case 21: { return cb + cs - 2.0 * cb * cs; }            // Exclusion
+        case 22: { return max(cb - cs, 0.0); }                  // Subtract
+        case 23: {                                              // Divide
+            if (cs <= 0.0) { return select(1.0, 0.0, cb <= 0.0); }
+            return min(cb / cs, 1.0);
+        }
+        default: { return cs; }                                 // Normal, Dissolve, PassThrough
+    }
+}
+
+fn lum(c: vec3<f32>) -> f32 { return 0.3 * c.r + 0.59 * c.g + 0.11 * c.b; }
+
+fn clip_color(c: vec3<f32>) -> vec3<f32> {
+    let l = lum(c);
+    let n = min(min(c.r, c.g), c.b);
+    let x = max(max(c.r, c.g), c.b);
+    var out = c;
+    if (n < 0.0) {
+        let d = l - n;
+        if (abs(d) < 1e-12) { out = vec3(l); } else { out = l + (out - l) * l / d; }
+    }
+    if (x > 1.0) {
+        let d = x - l;
+        if (abs(d) < 1e-12) { out = vec3(l); } else { out = l + (out - l) * (1.0 - l) / d; }
+    }
+    return out;
+}
+fn set_lum(c: vec3<f32>, l: f32) -> vec3<f32> { return clip_color(c + (l - lum(c))); }
+fn sat(c: vec3<f32>) -> f32 { return max(max(c.r, c.g), c.b) - min(min(c.r, c.g), c.b); }
+fn set_sat(c: vec3<f32>, s: f32) -> vec3<f32> {
+    let mx = max(max(c.r, c.g), c.b);
+    let mn = min(min(c.r, c.g), c.b);
+    if (mx > mn) { return (c - mn) * s / (mx - mn); }
+    return vec3(0.0);
+}
+
+fn blend_rgb(mode: i32, cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
+    switch mode {
+        case 24: { return set_lum(set_sat(cs, sat(cb)), lum(cb)); } // Hue
+        case 25: { return set_lum(set_sat(cb, sat(cs)), lum(cb)); } // Saturation
+        case 26: { return set_lum(cs, lum(cb)); }                  // Color
+        case 27: { return set_lum(cb, lum(cs)); }                  // Luminosity
+        case 7: { return select(cb, cs, lum(cs) < lum(cb)); }      // DarkerColor
+        case 12: { return select(cb, cs, lum(cs) > lum(cb)); }     // LighterColor
+        default: {
+            return vec3(blend_channel(mode, cb.r, cs.r), blend_channel(mode, cb.g, cs.g), blend_channel(mode, cb.b, cs.b));
+        }
+    }
+}
+
+fn composite(mode: i32, b: vec4<f32>, s: vec4<f32>, opacity: f32) -> vec4<f32> {
+    let ab = b.a;
+    let as_ = s.a * opacity;
+    if (as_ <= 0.0) { return b; }
+    let bl = blend_rgb(mode, b.rgb, s.rgb);
+    let ao = as_ + ab * (1.0 - as_);
+    if (ao <= 0.0) { return vec4(0.0); }
+    let rgb = ((1.0 - as_) * ab * b.rgb + (1.0 - ab) * as_ * s.rgb + as_ * ab * bl) / ao;
+    return vec4(rgb, ao);
+}
+
+fn dissolve_noise(d: vec2<i32>) -> f32 {
+    var h = (bitcast<u32>(d.x) * 0x8da6b343u) ^ (bitcast<u32>(d.y) * 0xd8163841u) ^ 0x9e3779b9u;
+    h = h ^ (h >> 15u);
+    h = h * 0x2c1b3c6du;
+    h = h ^ (h >> 12u);
+    return f32(h & 0xffffu) / 65536.0;
+}
+
+// ---- adjustments (compose::adjust) ----------------------------------------------------------
+
+fn srgb_to_linear(v: f32) -> f32 {
+    if (v <= 0.04045) { return v / 12.92; }
+    return pow((v + 0.055) / 1.055, 2.4);
+}
+fn linear_to_srgb(v: f32) -> f32 {
+    if (v <= 0.0031308) { return v * 12.92; }
+    return 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+}
+fn t_decode(v: f32, g: f32) -> f32 {
+    if (g <= 0.0) { return srgb_to_linear(max(v, 0.0)); }
+    return pow(max(v, 0.0), g);
+}
+fn t_encode(v: f32, g: f32) -> f32 {
+    if (g <= 0.0) { return linear_to_srgb(max(v, 0.0)); }
+    return pow(max(v, 0.0), 1.0 / g);
+}
+
+fn rgb_to_hsl(c: vec3<f32>) -> vec3<f32> {
+    let mx = max(max(c.r, c.g), c.b);
+    let mn = min(min(c.r, c.g), c.b);
+    let l = (mx + mn) / 2.0;
+    if (abs(mx - mn) < 1e-7) { return vec3(0.0, 0.0, l); }
+    let d = mx - mn;
+    var s: f32;
+    if (l > 0.5) { s = d / (2.0 - mx - mn); } else { s = d / (mx + mn); }
+    var h: f32;
+    if (mx == c.r) {
+        h = rem_euclid((c.g - c.b) / d, 6.0);
+    } else if (mx == c.g) {
+        h = (c.b - c.r) / d + 2.0;
+    } else {
+        h = (c.r - c.g) / d + 4.0;
+    }
+    return vec3(h / 6.0, s, l);
+}
+fn hue_ch(p: f32, q: f32, t0: f32) -> f32 {
+    let t = rem_euclid(t0, 1.0);
+    if (t < 1.0 / 6.0) { return p + (q - p) * 6.0 * t; }
+    if (t < 0.5) { return q; }
+    if (t < 2.0 / 3.0) { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+    return p;
+}
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> vec3<f32> {
+    if (s <= 0.0) { return vec3(l); }
+    var q: f32;
+    if (l < 0.5) { q = l * (1.0 + s); } else { q = l + s - l * s; }
+    let p = 2.0 * l - q;
+    return vec3(hue_ch(p, q, h + 1.0 / 3.0), hue_ch(p, q, h), hue_ch(p, q, h - 1.0 / 3.0));
+}
+
+fn posterize(v: f32, n: f32) -> f32 {
+    let x = round_half_up(clamp(v, 0.0, 1.0) * 255.0);
+    let bin = min(floor(x * n / 256.0), n - 1.0);
+    return floor(bin * 255.0 / (n - 1.0)) / 255.0;
+}
+
+fn adjust(c: vec3<f32>) -> vec3<f32> {
+    let p0 = op.p0;
+    let p1 = op.p1;
+    let p2 = op.p2;
+    let p3 = op.p3;
+    switch op.kind {
+        case 1: { return 1.0 - c; }                                            // Invert
+        case 2: {                                                              // Threshold (p0.x = 8-bit level)
+            return vec3(select(0.0, 1.0, round_half_up(gray(c) * 255.0) >= p0.x));
+        }
+        case 3: { return vec3(posterize(c.r, p0.x), posterize(c.g, p0.x), posterize(c.b, p0.x)); }
+        case 4: { return clamp((c - 0.5) * p0.y + 0.5 + p0.x, vec3(0.0), vec3(1.0)); }   // B/C legacy
+        case 5: { return clamp((c + p0.x - 0.5) * p0.y + 0.5, vec3(0.0), vec3(1.0)); }   // B/C
+        case 6: {                                                              // Exposure
+            var o: vec3<f32>;
+            for (var i = 0; i < 3; i++) {
+                let lin = pow(max(t_decode(c[i], p0.w) * p0.x + p0.y, 0.0), 1.0 / p0.z);
+                o[i] = clamp(t_encode(lin, p0.w), 0.0, 1.0);
+            }
+            return o;
+        }
+        case 7: { return vec3(lut(0, c.r), lut(1, c.g), lut(2, c.b)); }        // Levels / Curves
+        case 8: {                                                              // Hue/Saturation
+            let hsl = rgb_to_hsl(c);
+            var hh: f32;
+            var ss: f32;
+            if (p0.w > 0.5) {
+                hh = rem_euclid(p0.x, 360.0) / 360.0;
+                ss = max(abs(p0.y), 0.25);
+            } else {
+                hh = rem_euclid(hsl.x + p0.x / 360.0, 1.0);
+                ss = clamp(hsl.y * (1.0 + p0.y), 0.0, 1.0);
+            }
+            var rgb = hsl_to_rgb(hh, ss, hsl.z);
+            if (p0.z > 0.0) {
+                rgb = rgb + (1.0 - rgb) * p0.z;
+            } else if (p0.z < 0.0) {
+                rgb = rgb * (1.0 + p0.z);
+            }
+            return rgb;
+        }
+        case 9: {                                                              // Vibrance
+            let hsl = rgb_to_hsl(c);
+            let boost = p0.x * (1.0 - hsl.y);
+            let ns = clamp(hsl.y * (1.0 + p0.y) + boost * max(hsl.y, 0.1), 0.0, 1.0);
+            return hsl_to_rgb(hsl.x, ns, hsl.z);
+        }
+        case 10: {                                                             // Channel mixer
+            let r = clamp(dot(p0.xyz, c) + p0.w, 0.0, 1.0);
+            if (p3.x > 0.5) { return vec3(r); }
+            return vec3(r, clamp(dot(p1.xyz, c) + p1.w, 0.0, 1.0), clamp(dot(p2.xyz, c) + p2.w, 0.0, 1.0));
+        }
+        case 11: {                                                             // Photo filter
+            let f = c * (1.0 - p0.w) + c * p0.rgb * p0.w;
+            if (p1.x > 0.5) {
+                let l0 = gray(c);
+                let l1 = max(gray(f), 1e-6);
+                return clamp(f * l0 / l1, vec3(0.0), vec3(1.0));
+            }
+            return f;
+        }
+        case 12: {                                                             // Black & White
+            let hsl = rgb_to_hsl(c);
+            let base = gray(c);
+            let sector = hsl.x * 6.0;
+            let i0 = u32(floor(sector)) % 6u;
+            let i1 = (i0 + 1u) % 6u;
+            let f = sector - trunc(sector);
+            var w = array<f32, 6>(p0.x - 40.0, p0.y - 60.0, p0.z - 40.0, p0.w - 60.0, p1.x - 20.0, p1.y - 80.0);
+            let wt = w[i0] * (1.0 - f) + w[i1] * f;
+            let g = clamp(base + hsl.y * wt / 100.0 * 0.5, 0.0, 1.0);
+            if (p1.z > 0.5) {
+                return clamp(g * p2.rgb * 2.0, vec3(0.0), vec3(1.0)) * 0.5 + g * 0.5;
+            }
+            return vec3(g);
+        }
+        case 13: {                                                             // Gradient map
+            var t = gray(c);
+            if (p0.x > 0.5) { t = 1.0 - t; }
+            return vec3(lut(0, t), lut(1, t), lut(2, t));
+        }
+        case 14: {                                                             // Color balance
+            let l = gray(c);
+            let ws = clamp(1.0 - l * 2.0, 0.0, 1.0);
+            let wh = clamp(l * 2.0 - 1.0, 0.0, 1.0);
+            let wm = 1.0 - ws - wh;
+            let o = clamp(c + (p0.rgb * ws + p1.rgb * wm + p2.rgb * wh) / 100.0 * 0.5, vec3(0.0), vec3(1.0));
+            if (p3.x > 0.5) {
+                let l1 = max(gray(o), 1e-6);
+                return clamp(o * l / l1, vec3(0.0), vec3(1.0));
+            }
+            return o;
+        }
+        default: { return c; }
+    }
+}
+
+// ---- fills ----------------------------------------------------------------------------------
+
+fn gradient_t(d: vec2<i32>) -> f32 {
+    // p0 = (angle°, scale, reverse, style), p1 = canvas (x0, y0, w, h)
+    let w = max(op.p1.z, 1.0);
+    let h = max(op.p1.w, 1.0);
+    let cx = op.p1.x + w / 2.0;
+    let cy = op.p1.y + h / 2.0;
+    let a = radians(op.p0.x);
+    let s = sin(a);
+    let c = cos(a);
+    let dx = f32(d.x) + 0.5 - cx;
+    let dy = f32(d.y) + 0.5 - cy;
+    let along = dx * c - dy * s;
+    let across = dx * s + dy * c;
+    let len = max(sqrt((c * w) * (c * w) + (s * h) * (s * h)), 1.0) * max(op.p0.y, 1e-3);
+    var t: f32;
+    switch i32(op.p0.w) {
+        case 1: { t = sqrt(dx * dx + dy * dy) / (len / 2.0); }                  // Radial
+        case 2: { t = rem_euclid((a - atan2(-dy, dx)) / 6.28318530718, 1.0); }   // Angle
+        case 3: { t = abs(along / (len / 2.0)); }                               // Reflected
+        case 4: { t = (abs(along) + abs(across)) / (len / 2.0); }               // Diamond
+        default: { t = along / len + 0.5; }                                     // Linear
+    }
+    t = clamp(t, 0.0, 1.0);
+    if (op.p0.z > 0.5) { t = 1.0 - t; }
+    return t;
+}
+
+fn layer_texel(d: vec2<i32>) -> vec4<f32> {
+    if ((op.flags & F_GRADIENT) != 0u) {
+        let t = gradient_t(d);
+        return vec4(lut(0, t), lut(1, t), lut(2, t), lut(3, t));
+    }
+    if ((op.flags & F_TEX) != 0u) {
+        let q = d - op.tex_origin;
+        if (inside(q, op.tex_size)) {
+            return textureLoad(layer_tex, q, 0);
+        }
+    }
+    return op.color;
+}
+
+// ---- passes ---------------------------------------------------------------------------------
+
+// A layer's own pixels (raster / fill), times its mask.
+@fragment
+fn fs_content(in: VOut) -> @location(0) vec4<f32> {
+    let d = doc_px(local(in.pos));
+    var c = layer_texel(d);
+    c.a = c.a * mask_value(d);
+    return c;
+}
+
+// Multiply alpha of A by the mask (isolated group content).
+@fragment
+fn fs_mask(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    var c = textureLoad(tex_a, p, 0);
+    c.a = c.a * mask_value(doc_px(p));
+    return c;
+}
+
+// blend_into(backdrop = A, src = B, mode, opacity), including Dissolve.
+@fragment
+fn fs_blend(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let b = textureLoad(tex_a, p, 0);
+    var s = textureLoad(tex_b, p, 0);
+    if (s.a <= 0.0) { return b; }
+    if (op.mode == M_DISSOLVE) {
+        s.a = select(0.0, 1.0, dissolve_noise(doc_px(p)) < s.a * op.opacity);
+        return composite(M_NORMAL, b, s, 1.0);
+    }
+    return composite(op.mode, b, s, op.opacity);
+}
+
+// composite_atop(base = A, src = B): blend as if the base were opaque, keep its alpha.
+@fragment
+fn fs_atop(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let base = textureLoad(tex_a, p, 0);
+    if (base.a <= 0.0) { return base; }
+    let s = textureLoad(tex_b, p, 0);
+    let r = composite(op.mode, vec4(base.rgb, 1.0), s, op.opacity);
+    return vec4(r.rgb, base.a);
+}
+
+// Adjustment applied to A (transparent pixels untouched).
+@fragment
+fn fs_adjust(in: VOut) -> @location(0) vec4<f32> {
+    let c = textureLoad(tex_a, local(in.pos), 0);
+    if (c.a <= 0.0) { return c; }
+    return vec4(adjust(c.rgb), c.a);
+}
+
+// Mix an adjusted result B back over the original A with blend mode, opacity and mask.
+@fragment
+fn fs_adjmix(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let b = textureLoad(tex_a, p, 0);
+    let k = op.opacity * mask_value(doc_px(p));
+    if (k <= 0.0) { return b; }
+    let a = textureLoad(tex_b, p, 0);
+    let bl = blend_rgb(op.mode, b.rgb, a.rgb);
+    return vec4(b.rgb + (bl - b.rgb) * k, b.a);
+}
+
+// Pass-through group opacity/mask: lerp(A, B, opacity × mask) on all channels.
+@fragment
+fn fs_lerp(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let a = textureLoad(tex_a, p, 0);
+    let b = textureLoad(tex_b, p, 0);
+    let k = op.opacity * mask_value(doc_px(p));
+    return a + (b - a) * k;
+}

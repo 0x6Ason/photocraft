@@ -50,8 +50,33 @@ pub fn tool_icon(t: Tool) -> &'static str {
         Tool::Brush => "brush",
         Tool::Eraser => "eraser",
         Tool::Eyedropper => "pipette",
+        Tool::Lasso => "lasso",
+        Tool::PolygonLasso => "pentagon",
+        Tool::MagicWand => "wand-sparkles",
+        Tool::Crop => "crop",
+        Tool::Gradient => "blend",
+        Tool::PaintBucket => "paint-bucket",
+        Tool::Type => "type",
         Tool::Hand => "hand",
         Tool::Zoom => "zoom-in",
+        Tool::SpotHealing | Tool::Healing => "bandage",
+        Tool::CloneStamp => "stamp",
+        Tool::HistoryBrush => "clock",
+        Tool::Blur => "droplet",
+        Tool::Sharpen => "triangle",
+        Tool::Smudge => "pointer",
+        Tool::Dodge => "lollipop",
+        Tool::Burn => "flame",
+        Tool::Sponge => "cloud",
+        Tool::QuickSelection => "circle-dashed",
+        Tool::ObjectSelection => "square-dashed-mouse-pointer",
+        Tool::Pen => "pen-tool",
+        Tool::PathSelection => "mouse-pointer-2",
+        Tool::Rectangle => "rectangle-horizontal",
+        Tool::EllipseShape => "circle",
+        Tool::Triangle => "triangle",
+        Tool::Polygon => "pentagon",
+        Tool::Line => "slash",
     }
 }
 
@@ -69,6 +94,21 @@ pub fn button(ui: &mut egui::Ui, name: &str, box_size: f32, selected: bool, tool
     let tint = if selected { t.accent_text } else if hovered { t.text } else { t.icon };
     paint(ui, rect, name, (box_size * 0.52).round(), tint);
     if tooltip.is_empty() { resp } else { resp.on_hover_text(tooltip) }
+}
+
+/// Rail toggle: "on" gets a quiet filled background and full-strength icon (no accent).
+pub fn rail_button(ui: &mut egui::Ui, name: &str, box_size: f32, on: bool, tooltip: &str) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(box_size), Sense::click());
+    if on {
+        ui.painter().rect_filled(rect, t.radius_sm, t.card);
+        ui.painter().rect_stroke(rect, t.radius_sm, egui::Stroke::new(1.0, t.card_border), egui::StrokeKind::Inside);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, t.radius_sm, t.hover);
+    }
+    let tint = if on || resp.hovered() { t.text } else { t.text_faint };
+    paint(ui, rect, name, (box_size * 0.52).round(), tint);
+    resp.on_hover_text(tooltip)
 }
 
 #[cfg(test)]
@@ -91,19 +131,4 @@ mod tests {
             assert!(!s.contains("currentColor"), "{name}");
         }
     }
-}
-
-/// Rail toggle: "on" gets a quiet filled background and full-strength icon (no accent).
-pub fn rail_button(ui: &mut egui::Ui, name: &str, box_size: f32, on: bool, tooltip: &str) -> Response {
-    let t = Tokens::get(ui.ctx());
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(box_size), Sense::click());
-    if on {
-        ui.painter().rect_filled(rect, t.radius_sm, t.card);
-        ui.painter().rect_stroke(rect, t.radius_sm, egui::Stroke::new(1.0, t.card_border), egui::StrokeKind::Inside);
-    } else if resp.hovered() {
-        ui.painter().rect_filled(rect, t.radius_sm, t.hover);
-    }
-    let tint = if on || resp.hovered() { t.text } else { t.text_faint };
-    paint(ui, rect, name, (box_size * 0.52).round(), tint);
-    resp.on_hover_text(tooltip)
 }

@@ -78,7 +78,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                     .filter_map(|m| {
                         let path = m.path.join(" › ");
                         let s = fuzzy_score(&q, &format!("{} {}", m.label, path))?;
-                        Some((s, m.id, format!("{}", m.label.trim_end_matches('…')), Some(path).filter(|_| true).map(|p| p + &m.shortcut.map(|s| format!("   {}", crate::shortcuts::pretty(&s))).unwrap_or_default()), m.enabled))
+                        Some((s, m.id, m.label.trim_end_matches('…').to_string(), Some(path).filter(|_| true).map(|p| p + &m.shortcut.map(|s| format!("   {}", crate::shortcuts::pretty(&s))).unwrap_or_default()), m.enabled))
                     })
                     .collect();
                 for tool in crate::state::Tool::ALL {

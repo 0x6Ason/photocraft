@@ -162,8 +162,8 @@ fn testgen_import_details() {
     assert!(d.icc_profile.is_some());
     assert!((d.resolution_dpi - 72.0).abs() < 1e-3);
     assert!(d.metadata.xmp.is_some());
-    // Unmapped named resource preserved.
-    assert!(d.metadata.psd_resources.iter().any(|r| r.0 == 2000 && r.1 == "Path 1"));
+    // Named saved-path resource (2000) becomes a document path, raw bytes kept for export.
+    assert!(d.paths.iter().any(|p| p.name == "Path 1" && p.psd_raw.as_deref() == Some(&vec![1u8, 2, 3])));
     // Global blocks preserved.
     assert!(d.metadata.psd_global_blocks.iter().any(|b| &b.1 == b"Patt"));
     // lfx2 kept on effects.

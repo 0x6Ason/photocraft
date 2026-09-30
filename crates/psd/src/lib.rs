@@ -49,6 +49,7 @@ pub mod header;
 pub mod image_data;
 mod io;
 pub mod layer;
+pub mod path;
 pub mod pixels;
 pub mod resources;
 pub mod tagged;

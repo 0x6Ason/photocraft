@@ -14,7 +14,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         let title = title(&d);
         let modal = egui::Modal::new(egui::Id::new(("dialog", d.id))).show(ctx, |ui| {
             ui.set_min_width(380.0);
-            ui.set_max_width(if d.kind == DialogKind::LayerStyle { 600.0 } else { 440.0 });
+            ui.set_max_width(if d.kind == DialogKind::LayerStyle || d.fields.contains_key("__export") { 600.0 } else { 440.0 });
             ui.label(egui::RichText::new(&title).font(crate::theme::semibold(15.0)));
             ui.add_space(4.0);
             crate::widgets::hairline(ui);
@@ -26,6 +26,9 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                     ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                     ui.weak("egui · wgpu · photocraft-engine");
                 }
+                DialogKind::Command if fields.contains_key("__export") => crate::export_dialog::body(app, ui, &mut fields),
+                DialogKind::Command if fields.contains_key("__sizing") => crate::sizing::body(ui, &mut fields),
+                DialogKind::Command if fields.contains_key("__filter") => crate::filter_dialog::body(ui, &mut fields),
                 DialogKind::Command => command_fields(ui, &mut fields),
                 DialogKind::LayerStyle => crate::layer_style::body(ui, &mut fields),
                 DialogKind::Error => {
@@ -40,7 +43,13 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                         outcome = Some(false);
                     }
                 } else {
-                    let ok_label = if d.kind == DialogKind::NewDocument { "Create" } else { "OK" };
+                    let ok_label = if d.kind == DialogKind::NewDocument {
+                        "Create"
+                    } else if d.fields.contains_key("__export") {
+                        "Export"
+                    } else {
+                        "OK"
+                    };
                     if crate::widgets::primary_button(ui, ok_label, 84.0).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         outcome = Some(true);
                     }
@@ -62,6 +71,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
             }
             Some(false) => {
                 app.ui.close_dialog(d.id);
+                app.filter_preview = None;
             }
             None => {}
         }
@@ -89,12 +99,11 @@ pub fn confirm(app: &mut PhotocraftApp, id: u64) -> Result<Value, String> {
             }
             r
         }
+        DialogKind::Command if d.fields.contains_key("__export") => crate::export_dialog::confirm(app, &d.fields),
         DialogKind::Command => {
-            let mut fields = d.fields;
-            let cmd = fields.remove("__command").and_then(|v| v.as_str().map(str::to_string)).ok_or("dialog has no command")?;
-            fields.remove("__label");
-            fields.remove("__kind");
-            app.run(&cmd, Value::Object(fields))
+            app.filter_preview = None;
+            let cmd = d.fields.get("__command").and_then(|v| v.as_str().map(str::to_string)).ok_or("dialog has no command")?;
+            app.run(&cmd, crate::filter_dialog::params_of(&d.fields))
         }
         DialogKind::LayerStyle => crate::layer_style::confirm(app, &d.fields),
         DialogKind::About | DialogKind::Error => Ok(Value::Null),

@@ -9,6 +9,8 @@
 
 pub mod adjust;
 pub mod effects;
+pub mod text;
+pub mod vector;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +23,10 @@ pub use effects::{
 pub use photocraft_color::{BlendMode, Color, ColorMode, PixelFormat, SampleType};
 pub use photocraft_geom::{Affine, Rect, Size};
 pub use photocraft_raster::Surface;
+pub use vector::{
+    ClippingPath, FillRule, Knot, LineCap, LineJoin, LiveShape, NamedPath, Path, PathOp, ShapeLayer, ShapeStroke, StrokeAlign, Subpath,
+    VectorMask,
+};
 use serde::{Deserialize, Serialize};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -36,6 +42,12 @@ impl LayerId {
     pub fn fresh() -> Self {
         LayerId(next_id())
     }
+}
+
+/// Advance the process-wide id counter (shared by layer and document ids) past `max`, so ids
+/// loaded from a file never collide with ids minted later.
+pub fn ensure_ids_above(max: u64) {
+    NEXT_ID.fetch_max(max.saturating_add(1), Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -92,8 +104,30 @@ impl LayerMask {
         if !self.enabled {
             return 1.0;
         }
-        let v = self.surface.pixel(x, y)[0];
+        let v = self.surface.sample_channel(x, y, 0);
         1.0 - self.density * (1.0 - v)
+    }
+
+    /// Effective mask values over `r` (row-major) into `out`, including
+    /// density; all ones when disabled.
+    pub fn values_into(&self, r: Rect, out: &mut Vec<f32>) {
+        let n = r.width() as usize * r.height() as usize;
+        if !self.enabled {
+            out.clear();
+            out.resize(n, 1.0);
+            return;
+        }
+        self.surface.read_region_into(r, out);
+        let ch = self.surface.channels();
+        if ch > 1 {
+            let v: Vec<f32> = out.chunks_exact(ch).map(|p| p[0]).collect();
+            *out = v;
+        }
+        if self.density < 1.0 {
+            for v in out.iter_mut() {
+                *v = 1.0 - self.density * (1.0 - *v);
+            }
+        }
     }
 }
 
@@ -133,15 +167,97 @@ pub struct TextLayer {
     /// Data of the PSD `TySh` block. On export it replaces the `TySh` entry in
     /// [`Layer::psd_blocks`] (the text engine updates this field when it edits text).
     pub psd_raw: Option<Arc<Vec<u8>>>,
+    /// Character style runs (see [`text`]). Empty = one run built from `font_family`, `size_pt`
+    /// and `color`, which otherwise mirror the first run (summary for simple UIs).
+    pub runs: Vec<text::TextRun>,
+    /// Paragraph style runs. Empty = default paragraph style.
+    pub paragraphs: Vec<text::ParagraphRun>,
+    /// Point or paragraph (box) text.
+    pub shape: text::TextShape,
+    pub orientation: text::Orientation,
+    pub antialias: text::AntiAlias,
+    /// Warp settings (stored; not rendered yet).
+    pub warp: Option<text::TextWarp>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ShapeLayer {
-    pub fill: Option<Fill>,
-    pub cache: Option<Surface>,
-    /// Data of the PSD vector mask block (`vsms`, else `vmsk`). On export it
-    /// replaces that entry in [`Layer::psd_blocks`].
-    pub psd_raw: Option<Arc<Vec<u8>>>,
+impl Default for TextLayer {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            font_family: String::new(),
+            size_pt: 12.0,
+            color: Color::BLACK,
+            transform: Affine::IDENTITY,
+            cache: None,
+            psd_raw: None,
+            runs: Vec::new(),
+            paragraphs: Vec::new(),
+            shape: text::TextShape::Point,
+            orientation: text::Orientation::Horizontal,
+            antialias: text::AntiAlias::Smooth,
+            warp: None,
+        }
+    }
+}
+
+impl TextLayer {
+    /// Character runs covering exactly `text.len()` bytes, each on a char boundary.
+    pub fn char_runs(&self) -> Vec<text::TextRun> {
+        let base = text::CharStyle { font_family: self.font_family.clone(), size_pt: self.size_pt, color: self.color, ..Default::default() };
+        normalize_runs(&self.text, self.runs.iter().map(|r| (r.len, r.style.clone())).collect(), base)
+            .into_iter()
+            .map(|(len, style)| text::TextRun { len, style })
+            .collect()
+    }
+    /// Paragraph runs covering exactly `text.len()` bytes.
+    pub fn paragraph_runs(&self) -> Vec<text::ParagraphRun> {
+        normalize_runs(&self.text, self.paragraphs.iter().map(|r| (r.len, r.style.clone())).collect(), text::ParagraphStyle::default())
+            .into_iter()
+            .map(|(len, style)| text::ParagraphRun { len, style })
+            .collect()
+    }
+    /// Copies the first run's family, size and colour into the summary fields.
+    pub fn sync_summary(&mut self) {
+        if let Some(r) = self.runs.first() {
+            self.font_family = r.style.font_family.clone();
+            self.size_pt = r.style.size_pt;
+            self.color = r.style.color;
+        }
+    }
+}
+
+/// Stretches/truncates `(len, style)` runs to cover `text` exactly, snapping to char boundaries
+/// and dropping empty runs (keeps one run for empty text).
+fn normalize_runs<S: Clone>(text: &str, runs: Vec<(usize, S)>, base: S) -> Vec<(usize, S)> {
+    let total = text.len();
+    if total == 0 {
+        return vec![(0, runs.into_iter().next().map_or(base, |r| r.1))];
+    }
+    let mut out: Vec<(usize, S)> = Vec::new();
+    let mut at = 0usize;
+    for (len, style) in runs {
+        if at >= total {
+            break;
+        }
+        let mut end = (at + len).min(total);
+        while !text.is_char_boundary(end) {
+            end += 1;
+        }
+        if end > at {
+            out.push((end - at, style));
+            at = end;
+        }
+    }
+    if at < total {
+        match out.last_mut() {
+            Some(last) => last.0 += total - at,
+            None => out.push((total, base.clone())),
+        }
+    }
+    if out.is_empty() {
+        out.push((0, base));
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -225,6 +341,9 @@ pub struct Layer {
     /// Clipped to the layer below (clipping mask).
     pub clipped: bool,
     pub mask: Option<LayerMask>,
+    /// Vector mask (Layer › Vector Mask), applied together with `mask`. Shape layers keep their
+    /// outline in [`ShapeLayer::path`] instead.
+    pub vector_mask: Option<VectorMask>,
     pub effects: Effects,
     pub label: LabelColor,
     pub content: LayerContent,
@@ -255,6 +374,7 @@ impl Layer {
             fill_opacity: 1.0,
             clipped: false,
             mask: None,
+            vector_mask: None,
             effects: Effects { enabled: true, ..Default::default() },
             label: LabelColor::None,
             content,
@@ -364,6 +484,12 @@ pub struct Document {
     pub metadata: Metadata,
     /// Global light used by layer effects (PSD resources 1037/1049).
     pub global_light: GlobalLight,
+    /// Saved paths (Paths panel), top to bottom.
+    pub paths: Vec<NamedPath>,
+    /// The (unsaved) work path.
+    pub work_path: Option<Path>,
+    /// Clipping path used on export (names one of `paths`).
+    pub clipping_path: Option<ClippingPath>,
 }
 
 /// Where a layer lives in the tree: indices from the root down.
@@ -385,6 +511,9 @@ impl Document {
             selection: None,
             metadata: Metadata::default(),
             global_light: GlobalLight::default(),
+            paths: Vec::new(),
+            work_path: None,
+            clipping_path: None,
         }
     }
 
@@ -630,5 +759,17 @@ mod tests {
         let bg = d.layers[0].id;
         d.layer_mut(bg).unwrap().surface_mut().unwrap().write_pixel(0, 0, &[0.0, 0.0, 0.0, 1.0]);
         assert_eq!(snap.layers[0].surface().unwrap().pixel(0, 0), vec![1.0; 4]);
+    }
+}
+
+#[cfg(test)]
+mod id_tests {
+    #[test]
+    fn ensure_ids_above_advances_counter() {
+        let far = super::LayerId::fresh().0 + 1000;
+        super::ensure_ids_above(far);
+        assert!(super::LayerId::fresh().0 > far);
+        super::ensure_ids_above(3); // never moves backwards
+        assert!(super::DocId::fresh().0 > far);
     }
 }

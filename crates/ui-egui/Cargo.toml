@@ -13,7 +13,10 @@ photocraft-color = { workspace = true }
 photocraft-raster = { workspace = true }
 photocraft-doc = { workspace = true }
 photocraft-compose = { workspace = true }
+photocraft-gpu = { workspace = true }
 photocraft-engine = { workspace = true }
+photocraft-algo = { workspace = true }
+photocraft-text = { workspace = true }
 egui = { workspace = true }
 egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
@@ -21,5 +24,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }
+
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot", "eframe"] }
+# Only for examples/snapshot.rs (offscreen UI renders of real files).
+photocraft-io = { workspace = true }

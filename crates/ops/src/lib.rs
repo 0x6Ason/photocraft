@@ -84,6 +84,17 @@ impl History {
         self.undo.iter().map(|s| s.label.clone()).chain(std::iter::once(self.current_label.clone())).collect()
     }
 
+    /// Document of past entry `i`, indexed like [`History::entries`] (0 = oldest). The last entry is
+    /// the current document, which the history does not hold, so it (and any index past it) is `None`.
+    pub fn state(&self, i: usize) -> Option<Arc<Document>> {
+        self.undo.get(i).map(|s| s.doc.clone())
+    }
+
+    /// Number of past states (entries before the current one).
+    pub fn past_len(&self) -> usize {
+        self.undo.len()
+    }
+
     pub fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
@@ -147,6 +158,19 @@ mod tests {
         cur = h.redo(cur).unwrap();
         assert_eq!(cur.layers.len(), 2);
         assert!(h.redo(cur.clone()).is_none());
+    }
+
+    #[test]
+    fn state_accessor_matches_entries() {
+        let mut h = History::default();
+        let mut cur = Arc::new(base());
+        let open = cur.clone();
+        edit(&mut h, &mut cur, "A", |d| d.name = "a".into());
+        edit(&mut h, &mut cur, "B", |d| d.name = "b".into());
+        assert_eq!(h.entries().len(), h.past_len() + 1);
+        assert!(Arc::ptr_eq(&h.state(0).unwrap(), &open));
+        assert_eq!(h.state(1).unwrap().name, "a");
+        assert!(h.state(2).is_none(), "the current document is not held");
     }
 
     #[test]

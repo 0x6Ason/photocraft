@@ -107,9 +107,14 @@ fn text_shape_smart_raw_blocks_survive() {
         }),
     );
     smart.psd_blocks = vec![(*b"PlLd", Arc::new(vec![0; 4])), (*b"vmsk", Arc::new(vec![5; 8])), (*b"luni", Arc::new(vec![0; 8]))];
+    // The typed vector mask (as import produces it) keeps the raw block while unchanged.
+    smart.vector_mask = photocraft_io::vector_map::vector_mask_from_block(&[5; 8], d.size.width, d.size.height);
     d.layers.push(smart);
-    let mut shape = Layer::new("Shape", LayerContent::Shape(ShapeLayer { fill: None, cache: Some(cache.clone()), psd_raw: None }));
+    let mut shape = Layer::new("Shape", LayerContent::Shape(ShapeLayer { fill: None, cache: Some(cache.clone()), psd_raw: None, ..Default::default() }));
     shape.psd_blocks = vec![(*b"vscg", Arc::new(vec![1, 2, 3, 4])), (*b"vmsk", Arc::new(vec![7; 8]))];
+    if let LayerContent::Shape(s) = &mut shape.content {
+        s.path = photocraft_io::vector_map::path_from_vmsk(&[7; 8], d.size.width, d.size.height).unwrap().0;
+    }
     d.layers.push(shape);
     let back = roundtrip(&d);
     let n = back.layers.len();
@@ -134,8 +139,10 @@ fn raster_layer_blocks_preserved() {
     let mut d = gen_doc(ColorMode::Rgb, SampleType::U8, Features::PIXELS);
     let blocks = vec![(*b"vmsk", std::sync::Arc::new(vec![0u8; 12])), (*b"clbl", std::sync::Arc::new(vec![0u8, 0, 0, 0])), (*b"Zzzz", std::sync::Arc::new(vec![1u8]))];
     d.layers[1].psd_blocks = blocks.clone();
+    d.layers[1].vector_mask = photocraft_io::vector_map::vector_mask_from_block(&[0; 12], d.size.width, d.size.height);
     let back = roundtrip(&d);
     assert_eq!(back.layers[1].psd_blocks, blocks);
+    assert_eq!(back.layers[1].vector_mask, d.layers[1].vector_mask);
 }
 
 #[test]
@@ -209,6 +216,7 @@ fn text_layer_roundtrip_with_tysh() {
             transform: photocraft_geom::Affine { m: [1.0, 0.0, 0.0, 1.0, 3.0, 4.0] },
             cache: Some(pattern(fmt, photocraft_geom::Rect::new(3, 4, 9, 8), 5, true)),
             psd_raw: Some(std::sync::Arc::new(tysh)),
+            ..Default::default()
         }),
     ));
     let back = roundtrip(&d);

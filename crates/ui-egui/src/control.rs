@@ -12,6 +12,8 @@
 //! - `ui.dialog.open {kind, fields?}` / `ui.dialog.set {dialog, field, value}` / `ui.dialog.confirm {dialog}` / `ui.dialog.cancel {dialog}`
 //! - `ui.window.open {document?}` / `ui.window.close {window}`: extra document windows
 //! - `ui.pointer {events: [{kind: down|move|up, x, y, pressure?}], modifiers?}`: drive the active tool in document coordinates
+//! - `ui.click {x, y, button?, count?}` / `ui.move {x, y}`: synthetic pointer input in screen points
+//! - `ui.key {key, command?, shift?, alt?, ctrl?}` / `ui.type {text}`: synthetic keyboard input
 //! - `ui.resize {width, height}`: resize the main window
 //! - `ui.screenshot {path?, focus?}`: capture the main window (PNG). Raises the window first (default)
 //!   because occluded macOS windows stop rendering
@@ -45,6 +47,9 @@ impl ControlRequest {
 pub enum Outcome {
     Done(Value),
     Screenshot { token: u64, path: Option<String> },
+    /// Synthetic input queued: reply once the app has processed all of it (so a following
+    /// `ui.inspect`/`engine.execute` observes the effect).
+    AfterInput,
 }
 
 fn ok(v: Value) -> Outcome {
@@ -89,6 +94,21 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
                 }
                 match serde_json::from_value(cur) {
                     Ok(v) => app.ui.panels = v,
+                    Err(e) => return err(e),
+                }
+            }
+            if let Some(m) = p.get("maskTarget").and_then(Value::as_bool) {
+                app.ui.mask_target = m;
+            }
+            if let Some(tabs) = p.get("dockTabs") {
+                let mut cur = serde_json::to_value(app.ui.dock_tabs).unwrap_or_default();
+                if let (Some(c), Some(n)) = (cur.as_object_mut(), tabs.as_object()) {
+                    for (k, v) in n {
+                        c.insert(k.clone(), v.clone());
+                    }
+                }
+                match serde_json::from_value(cur) {
+                    Ok(v) => app.ui.dock_tabs = v,
                     Err(e) => return err(e),
                 }
             }
@@ -174,15 +194,12 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
         }
         "ui.pointer" => {
             let Some(events) = p.get("events").and_then(Value::as_array) else { return err("missing `events`") };
-            let mods = egui::Modifiers {
-                shift: p.get("shift").and_then(Value::as_bool).unwrap_or(false),
-                alt: p.get("alt").and_then(Value::as_bool).unwrap_or(false),
-                ..Default::default()
-            };
-            if let Some(t) = s("tool") {
-                if let Some(t) = Tool::from_name(t) {
-                    app.ui.tool = t;
-                }
+            // Modifier flags may be top-level or grouped under "modifiers".
+            let m = p.get("modifiers").unwrap_or(p);
+            let flag = |k: &str| m.get(k).and_then(Value::as_bool).unwrap_or(false);
+            let mods = egui::Modifiers { shift: flag("shift"), alt: flag("alt"), command: flag("command"), mac_cmd: cfg!(target_os = "macos") && flag("command"), ctrl: flag("ctrl") };
+            if let Some(t) = s("tool").and_then(Tool::from_name) {
+                app.ui.tool = t;
             }
             for e in events {
                 let x = e.get("x").and_then(Value::as_f64).unwrap_or(0.0);
@@ -196,6 +213,45 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
                 tool_event(app, ev, mods);
             }
             ok(json!({"status": app.ui.status}))
+        }
+        "ui.click" | "ui.move" => {
+            // Screen coordinates in points (as reported by ui.inspect window size).
+            let x = p.get("x").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let y = p.get("y").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let pos = egui::pos2(x, y);
+            let button = match s("button").unwrap_or("left") {
+                "right" | "secondary" => egui::PointerButton::Secondary,
+                "middle" => egui::PointerButton::Middle,
+                _ => egui::PointerButton::Primary,
+            };
+            app.synthetic.push(egui::Event::PointerMoved(pos));
+            if req.method == "ui.click" {
+                let clicks = p.get("count").and_then(Value::as_u64).unwrap_or(1);
+                for _ in 0..clicks {
+                    app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: true, modifiers: Default::default() });
+                    app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: false, modifiers: Default::default() });
+                }
+            }
+            ctx.request_repaint();
+            Outcome::AfterInput
+        }
+        "ui.key" => {
+            let Some(name) = s("key") else { return err("missing `key`") };
+            let Some(key) = egui::Key::from_name(name) else { return err(format!("unknown key `{name}`")) };
+            // Modifier flags may be top-level or grouped under "modifiers".
+            let m = p.get("modifiers").unwrap_or(p);
+            let flag = |k: &str| m.get(k).and_then(Value::as_bool).unwrap_or(false);
+            let modifiers = egui::Modifiers { command: flag("command"), mac_cmd: cfg!(target_os = "macos") && flag("command"), shift: flag("shift"), alt: flag("alt"), ctrl: flag("ctrl") };
+            app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers });
+            app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers });
+            ctx.request_repaint();
+            Outcome::AfterInput
+        }
+        "ui.type" => {
+            let Some(text) = s("text") else { return err("missing `text`") };
+            app.synthetic.push(egui::Event::Text(text.to_string()));
+            ctx.request_repaint();
+            Outcome::AfterInput
         }
         "ui.resize" => {
             let (w, h) = (p.get("width").and_then(Value::as_f64).unwrap_or(1280.0), p.get("height").and_then(Value::as_f64).unwrap_or(800.0));
@@ -214,8 +270,9 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
             if p.get("focus").and_then(Value::as_bool).unwrap_or(true) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
+            // The capture itself is issued by `PhotocraftApp::issue_screenshots` once open/close
+            // animations (modals, popups) have settled.
             let token = app.ui.alloc_id();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(token)));
             ctx.request_repaint();
             Outcome::Screenshot { token, path: s("path").map(str::to_string) }
         }
@@ -244,6 +301,7 @@ pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
     json!({
         "window": {"width": screen.width(), "height": screen.height(), "pixelsPerPoint": ctx.pixels_per_point()},
         "tool": app.ui.tool,
+        "textEdit": app.ui.text_edit,
         "panels": app.ui.panels,
         "views": app.ui.views,
         "dialogs": dialogs,

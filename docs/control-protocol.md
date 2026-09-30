@@ -13,18 +13,20 @@ Each reply is one JSON line with the same `id`:
 {"id": 2, "ok": false, "error": "unknown tool `foo`"}
 ```
 
-The transport is `apps/photocraft/src/control_server.rs`, and the handlers are in `crates/ui-egui/src/control.rs`. An MCP server will wrap this same protocol (milestone M11).
+The transport is `apps/photocraft/src/control_server.rs`, and the handlers are in `crates/ui-egui/src/control.rs`. The MCP server (`photocraft-cli mcp --bridge 127.0.0.1:<port>`, crate `photocraft-automation`) wraps this same protocol. See [MCP bridge](#mcp-bridge) below.
 
 ## Methods
 
 - `engine.execute {command, params}`: run any engine or UI command by id
 - `engine.commands`: list commands with enablement
 - `ui.inspect`: full UI state (tool, panels, views, dialogs, windows, menu tree, window size)
-- `ui.set {tool?, panels?, zoom?, center?, dark?}`: change UI state
+- `ui.set {tool?, panels?, dockTabs?, maskTarget?, zoom?, center?, dark?}`: change UI state
 - `ui.menu.invoke {id}` / `ui.menu.list`: activate a menu item by id; list the menu tree
 - `ui.dialog.open {kind, fields?}` / `ui.dialog.set {dialog, field, value}` / `ui.dialog.confirm {dialog}` / `ui.dialog.cancel {dialog}`
 - `ui.window.open {document?}` / `ui.window.close {window}`: extra document windows
 - `ui.pointer {events: [{kind: down|move|up, x, y, pressure?}], modifiers?}`: drive the active tool in document coordinates
+- `ui.key {key, command?, shift?, alt?, ctrl?}` (flags may also be grouped under `modifiers`): press and release a key, e.g. `{"key": "ArrowLeft", "shift": true}`
+- `ui.type {text}`: type text (goes to the focused widget, or to the canvas while the Type tool is editing)
 - `ui.resize {width, height}`: resize the main window
 - `ui.screenshot {path?, focus?}`: capture the main window (PNG). Raises the window first (default)
   because occluded macOS windows stop rendering
@@ -48,3 +50,34 @@ The transport is `apps/photocraft/src/control_server.rs`, and the handlers are i
 | `document.pixel` | `{"x":10,"y":10}`: composite RGBA |
 
 UI-level commands (`file.open`, `file.save`, `view.zoomIn`, `window.theme.pro`, `edit.search`, …) are also accepted by `engine.execute` and `ui.menu.invoke`.
+
+## MCP bridge
+
+`photocraft-automation` provides an MCP server built on the official Rust SDK (`rmcp`). It runs in one of two modes:
+
+- **Headless** (`photocraft-cli mcp`): an in-process `photocraft_engine::Session`. There is no window.
+- **Bridge** (`photocraft-cli mcp --bridge 127.0.0.1:7878`): every tool is forwarded to a running `photocraft --control 7878` over this protocol, so agents see and drive the live app.
+
+The bridge keeps one TCP connection open. It reconnects once if a request fails, and it skips reply lines whose `id` doesn't match the request (for example, stale replies to requests that timed out). It only accepts loopback addresses, because the app only listens on loopback.
+
+How each MCP tool maps onto control methods in bridge mode:
+
+| MCP tool | Control method |
+|---|---|
+| `command_run {id, params}` | `engine.execute {command: id, params}` |
+| `command_list {filter?, enabled_only?}` | `engine.commands` (filtered by the MCP server) |
+| `doc_new {…}` | `engine.execute {command: "file.new", params}` |
+| `doc_inspect` | `engine.execute {command: "document.inspect"}` |
+| `doc_open {path}` | `app.open {path}` |
+| `doc_save {path}` / `doc_export {path}` | `app.save {path}` |
+| `doc_render_preview {max_side?}` | `ui.screenshot {path: <temp>}`, returned as PNG image content |
+| `session_list`, `ui_inspect` | `ui.inspect` |
+| `ui_screenshot {max_side?}` | `ui.screenshot`, returned as PNG image content |
+| `ui_pointer {events, modifiers?}` | `ui.pointer` |
+| `ui_menu_invoke {id}` | `ui.menu.invoke` |
+| `ui_set {fields}` | `ui.set` |
+| `control_call {method, params}` | any method, passed through unchanged |
+
+`doc_select` and `doc_close` work only in headless mode. The `ui_*` tools and `control_call` work only in bridge mode; in headless mode they return a tool error that explains how to start bridge mode.
+
+**Security note:** the control port has no authentication. Any local process can drive the app. Only enable `--control` when you need it. A token handshake is planned (architecture §12).

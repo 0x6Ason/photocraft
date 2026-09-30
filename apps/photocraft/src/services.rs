@@ -11,7 +11,13 @@ const IMAGE_EXTS: &[&str] = &["psd", "psb", "png", "jpg", "jpeg", "tif", "tiff",
 pub fn native() -> Services {
     Services {
         import: Some(Box::new(|name: &str, bytes: &[u8]| photocraft_io::import(name, bytes).map(|r| r.document).map_err(|e| e.to_string()))),
-        export: Some(Box::new(|doc: &Document, path: &str| photocraft_io::export(doc, path, &Default::default()).map(|r| r.bytes).map_err(|e| e.to_string()))),
+        export: Some(Box::new(|doc: &Document, path: &str, settings: &photocraft_ui_egui::ExportSettings| {
+            let mut opts = photocraft_io::ExportOptions::default();
+            if let Some(q) = settings.jpeg_quality {
+                opts.encode.jpeg_quality = q;
+            }
+            photocraft_io::export(doc, path, &opts).map(|r| r.bytes).map_err(|e| e.to_string())
+        })),
         pick_open: Some(Box::new(|| {
             let path = rfd::FileDialog::new().add_filter("Images", IMAGE_EXTS).pick_file()?;
             let bytes = std::fs::read(&path).ok()?;
@@ -31,6 +37,14 @@ pub fn native() -> Services {
             photocraft_codecs::encode(&img, photocraft_codecs::Format::Png, &EncodeOptions::default()).map_err(|e| e.to_string())
         })),
         inbox: None,
+        clipboard_set_image: Some(Box::new(|w: u32, h: u32, px: &[u8]| {
+            let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+            cb.set_image(arboard::ImageData { width: w as usize, height: h as usize, bytes: std::borrow::Cow::Borrowed(px) }).map_err(|e| e.to_string())
+        })),
+        clipboard_get_image: Some(Box::new(|| {
+            let img = arboard::Clipboard::new().ok()?.get_image().ok()?;
+            Some((img.width as u32, img.height as u32, img.bytes.into_owned()))
+        })),
     }
 }
 

@@ -311,3 +311,112 @@ fn move_to_reorders_and_nests() {
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(names(&s), ["Background", "B", "A", "G"]);
 }
+
+#[test]
+fn selecting_a_layer_does_not_dirty_the_document() {
+    let mut s = session_with_doc();
+    let bg = s.active().unwrap().doc.layers[0].id;
+    assert!(!s.active().unwrap().is_dirty());
+    s.execute("layer.select", json!({"layer": bg.0})).unwrap();
+    assert!(!s.active().unwrap().is_dirty());
+    s.execute("layer.new.layer", json!({})).unwrap();
+    assert!(s.active().unwrap().is_dirty());
+}
+
+#[test]
+fn coalesced_edits_share_one_history_step() {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 20, "height": 20})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    let steps = |s: &Session| s.active().unwrap().history.entries().len();
+    let base = steps(&s);
+    for o in [10, 20, 30] {
+        s.execute("layer.setProps", json!({"opacity": o as f64 / 100.0, "coalesce": "drag-1"})).unwrap();
+    }
+    assert_eq!(steps(&s), base + 1, "three coalesced edits = one step");
+    // A different key starts a new step; an uncoalesced edit breaks the chain.
+    s.execute("layer.setProps", json!({"opacity": 0.4, "coalesce": "drag-2"})).unwrap();
+    s.execute("layer.setProps", json!({"opacity": 0.5})).unwrap();
+    s.execute("layer.setProps", json!({"opacity": 0.6, "coalesce": "drag-2"})).unwrap();
+    assert_eq!(steps(&s), base + 4);
+    // Undo returns to the state before the whole coalesced run.
+    s.undo();
+    s.undo();
+    s.undo();
+    s.undo();
+    let st = s.active().unwrap();
+    let l = st.doc.layer(st.active_layer.unwrap()).unwrap().opacity;
+    assert!((l - 1.0).abs() < 1e-6, "{l}");
+}
+
+#[test]
+fn type_edit_rerenders_cache_to_new_text() {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 800, "height": 400})).unwrap();
+    let r = s.execute("type.create", json!({"x": 50, "y": 200, "text": "Lorem Ipsum", "size": 48, "coalesce": "k"})).unwrap();
+    let id = r["layer"].as_u64().unwrap();
+    let width = |s: &Session| {
+        let st = s.active().unwrap();
+        st.doc.layer(photocraft_doc::LayerId(id)).unwrap().surface().unwrap().content_bounds().width()
+    };
+    let w0 = width(&s);
+    s.execute("type.edit", json!({"layer": id, "replace": {"start": 0, "end": 11, "text": "Photocraft"}, "coalesce": "k"})).unwrap();
+    let w1 = width(&s);
+    assert!(w0 > 150 && w1 > 150, "cache widths {w0} → {w1}");
+}
+
+#[test]
+fn levels_and_curves_params_cover_output_and_channels() {
+    use photocraft_doc::Adjustment;
+    let a = crate::commands::adjustment_from_params("levels", &json!({"inBlack": 10, "outWhite": 200, "green": {"gamma": 1.5}}));
+    let Adjustment::Levels { master, per_channel } = a else { panic!() };
+    assert!((master.in_black - 10.0 / 255.0).abs() < 1e-6 && (master.out_white - 200.0 / 255.0).abs() < 1e-6);
+    assert_eq!(per_channel[1].gamma, 1.5);
+    assert_eq!(per_channel[0].gamma, 1.0);
+    let c = crate::commands::adjustment_from_params("curves", &json!({"points": [[0, 0], [128, 160], [255, 255]], "blue": [[0, 20], [255, 235]]}));
+    let Adjustment::Curves { master, per_channel } = c else { panic!() };
+    assert_eq!(master.len(), 3);
+    assert!((per_channel[2][0].output - 20.0 / 255.0).abs() < 1e-6);
+    assert_eq!(per_channel[0].len(), 2);
+}
+
+#[test]
+fn painting_can_target_the_layer_mask() {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 40, "height": 40})).unwrap();
+    s.execute("layer.newAdjustmentLayer.invert", json!({})).unwrap();
+    let id = s.active().unwrap().active_layer.unwrap();
+    s.edit("mask", |doc, _| {
+        doc.layer_mut(id).unwrap().mask = Some(photocraft_doc::LayerMask::reveal_all());
+        Ok(())
+    })
+    .unwrap();
+    // Adjustment layers are paintable through their mask only.
+    assert!(s.execute("paint.stroke", json!({"points": [[20, 20]], "size": 10, "hardness": 1.0, "color": "#000000"})).is_err());
+    s.execute("paint.stroke", json!({"points": [[20, 20]], "size": 10, "hardness": 1.0, "color": "#000000", "target": "mask"})).unwrap();
+    let m = |s: &Session, x, y| s.active().unwrap().doc.layer(id).unwrap().mask.as_ref().unwrap().surface.pixel(x, y)[0];
+    assert!(m(&s, 20, 20) < 0.01, "painted black");
+    assert!(m(&s, 2, 2) > 0.99, "rest still revealed");
+    // Eraser on a mask paints the background colour (white).
+    s.execute("paint.stroke", json!({"points": [[20, 20]], "size": 10, "hardness": 1.0, "erase": true, "target": "mask"})).unwrap();
+    assert!(m(&s, 20, 20) > 0.99);
+    // Gradient into the mask.
+    s.execute("paint.gradient", json!({"from": [0, 0], "to": [40, 0], "colors": ["#000000", "#ffffff"], "target": "mask"})).unwrap();
+    assert!(m(&s, 2, 20) < 0.1 && m(&s, 38, 20) > 0.9);
+}
+
+#[test]
+fn layer_locks_are_set_and_enforced() {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 20, "height": 20})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("layer.setProps", json!({"locks": {"pixels": true}})).unwrap();
+    assert!(s.execute("paint.stroke", json!({"points": [[5, 5]], "size": 4})).is_err(), "pixel lock blocks painting");
+    s.execute("layer.setProps", json!({"locks": {"pixels": false, "position": true}})).unwrap();
+    s.execute("paint.stroke", json!({"points": [[5, 5]], "size": 4})).unwrap();
+    assert!(s.execute("edit.transform", json!({"matrix": [1, 0, 0, 1, 3, 0]})).is_err(), "position lock blocks transforms");
+    assert!(s.execute("layer.setProps", json!({"locks": {"bogus": true}})).is_err());
+    let st = s.active().unwrap();
+    let l = st.doc.layer(st.active_layer.unwrap()).unwrap();
+    assert!(l.locks.position && !l.locks.pixels);
+}

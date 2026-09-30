@@ -60,6 +60,10 @@ impl Rect {
     pub fn is_empty(&self) -> bool {
         self.x1 <= self.x0 || self.y1 <= self.y0
     }
+    /// `other` lies entirely inside `self` (an empty `other` is contained in anything).
+    pub fn contains_rect(&self, other: &Rect) -> bool {
+        other.is_empty() || (other.x0 >= self.x0 && other.y0 >= self.y0 && other.x1 <= self.x1 && other.y1 <= self.y1)
+    }
     pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
     }

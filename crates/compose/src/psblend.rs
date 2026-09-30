@@ -63,10 +63,24 @@ pub fn composite(mode: BlendMode, backdrop: [f32; 4], source: [f32; 4], opacity:
     if as_ <= 0.0 {
         return backdrop;
     }
+    let ao = as_ + ab * (1.0 - as_);
+    if mode == BlendMode::Normal {
+        // Fast path: B(Cb, Cs) = Cs.
+        if ao <= 0.0 {
+            return [0.0; 4];
+        }
+        let kb = ab * (1.0 - as_);
+        let inv = 1.0 / ao;
+        return [
+            (kb * backdrop[0] + as_ * source[0]) * inv,
+            (kb * backdrop[1] + as_ * source[1]) * inv,
+            (kb * backdrop[2] + as_ * source[2]) * inv,
+            ao,
+        ];
+    }
     let cb = [backdrop[0], backdrop[1], backdrop[2]];
     let cs = [source[0], source[1], source[2]];
     let b = blend_rgb(mode, cb, cs);
-    let ao = as_ + ab * (1.0 - as_);
     if ao <= 0.0 {
         return [0.0; 4];
     }
@@ -106,7 +120,10 @@ mod tests {
             }
             let (cb, cs) = ([0.2, 0.5, 0.9], [0.7, 0.1, 0.4]);
             assert_eq!(blend_rgb(m, cb, cs), generic::blend_rgb(m, cb, cs));
-            assert_eq!(composite(m, [0.2, 0.5, 0.9, 0.7], [0.7, 0.1, 0.4, 0.6], 0.8), generic::composite(m, [0.2, 0.5, 0.9, 0.7], [0.7, 0.1, 0.4, 0.6], 0.8));
+            let (a, b) = (composite(m, [0.2, 0.5, 0.9, 0.7], [0.7, 0.1, 0.4, 0.6], 0.8), generic::composite(m, [0.2, 0.5, 0.9, 0.7], [0.7, 0.1, 0.4, 0.6], 0.8));
+            for c in 0..4 {
+                assert!((a[c] - b[c]).abs() < 1e-6, "{m:?} {a:?} {b:?}");
+            }
         }
     }
 }

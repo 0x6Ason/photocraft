@@ -129,12 +129,87 @@ impl GpuCanvas {
         self.upload_rect(doc, [r.x0 as u32, r.y0 as u32], [r.width(), r.height()], &premultiply_rgba8(&buf.px))
     }
 
+    /// Composite `region` of `doc` with the wgpu compositor straight into its display texture
+    /// (no CPU pixels, no upload of the composite). Returns `Err` when the document uses features
+    /// the GPU compositor doesn't cover yet; the caller then falls back to the CPU compositor.
+    pub fn composite(&self, doc: &photocraft_doc::Document, region: photocraft_geom::Rect) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
+        let (device, queue) = (&self.rs.device, &self.rs.queue);
+        let size = [doc.size.width, doc.size.height];
+        if size[0] == 0 || size[1] == 0 {
+            return Err(photocraft_gpu::Unsupported("empty document".into()));
+        }
+        if std::env::var_os("PHOTOCRAFT_CPU_COMPOSE").is_some() {
+            return Err(photocraft_gpu::Unsupported("disabled by PHOTOCRAFT_CPU_COMPOSE".into()));
+        }
+        let mut renderer = self.rs.renderer.write();
+        let Some(res) = renderer.callback_resources.get_mut::<Resources>() else { return Err(photocraft_gpu::Unsupported("no GPU canvas".into())) };
+        let mut comp = res.compositor.take().unwrap_or_else(|| photocraft_gpu::Compositor::new(device));
+        let key = doc.id.0;
+        let fresh = res.docs.get(&key).is_none_or(|d| d.size != size);
+        let region = if fresh { doc.bounds() } else { region.intersect(&doc.bounds()) };
+        if let Err(e) = comp.supports(doc) {
+            res.compositor = Some(comp);
+            return Err(e);
+        }
+        if fresh {
+            let tex = DocTextures::new(device, res, size, self.tile);
+            res.docs.insert(key, tex);
+        }
+        let d = &res.docs[&key];
+        let (bgl, pipe) = (&res.encode_bgl, &res.encode_pipeline);
+        let result = comp.render(device, queue, doc, region, |enc, out| {
+            for t in &d.tiles {
+                let [tx, ty, tw, th] = t.rect.map(|v| v as i32);
+                let r = out.rect.intersect(&photocraft_geom::Rect::from_xywh(tx, ty, tw as u32, th as u32));
+                if r.is_empty() {
+                    continue;
+                }
+                let offset = [out.rect.x0 - tx, out.rect.y0 - ty, 0, 0];
+                let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("pc_encode"), contents: &offset.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), usage: wgpu::BufferUsages::UNIFORM });
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("pc_encode"),
+                    layout: bgl,
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(out.view) }, wgpu::BindGroupEntry { binding: 1, resource: ubuf.as_entire_binding() }],
+                });
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("pc_encode"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &t.levels[0], resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.set_scissor_rect((r.x0 - tx) as u32, (r.y0 - ty) as u32, r.width(), r.height());
+                pass.draw(0..3, 0..1);
+            }
+        });
+        if result.is_ok() {
+            d.regenerate_mips(device, queue, res, [region.x0 as u32, region.y0 as u32, region.x1 as u32, region.y1 as u32]);
+            if std::env::var_os("PHOTOCRAFT_GPU_SYNC").is_some() {
+                // Benchmarking: wait for the GPU so callers can time the whole refresh.
+                let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            }
+        } else if fresh {
+            res.docs.remove(&key);
+        }
+        res.compositor = Some(comp);
+        result
+    }
+
     /// Free textures of documents not in `live`.
     pub fn retain(&self, live: &[u64]) {
         let mut renderer = self.rs.renderer.write();
         if let Some(res) = renderer.callback_resources.get_mut::<Resources>()
             && res.docs.keys().any(|k| !live.contains(k))
         {
+            let gone: Vec<u64> = res.docs.keys().filter(|k| !live.contains(k)).copied().collect();
+            if let Some(c) = res.compositor.as_mut() {
+                for k in &gone {
+                    c.forget_doc(photocraft_doc::DocId(*k));
+                }
+            }
             res.docs.retain(|k, _| live.contains(k));
         }
     }
@@ -157,7 +232,7 @@ pub fn now_ms() -> f64 {
 }
 
 /// UI-thread timings (CPU side), exponentially smoothed.
-#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Perf {
     /// Average CPU time building the UI per frame (ms).
@@ -174,6 +249,15 @@ pub struct Perf {
     pub last_refresh_px: u64,
     /// Whether the GPU canvas path is active.
     pub gpu: bool,
+    /// Layer tiles uploaded by the last GPU composite.
+    pub gpu_uploads: u64,
+    /// Why the last refresh fell back to the CPU compositor (None = GPU composited).
+    pub gpu_fallback: Option<String>,
+    /// Last command run through the app and its duration (ms).
+    pub last_command: String,
+    pub command_ms: f64,
+    /// Most recent cost of occasional UI work (outline tracing, thumbnails, …), in ms.
+    pub spans: std::collections::BTreeMap<&'static str, f64>,
     #[serde(skip)]
     max_decay: f64,
 }
@@ -184,6 +268,14 @@ impl Perf {
         self.last_refresh_px = px;
         self.composite_ms = composite_ms;
         self.upload_ms = upload_ms;
+        if !kind.starts_with("gpu") {
+            self.gpu_uploads = 0;
+        } else {
+            self.gpu_fallback = None;
+        }
+    }
+    pub fn span(&mut self, name: &'static str, ms: f64) {
+        self.spans.insert(name, (ms * 100.0).round() / 100.0);
     }
     pub fn frame(&mut self, ms: f64) {
         self.ui_ms = if self.ui_ms == 0.0 { ms } else { self.ui_ms * 0.9 + ms * 0.1 };
@@ -237,6 +329,10 @@ struct Resources {
     docs: HashMap<u64, DocTextures>,
     views: HashMap<u64, ViewGpu>,
     out_linear: bool,
+    /// The wgpu layer compositor (created on first use).
+    compositor: Option<photocraft_gpu::Compositor>,
+    encode_bgl: wgpu::BindGroupLayout,
+    encode_pipeline: wgpu::RenderPipeline,
 }
 
 struct ViewGpu {
@@ -325,7 +421,33 @@ impl Resources {
         let mip_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("pc_mip"), bind_group_layouts: &[Some(&mip_bgl)], immediate_size: 0 });
         let mip_pipeline = pipeline(device, "pc_mip", &mip_layout, &mip_module, ("vs", "fs"), FORMAT, None);
         let mip_sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("pc_mip"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
-        Self { view_bgl, tile_bgl, shadow_pipeline, tile_pipeline, sampler, mip_bgl, mip_pipeline, mip_sampler, docs: HashMap::new(), views: HashMap::new(), out_linear: target.is_srgb() }
+        // Compositor output (straight RGBA32F chunk) -> premultiplied RGBA8 display tile.
+        let encode_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("pc_encode"), source: wgpu::ShaderSource::Wgsl(ENCODE_WGSL.into()) });
+        let unfilterable = wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { multisampled: false, sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2 },
+            count: None,
+        };
+        let encode_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("pc_encode"), entries: &[unfilterable, uniform_entry(1, 16, wgpu::ShaderStages::FRAGMENT)] });
+        let encode_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("pc_encode"), bind_group_layouts: &[Some(&encode_bgl)], immediate_size: 0 });
+        let encode_pipeline = pipeline(device, "pc_encode", &encode_layout, &encode_module, ("vs", "fs"), FORMAT, None);
+        Self {
+            view_bgl,
+            tile_bgl,
+            shadow_pipeline,
+            tile_pipeline,
+            sampler,
+            mip_bgl,
+            mip_pipeline,
+            mip_sampler,
+            docs: HashMap::new(),
+            views: HashMap::new(),
+            out_linear: target.is_srgb(),
+            compositor: None,
+            encode_bgl,
+            encode_pipeline,
+        }
     }
 }
 
@@ -649,6 +771,24 @@ fn fs_tile(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+const ENCODE_WGSL: &str = r#"
+@group(0) @binding(0) var acc: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> offset: vec4<i32>;
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2(f32((vi << 1u) & 2u), f32(vi & 2u));
+    return vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let c = textureLoad(acc, vec2<i32>(floor(pos.xy)) - offset.xy, 0);
+    let a = clamp(c.a, 0.0, 1.0);
+    return vec4(clamp(c.rgb, vec3(0.0), vec3(1.0)) * a, a);
+}
+"#;
+
 const MIP_WGSL: &str = r#"
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
@@ -692,7 +832,7 @@ mod tests {
     #[test]
     fn shaders_validate() {
         use wgpu::naga;
-        for (name, src) in [("canvas", CANVAS_WGSL), ("mip", MIP_WGSL)] {
+        for (name, src) in [("canvas", CANVAS_WGSL), ("mip", MIP_WGSL), ("encode", ENCODE_WGSL)] {
             let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty()).validate(&module).unwrap_or_else(|e| panic!("{name}: {e:?}"));
         }

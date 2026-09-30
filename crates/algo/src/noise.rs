@@ -32,7 +32,7 @@ pub(crate) fn add(src: &Image, out: Rect, ctx: &Ctx, amount: f32, dist: Distribu
             continue;
         }
         let (x, y) = (out.x0 + (i % w) as i32, out.y0 + (i / w) as i32);
-        for c in 0..cc {
+        for (c, pv) in px.iter_mut().enumerate().take(cc) {
             let ch = if mono { 0 } else { c as u32 };
             let v = match dist {
                 Distribution::Uniform => (hash01(x, y, ch, seed) - 0.5) * 2.0 * a,
@@ -43,7 +43,7 @@ pub(crate) fn add(src: &Image, out: Rect, ctx: &Ctx, amount: f32, dist: Distribu
                 }
             };
             // Integer storage clamps on write; float surfaces keep the value.
-            px[c] += v;
+            *pv += v;
         }
     }
     res

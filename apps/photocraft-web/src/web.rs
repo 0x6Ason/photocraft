@@ -127,8 +127,12 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
                 .map(|r| r.document)
                 .map_err(|e| e.to_string())
         })),
-        export: Some(Box::new(|doc: &Document, path: &str| {
-            photocraft_io::export(doc, path, &Default::default())
+        export: Some(Box::new(|doc: &Document, path: &str, settings: &photocraft_ui_egui::ExportSettings| {
+            let mut opts = photocraft_io::ExportOptions::default();
+            if let Some(q) = settings.jpeg_quality {
+                opts.encode.jpeg_quality = q;
+            }
+            photocraft_io::export(doc, path, &opts)
                 .map(|r| r.bytes)
                 .map_err(|e| e.to_string())
         })),

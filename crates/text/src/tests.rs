@@ -1,0 +1,750 @@
+use photocraft_color::{Color, PixelFormat, SampleType};
+use photocraft_doc::TextLayer;
+use photocraft_doc::text::{
+    CharStyle, FontFeature, ParagraphRun, ParagraphStyle, TextAlign, TextDirection, TextRun,
+    TextShape,
+};
+use photocraft_geom::Affine;
+
+use crate::{TextEngine, fonts};
+
+fn point(text: &str, size_pt: f32) -> TextLayer {
+    TextLayer {
+        text: text.into(),
+        font_family: "Inter".into(),
+        size_pt,
+        ..Default::default()
+    }
+}
+
+fn styled(text: &str, style: CharStyle) -> TextLayer {
+    TextLayer {
+        text: text.into(),
+        runs: vec![TextRun {
+            len: text.len(),
+            style,
+        }],
+        ..Default::default()
+    }
+}
+
+fn with_para(mut t: TextLayer, p: ParagraphStyle) -> TextLayer {
+    t.paragraphs = vec![ParagraphRun {
+        len: t.text.len(),
+        style: p,
+    }];
+    t
+}
+
+fn width(l: &crate::TextLayout) -> f32 {
+    l.lines.iter().map(|l| l.x1 - l.x0).fold(0.0, f32::max)
+}
+
+fn alpha_sum(s: &photocraft_raster::Surface, r: photocraft_geom::Rect) -> f64 {
+    let n = s.channels();
+    s.read_region(r)
+        .chunks_exact(n)
+        .map(|p| f64::from(p[n - 1]))
+        .sum()
+}
+
+#[test]
+fn bundled_fonts_cover_latin() {
+    let mut e = TextEngine::new();
+    let fams = e.fonts.families();
+    assert!(fams.iter().any(|f| f == "Inter"), "{fams:?}");
+    assert!(fams.iter().any(|f| f == "JetBrains Mono"), "{fams:?}");
+    let l = e.layout(&point("Hello, Wörld! 0123", 12.0), 72.0);
+    assert_eq!(l.glyphs.len(), "Hello, Wörld! 0123".chars().count());
+    assert!(l.glyphs.iter().all(|g| g.id != 0), "no .notdef");
+    assert_eq!(e.fonts.faces("Inter").len(), 3);
+}
+
+#[test]
+fn metrics_are_stable_and_scale_with_dpi() {
+    let mut e = TextEngine::new();
+    let a = e.layout(&point("Hamburgefonstiv", 12.0), 72.0);
+    let w = width(&a);
+    // Inter 12 px: stable to a tenth of a pixel across runs.
+    let again = width(&e.layout(&point("Hamburgefonstiv", 12.0), 72.0));
+    assert_eq!(w, again);
+    assert!((80.0..110.0).contains(&w), "{w}");
+    let b = e.layout(&point("Hamburgefonstiv", 12.0), 144.0);
+    assert!(
+        (width(&b) - 2.0 * w).abs() < 0.05,
+        "{} vs {}",
+        width(&b),
+        2.0 * w
+    );
+    // Point text: first baseline at the anchor.
+    assert_eq!(a.lines[0].baseline, 0.0);
+    assert!(a.lines[0].ascent > 8.0 && a.lines[0].ascent < 13.0);
+}
+
+#[test]
+fn auto_and_explicit_leading() {
+    let mut e = TextEngine::new();
+    let l = e.layout(&point("one\ntwo\rthree", 10.0), 72.0);
+    assert_eq!(l.lines.len(), 3);
+    assert!(
+        (l.lines[1].baseline - 12.0).abs() < 1e-3,
+        "auto leading = 1.2 × size"
+    );
+    assert!((l.lines[2].baseline - 24.0).abs() < 1e-3);
+    assert_eq!(&"one\ntwo\rthree"[l.lines[2].range.clone()], "three");
+    let t = styled(
+        "a\nb",
+        CharStyle {
+            size_pt: 10.0,
+            leading_pt: Some(30.0),
+            ..Default::default()
+        },
+    );
+    let l = e.layout(&t, 144.0);
+    assert!(
+        (l.lines[1].baseline - 60.0).abs() < 1e-3,
+        "{}",
+        l.lines[1].baseline
+    );
+    // Space before/after in points.
+    let t = with_para(
+        point("a\nb", 10.0),
+        ParagraphStyle {
+            space_after_pt: 5.0,
+            ..Default::default()
+        },
+    );
+    let l = e.layout(&t, 72.0);
+    assert!(
+        (l.lines[1].baseline - 17.0).abs() < 1e-3,
+        "{}",
+        l.lines[1].baseline
+    );
+}
+
+#[test]
+fn box_text_wraps_inside_width() {
+    let mut e = TextEngine::new();
+    let mut t = point(
+        "The quick brown fox jumps over the lazy dog again and again",
+        12.0,
+    );
+    t.shape = TextShape::Box {
+        x: 10.0,
+        y: 20.0,
+        width: 100.0,
+        height: 1000.0,
+    };
+    let l = e.layout(&t, 72.0);
+    assert!(l.lines.len() >= 3, "{}", l.lines.len());
+    for line in &l.lines {
+        assert!(
+            line.x0 >= 10.0 - 1e-3 && line.x1 <= 110.0 + 1e-3,
+            "{line:?}"
+        );
+    }
+    // First baseline = top + ascender height ('d'), a bit less than the hhea ascent.
+    let drop = l.lines[0].baseline - 20.0;
+    assert!(drop > 0.65 * 12.0 && drop < l.lines[0].ascent, "{drop}");
+    // Lines cover the text in order.
+    assert_eq!(l.lines[0].range.start, 0);
+    for w in l.lines.windows(2) {
+        assert!(w[1].range.start >= w[0].range.end);
+    }
+    // Overflowing lines are hidden, like Photoshop.
+    t.shape = TextShape::Box {
+        x: 0.0,
+        y: 0.0,
+        width: 100.0,
+        height: 30.0,
+    };
+    let l2 = e.layout(&t, 72.0);
+    assert_eq!(l2.lines.len(), 2);
+}
+
+#[test]
+fn alignment_point_and_box() {
+    let mut e = TextEngine::new();
+    let c = e.layout(
+        &with_para(
+            point("Centered", 20.0),
+            ParagraphStyle {
+                align: TextAlign::Center,
+                ..Default::default()
+            },
+        ),
+        72.0,
+    );
+    let ln = &c.lines[0];
+    assert!((ln.x0 + ln.x1).abs() < 0.01, "centered on anchor: {ln:?}");
+    let r = e.layout(
+        &with_para(
+            point("Right", 20.0),
+            ParagraphStyle {
+                align: TextAlign::Right,
+                ..Default::default()
+            },
+        ),
+        72.0,
+    );
+    assert!(r.lines[0].x1.abs() < 0.01 && r.lines[0].x0 < -10.0);
+
+    let mut t = point("aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk", 12.0);
+    t.shape = TextShape::Box {
+        x: 0.0,
+        y: 0.0,
+        width: 120.0,
+        height: 500.0,
+    };
+    let t = with_para(
+        t,
+        ParagraphStyle {
+            align: TextAlign::JustifyLeft,
+            ..Default::default()
+        },
+    );
+    let l = e.layout(&t, 72.0);
+    assert!(l.lines.len() > 1);
+    let first = &l.lines[0];
+    // Justified line: last glyph ends at the right edge (within a pixel).
+    let last_glyph_x = l
+        .glyphs
+        .iter()
+        .filter(|g| (g.y - first.baseline).abs() < 1e-3)
+        .map(|g| g.x)
+        .fold(f32::MIN, f32::max);
+    assert!(last_glyph_x > 110.0, "{last_glyph_x}");
+    let right = with_para(
+        TextLayer {
+            shape: TextShape::Box {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0,
+            },
+            ..point("end", 12.0)
+        },
+        ParagraphStyle {
+            align: TextAlign::Right,
+            ..Default::default()
+        },
+    );
+    let l = e.layout(&right, 72.0);
+    assert!((l.lines[0].x1 - 200.0).abs() < 0.5, "{:?}", l.lines[0]);
+}
+
+#[test]
+fn rtl_text_is_reordered() {
+    let mut e = TextEngine::new();
+    // Hebrew isn't in the bundled fonts, but bidi still resolves (glyphs may be .notdef).
+    let text = "abc שלום def";
+    let l = e.layout(&point(text, 12.0), 72.0);
+    let heb: Vec<_> = l
+        .clusters
+        .iter()
+        .filter(|c| {
+            text[c.range.clone()]
+                .chars()
+                .all(|ch| ('\u{0590}'..='\u{05FF}').contains(&ch))
+        })
+        .collect();
+    assert_eq!(heb.len(), 4);
+    assert!(heb.iter().all(|c| c.rtl));
+    // Visual order: the first logical Hebrew letter is rightmost among them.
+    let first = heb.iter().min_by_key(|c| c.range.start).unwrap();
+    assert!(heb.iter().all(|c| c.x <= first.x + 1e-3));
+    // Forced RTL paragraph: the Latin run ends up to the right of the Hebrew.
+    let t = with_para(
+        point("שלום abc", 12.0),
+        ParagraphStyle {
+            direction: TextDirection::Rtl,
+            ..Default::default()
+        },
+    );
+    let l = e.layout(&t, 72.0);
+    let a = l
+        .clusters
+        .iter()
+        .find(|c| &"שלום abc"[c.range.clone()] == "a")
+        .unwrap();
+    let shin = l.clusters.iter().find(|c| c.range.start == 0).unwrap();
+    assert!(a.x < shin.x, "abc left of the Hebrew in an RTL paragraph");
+    assert!(l.clusters.iter().all(|c| c.range.end <= "שלום abc".len()));
+}
+
+/// Builds a TrueType collection from standalone fonts (table offsets rebased).
+fn make_ttc(fonts: &[&[u8]]) -> Vec<u8> {
+    let header_len = 12 + 4 * fonts.len();
+    let mut out = Vec::new();
+    out.extend_from_slice(b"ttcf");
+    out.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+    out.extend_from_slice(&(fonts.len() as u32).to_be_bytes());
+    let mut offsets = Vec::new();
+    let mut body: Vec<u8> = Vec::new();
+    for f in fonts {
+        while !(header_len + body.len()).is_multiple_of(4) {
+            body.push(0);
+        }
+        let base = (header_len + body.len()) as u32;
+        offsets.push(base);
+        let mut copy = f.to_vec();
+        let n = u16::from_be_bytes([copy[4], copy[5]]) as usize;
+        for i in 0..n {
+            let at = 12 + i * 16 + 8;
+            let off = u32::from_be_bytes(copy[at..at + 4].try_into().unwrap());
+            copy[at..at + 4].copy_from_slice(&(off + base).to_be_bytes());
+        }
+        body.extend(copy);
+    }
+    for o in offsets {
+        out.extend_from_slice(&o.to_be_bytes());
+    }
+    out.extend(body);
+    out
+}
+
+#[test]
+fn truetype_collections_load() {
+    let ttc = make_ttc(&[fonts::BUNDLED[0].1, fonts::BUNDLED[3].1]);
+    assert_eq!(fonts::face_count(&ttc), 2);
+    let mut db = fonts::FontDb::new();
+    // A fresh DB without the bundled mono font would miss it; register the collection anyway
+    // and check both faces are indexed (families already present gain faces).
+    let before = db.faces("JetBrains Mono").len();
+    let names = db.register_font_data(ttc);
+    assert!(
+        names.iter().any(|n| n == "Inter") && names.iter().any(|n| n == "JetBrains Mono"),
+        "{names:?}"
+    );
+    assert_eq!(db.faces("JetBrains Mono").len(), before + 1);
+    // Layout with the TTC-backed face works.
+    let mut e = TextEngine {
+        fonts: db,
+        layouter: crate::layout::Layouter::new(),
+    };
+    let t = styled(
+        "mono",
+        CharStyle {
+            font_family: "JetBrains Mono".into(),
+            ..Default::default()
+        },
+    );
+    let l = e.layout(&t, 72.0);
+    assert!(l.glyphs.iter().all(|g| g.id != 0));
+}
+
+#[test]
+fn opentype_features_and_tracking() {
+    let mut e = TextEngine::new();
+    let ids = |e: &mut TextEngine, feats: Vec<FontFeature>, lig: bool| {
+        let t = styled(
+            "a0",
+            CharStyle {
+                features: feats,
+                ligatures: lig,
+                ..Default::default()
+            },
+        );
+        e.layout(&t, 72.0)
+            .glyphs
+            .iter()
+            .map(|g| g.id)
+            .collect::<Vec<_>>()
+    };
+    let plain = ids(&mut e, vec![], true);
+    let alt = ids(
+        &mut e,
+        vec![FontFeature {
+            tag: "zero".into(),
+            value: 1,
+        }],
+        true,
+    );
+    assert_ne!(
+        plain, alt,
+        "Inter's `zero` feature selects the slashed zero"
+    );
+    let a = width(&e.layout(&styled("tracking", CharStyle::default()), 72.0));
+    let b = width(&e.layout(
+        &styled(
+            "tracking",
+            CharStyle {
+                tracking: 100.0,
+                ..Default::default()
+            },
+        ),
+        72.0,
+    ));
+    // 100/1000 em at 12 px per letter (8 letters; trailing spacing counts too).
+    assert!((b - a - 8.0 * 1.2).abs() < 1.3, "{a} → {b}");
+}
+
+#[test]
+fn raster_coverage_scales_and_depths_agree() {
+    let mut e = TextEngine::new();
+    let t = |size: f32| TextLayer {
+        transform: Affine::translate(10.0, 50.0),
+        ..point("Ink", size)
+    };
+    let (_, r12) = e.render(&t(12.0), 72.0, PixelFormat::RGBA8);
+    let (_, r24) = e.render(&t(24.0), 72.0, PixelFormat::RGBA8);
+    let s12 = alpha_sum(&r12.surface, r12.rect);
+    let s24 = alpha_sum(&r24.surface, r24.rect);
+    assert!(s12 > 20.0, "{s12}");
+    let ratio = s24 / s12;
+    assert!((3.6..4.4).contains(&ratio), "ink ∝ size²: {ratio}");
+    // Placement: anchored at (10, 50) baseline.
+    assert!(
+        r12.rect.x0 >= 8 && r12.rect.x0 <= 11 && r12.rect.y1 <= 53 && r12.rect.y1 >= 50,
+        "{:?}",
+        r12.rect
+    );
+    for fmt in [
+        PixelFormat::RGBA16,
+        PixelFormat::RGBA32F,
+        PixelFormat::GRAYA8,
+        PixelFormat::CMYKA8,
+    ] {
+        let (_, r) = e.render(&t(12.0), 72.0, fmt);
+        assert_eq!(r.rect, r12.rect);
+        let s = alpha_sum(&r.surface, r.rect);
+        assert!((s - s12).abs() / s12 < 0.01, "{fmt:?}: {s} vs {s12}");
+    }
+    // Deterministic.
+    let (_, again) = e.render(&t(12.0), 72.0, PixelFormat::RGBA8);
+    assert_eq!(again.surface, r12.surface);
+    // Golden-ish total ink for "Ink" in Inter 12 px (±3%).
+    assert!(
+        (s12 - GOLDEN_INK_12).abs() / GOLDEN_INK_12 < 0.03,
+        "ink sum {s12}"
+    );
+}
+
+/// Sum of alpha for "Ink", Inter Regular 12 px (measured once; guards rasterizer regressions).
+const GOLDEN_INK_12: f64 = 44.4;
+
+#[test]
+fn styles_change_pixels() {
+    let mut e = TextEngine::new();
+    let base = CharStyle {
+        size_pt: 30.0,
+        ..Default::default()
+    };
+    let ink = |e: &mut TextEngine, s: CharStyle| {
+        let (_, r) = e.render(
+            &TextLayer {
+                transform: Affine::translate(5.0, 40.0),
+                ..styled("Hi", s)
+            },
+            72.0,
+            PixelFormat::RGBA8,
+        );
+        (alpha_sum(&r.surface, r.rect), r.rect)
+    };
+    let (plain, prect) = ink(&mut e, base.clone());
+    let (bold, _) = ink(
+        &mut e,
+        CharStyle {
+            faux_bold: true,
+            ..base.clone()
+        },
+    );
+    assert!(bold > plain * 1.1, "{plain} → {bold}");
+    let (under, urect) = ink(
+        &mut e,
+        CharStyle {
+            underline: true,
+            ..base.clone()
+        },
+    );
+    assert!(under > plain && urect.y1 > prect.y1);
+    let (_, irect) = ink(
+        &mut e,
+        CharStyle {
+            faux_italic: true,
+            ..base.clone()
+        },
+    );
+    assert!(irect.x1 > prect.x1, "slanted top extends right");
+    let (_, srect) = ink(
+        &mut e,
+        CharStyle {
+            baseline_shift_pt: 10.0,
+            ..base.clone()
+        },
+    );
+    assert_eq!(srect.y0, prect.y0 - 10);
+    let (_, hrect) = ink(
+        &mut e,
+        CharStyle {
+            horizontal_scale: 2.0,
+            ..base.clone()
+        },
+    );
+    assert!(hrect.width() as f32 > prect.width() as f32 * 1.7);
+}
+
+#[test]
+fn multicolor_runs() {
+    let mut e = TextEngine::new();
+    let red = CharStyle {
+        size_pt: 40.0,
+        color: Color::rgb(1.0, 0.0, 0.0),
+        ..Default::default()
+    };
+    let blue = CharStyle {
+        color: Color::rgb(0.0, 0.0, 1.0),
+        ..red.clone()
+    };
+    let t = TextLayer {
+        text: "HH".into(),
+        runs: vec![
+            TextRun { len: 1, style: red },
+            TextRun {
+                len: 1,
+                style: blue,
+            },
+        ],
+        transform: Affine::translate(0.0, 40.0),
+        ..Default::default()
+    };
+    let (l, r) = e.render(&t, 72.0, PixelFormat::RGBA8);
+    assert_eq!(l.glyphs.len(), 2);
+    let px = r.surface.read_region(r.rect);
+    let opaque: Vec<&[f32]> = px.chunks_exact(4).filter(|p| p[3] > 0.99).collect();
+    assert!(opaque.iter().any(|p| p[0] > 0.99 && p[2] < 0.01));
+    assert!(opaque.iter().any(|p| p[2] > 0.99 && p[0] < 0.01));
+    // CMYK target keeps colour in the document model.
+    let (_, rc) = e.render(&t, 72.0, PixelFormat::CMYKA8);
+    assert!(
+        rc.surface
+            .read_region(rc.rect)
+            .chunks_exact(5)
+            .any(|p| p[4] > 0.99 && p[1] > 0.9 && p[2] > 0.9)
+    );
+}
+
+#[test]
+fn hit_test_and_caret() {
+    let mut e = TextEngine::new();
+    let l = e.layout(&point("abc\ndef", 20.0), 72.0);
+    assert_eq!(l.hit_test(-5.0, -5.0), 0);
+    assert_eq!(l.hit_test(1000.0, -5.0), 3);
+    assert_eq!(l.hit_test(-5.0, 24.0), 4);
+    let (x, top, bottom) = l.caret(1);
+    assert!(x > 0.0 && top < 0.0 && bottom > 0.0);
+    let (x2, ..) = l.caret(2);
+    assert!(x2 > x);
+    assert_eq!(l.caret(3).0, l.lines[0].x1);
+}
+
+#[test]
+fn empty_text_and_empty_lines() {
+    let mut e = TextEngine::new();
+    let l = e.layout(&point("", 12.0), 72.0);
+    assert_eq!(l.lines.len(), 1);
+    assert!(l.glyphs.is_empty());
+    let l = e.layout(&point("a\n\nb", 12.0), 72.0);
+    assert_eq!(l.lines.len(), 3);
+    assert!((l.lines[2].baseline - 2.0 * 14.4).abs() < 1e-3);
+    let (_, r) = e.render(&point("", 12.0), 72.0, PixelFormat::RGBA8);
+    assert_eq!(r.rect.width(), 0);
+}
+
+#[test]
+fn postscript_names() {
+    let g = fonts::guess_from_postscript("MyriadPro-BoldIt");
+    assert_eq!(
+        (g.family.as_str(), g.weight, g.italic),
+        ("Myriad Pro", 700, true)
+    );
+    let g = fonts::guess_from_postscript("TimesNewRomanPSMT");
+    assert_eq!(
+        (g.family.as_str(), g.weight, g.italic),
+        ("Times New Roman", 400, false)
+    );
+    let g = fonts::guess_from_postscript("Arial-BoldMT");
+    assert_eq!((g.family.as_str(), g.weight), ("Arial", 700));
+    let mut db = fonts::FontDb::new();
+    let r = db.resolve_postscript("Inter-SemiBold");
+    assert_eq!((r.family.as_str(), r.weight, r.exact), ("Inter", 600, true));
+    // Unknown fonts fall back gracefully in layout.
+    let mut e = TextEngine::new();
+    let t = styled(
+        "x",
+        CharStyle {
+            font_family: "Nonexistent Sans".into(),
+            postscript_name: Some("Nope-Bold".into()),
+            ..Default::default()
+        },
+    );
+    assert!(e.layout(&t, 72.0).glyphs[0].id != 0);
+}
+
+#[test]
+fn depth_is_respected() {
+    let mut e = TextEngine::new();
+    let (_, r) = e.render(
+        &TextLayer {
+            transform: Affine::translate(2.0, 20.0),
+            ..point("a", 20.0)
+        },
+        72.0,
+        PixelFormat::RGBA16,
+    );
+    assert_eq!(r.surface.format().sample, SampleType::U16);
+    assert!(r.surface.format().alpha);
+}
+
+/// Visual check: `PHOTOCRAFT_TEXT_DUMP=/tmp/t.ppm cargo test -p photocraft-text dump -- --ignored`.
+#[test]
+#[ignore]
+fn dump_sample() {
+    use photocraft_doc::text::{Caps, TextAlign};
+    let Some(path) = std::env::var_os("PHOTOCRAFT_TEXT_DUMP") else {
+        return;
+    };
+    let mut e = if std::env::var_os("PHOTOCRAFT_TEXT_SYSTEM").is_some() {
+        TextEngine::with_system_fonts()
+    } else {
+        TextEngine::new()
+    };
+    let s = CharStyle {
+        size_pt: 28.0,
+        ..Default::default()
+    };
+    let text = "Photocraft Type\nBold faux, italic faux, underline\nשלום عربي mixed ✓\nJustified paragraph text wraps inside the box nicely and evenly across lines.";
+    let runs = vec![
+        TextRun {
+            len: 16,
+            style: CharStyle {
+                size_pt: 40.0,
+                color: Color::rgb(0.1, 0.3, 0.9),
+                caps: Caps::Normal,
+                ..s.clone()
+            },
+        },
+        TextRun {
+            len: 5,
+            style: CharStyle {
+                faux_bold: true,
+                ..s.clone()
+            },
+        },
+        TextRun {
+            len: 13,
+            style: CharStyle {
+                faux_italic: true,
+                color: Color::rgb(0.8, 0.1, 0.1),
+                ..s.clone()
+            },
+        },
+        TextRun {
+            len: 11,
+            style: CharStyle {
+                underline: true,
+                strikethrough: false,
+                ..s.clone()
+            },
+        },
+        TextRun {
+            len: 1000,
+            style: CharStyle {
+                size_pt: 20.0,
+                tracking: 20.0,
+                ..s.clone()
+            },
+        },
+    ];
+    let t = TextLayer {
+        text: text.into(),
+        runs,
+        paragraphs: vec![
+            ParagraphRun {
+                len: 45,
+                style: ParagraphStyle {
+                    align: TextAlign::Left,
+                    ..Default::default()
+                },
+            },
+            ParagraphRun {
+                len: 1000,
+                style: ParagraphStyle {
+                    align: TextAlign::JustifyLeft,
+                    space_before_pt: 6.0,
+                    ..Default::default()
+                },
+            },
+        ],
+        shape: TextShape::Box {
+            x: 0.0,
+            y: 0.0,
+            width: 560.0,
+            height: 400.0,
+        },
+        transform: Affine::translate(20.0, 20.0),
+        ..Default::default()
+    };
+    let (_, r) = e.render(&t, 72.0, PixelFormat::RGBA8);
+    let (w, h) = (600u32, 360u32);
+    let mut out = format!("P6 {w} {h} 255\n").into_bytes();
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let p = r.surface.pixel(x, y);
+            let a = p[3];
+            for c in &p[..3] {
+                out.push(((c * a + (1.0 - a)) * 255.0).round() as u8);
+            }
+        }
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+/// Variable-font axes reach the outlines (uses a system variable font when one is present).
+#[test]
+fn variable_font_axes() {
+    let candidates = [
+        "/System/Library/Fonts/SFNS.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-VariableFont_wdth,wght.ttf",
+        "C:\\Windows\\Fonts\\bahnschrift.ttf",
+    ];
+    let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
+        return;
+    };
+    let mut e = TextEngine::new();
+    let fams = e.fonts.register_font_data(bytes);
+    let Some(fam) = fams.first().cloned() else {
+        return;
+    };
+    if !e
+        .fonts
+        .faces(&fam)
+        .iter()
+        .any(|f| f.axes.iter().any(|a| a.0 == "wght"))
+    {
+        return;
+    }
+    let ink = |e: &mut TextEngine, w: f32| {
+        let s = CharStyle {
+            font_family: fam.clone(),
+            size_pt: 40.0,
+            variations: vec![photocraft_doc::text::FontVariation {
+                axis: "wght".into(),
+                value: w,
+            }],
+            ..Default::default()
+        };
+        let (_, r) = e.render(
+            &TextLayer {
+                transform: Affine::translate(0.0, 50.0),
+                ..styled("Weight", s)
+            },
+            72.0,
+            PixelFormat::RGBA8,
+        );
+        alpha_sum(&r.surface, r.rect)
+    };
+    let light = ink(&mut e, 200.0);
+    let heavy = ink(&mut e, 800.0);
+    assert!(heavy > light * 1.5, "{light} → {heavy}");
+}

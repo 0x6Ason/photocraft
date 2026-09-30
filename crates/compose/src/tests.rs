@@ -566,3 +566,66 @@ fn effects_render_identically_in_tiles() {
         assert!(close4(t, full.get(x, y)), "({x},{y})");
     }
 }
+
+#[test]
+fn parallel_tiles_match_single_pass() {
+    // A document exercising masks, clipping, groups, adjustments, fills and effects.
+    let mut d = doc_white(97, 61);
+    let mut a = solid_layer("a", Rect::new(5, 5, 70, 50), [1.0, 0.2, 0.1, 0.8]);
+    let mut m = LayerMask::reveal_all();
+    m.surface.fill_rect(Rect::new(0, 0, 40, 61), &[0.25]);
+    m.density = 0.8;
+    a.mask = Some(m);
+    a.effects.items.push(stroke(3.0, StrokePosition::Outside));
+    d.layers.push(a);
+    let mut clip = solid_layer("clip", Rect::new(30, 0, 97, 61), [0.0, 1.0, 0.0, 1.0]);
+    clip.clipped = true;
+    clip.blend = photocraft_color::BlendMode::Multiply;
+    d.layers.push(clip);
+    let mut g = Layer::group("g", vec![solid_layer("in", Rect::new(50, 20, 90, 60), [0.2, 0.3, 0.9, 1.0])]);
+    g.opacity = 0.6;
+    d.layers.push(g);
+    d.layers.push(Layer::new("inv", LayerContent::Adjustment(Adjustment::Invert)));
+    let mut f = Layer::new("fill", LayerContent::Fill(Fill::Solid(Color::rgb(0.5, 0.5, 0.0))));
+    f.opacity = 0.3;
+    d.layers.push(f);
+    let r = d.bounds();
+    let whole = render_tiled(&d, r, 10_000);
+    for tile in [7, 16, 33] {
+        assert_eq!(render_tiled(&d, r, tile), whole, "tile {tile}");
+    }
+    assert_eq!(render(&d, r), whole);
+}
+
+#[test]
+fn vector_mask_combines_with_pixel_mask() {
+    use photocraft_doc::{Path, Subpath, VectorMask};
+    let mut d = doc_white(8, 8);
+    let mut l = solid_layer("k", Rect::new(0, 0, 8, 8), [0.0, 0.0, 0.0, 1.0]);
+    // Vector mask reveals x in 0..4 (and half of column 4); the pixel mask hides rows 0..2.
+    l.vector_mask = Some(VectorMask::new(Path::new(vec![Subpath::polygon(&[(0.0, 0.0), (4.5, 0.0), (4.5, 8.0), (0.0, 8.0)])])));
+    let mut m = LayerMask::reveal_all();
+    m.surface.fill_rect(Rect::new(0, 0, 8, 2), &[0.0]);
+    l.mask = Some(m);
+    d.layers.push(l);
+    assert!(close4(px(&d, 1, 4), [0.0, 0.0, 0.0, 1.0]));
+    assert!(close4(px(&d, 6, 4), [1.0; 4]));
+    assert!(close4(px(&d, 4, 4), [0.5, 0.5, 0.5, 1.0]));
+    assert!(close4(px(&d, 1, 1), [1.0; 4]));
+    // Tiled rendering gives the same result.
+    let whole = render_tiled(&d, d.bounds(), 3);
+    assert_eq!(whole.px, render_tiled(&d, d.bounds(), 256).px);
+    // Density and disabling.
+    let top = d.layers.len() - 1;
+    let vm = d.layers[top].vector_mask.as_mut().unwrap();
+    vm.density = 0.5;
+    assert!(close4(px(&d, 6, 4), [0.5, 0.5, 0.5, 1.0]));
+    d.layers[top].vector_mask.as_mut().unwrap().enabled = false;
+    assert!(close4(px(&d, 6, 4), [0.0, 0.0, 0.0, 1.0]));
+    // Without a pixel mask the vector mask alone applies.
+    d.layers[top].mask = None;
+    d.layers[top].vector_mask.as_mut().unwrap().enabled = true;
+    d.layers[top].vector_mask.as_mut().unwrap().density = 1.0;
+    assert!(close4(px(&d, 1, 1), [0.0, 0.0, 0.0, 1.0]));
+    assert!(close4(px(&d, 6, 1), [1.0; 4]));
+}

@@ -45,6 +45,30 @@ fn has_pixel_layer(s: &Session) -> std::result::Result<(), String> {
     let l = d.doc.layer(d.active_layer.unwrap()).unwrap();
     if matches!(l.content, LayerContent::Raster(_)) { Ok(()) } else { Err(format!("active layer is a {} layer, not a pixel layer", l.content.kind_name())) }
 }
+/// A layer that can be painted: pixels, or any layer with a mask (paint with `"target":"mask"`).
+pub(crate) fn has_paintable(s: &Session) -> std::result::Result<(), String> {
+    has_layer(s)?;
+    let d = s.active().unwrap();
+    let l = d.doc.layer(d.active_layer.unwrap()).unwrap();
+    if matches!(l.content, LayerContent::Raster(_)) || l.mask.is_some() { Ok(()) } else { Err(format!("active layer is a {} layer without a mask", l.content.kind_name())) }
+}
+
+/// Surface a paint command writes to: the layer's pixels, or its mask with `"target":"mask"`.
+pub(crate) fn paint_surface<'a>(l: &'a mut Layer, p: &Value) -> Result<&'a mut photocraft_raster::Surface> {
+    if !is_mask_target(p) && (l.locks.pixels || l.locks.all) {
+        return Err(EngineError::Other(format!("Could not complete your request because the layer \"{}\" is locked", l.name)));
+    }
+    if is_mask_target(p) {
+        l.mask.as_mut().map(|m| &mut m.surface).ok_or_else(|| EngineError::Other("layer has no mask".into()))
+    } else {
+        l.surface_mut().ok_or_else(|| EngineError::Other("not a pixel layer".into()))
+    }
+}
+
+pub(crate) fn is_mask_target(p: &Value) -> bool {
+    p.get("target").and_then(Value::as_str) == Some("mask")
+}
+
 fn can_undo(s: &Session) -> std::result::Result<(), String> {
     s.active().filter(|d| d.history.can_undo()).map(|_| ()).ok_or_else(|| "nothing to undo".into())
 }
@@ -76,7 +100,7 @@ fn bad(cmd: &str, msg: impl Into<String>) -> EngineError {
     EngineError::BadParams { cmd: cmd.into(), msg: msg.into() }
 }
 /// Integer parameter that also accepts JSON floats (UIs send `12.0`); rounds.
-fn int(p: &Value, key: &str) -> Option<i64> {
+pub(crate) fn int(p: &Value, key: &str) -> Option<i64> {
     p.get(key).and_then(|v| v.as_i64().or_else(|| v.as_f64().filter(|f| f.is_finite()).map(|f| f.round() as i64)))
 }
 
@@ -153,26 +177,39 @@ pub fn adjustment_from_params(kind: &str, p: &Value) -> Adjustment {
         "exposure" => Adjustment::Exposure { exposure: f32_or(p, "exposure", 0.0), offset: f32_or(p, "offset", 0.0), gamma: f32_or(p, "gamma", 1.0) },
         "vibrance" => Adjustment::Vibrance { vibrance: f32_or(p, "vibrance", 0.0), saturation: f32_or(p, "saturation", 0.0) },
         "levels" => {
-            let mut a = Adjustment::identity_levels();
-            if let Adjustment::Levels { master, .. } = &mut a {
-                master.in_black = f32_or(p, "inBlack", 0.0) / 255.0;
-                master.in_white = f32_or(p, "inWhite", 255.0) / 255.0;
-                master.gamma = f32_or(p, "gamma", 1.0);
-            }
-            a
+            // Master keys at the top level; per channel under "red"/"green"/"blue" (0–255 levels).
+            let ch = |p: &Value| photocraft_doc::adjust::LevelsChannel {
+                in_black: f32_or(p, "inBlack", 0.0) / 255.0,
+                in_white: f32_or(p, "inWhite", 255.0) / 255.0,
+                gamma: f32_or(p, "gamma", 1.0).clamp(0.01, 9.99),
+                out_black: f32_or(p, "outBlack", 0.0) / 255.0,
+                out_white: f32_or(p, "outWhite", 255.0) / 255.0,
+            };
+            let per = |k: &str| p.get(k).map(ch).unwrap_or_default();
+            Adjustment::Levels { master: ch(p), per_channel: [per("red"), per("green"), per("blue")] }
         }
         "curves" => {
-            let mut a = Adjustment::identity_curves();
-            if let (Adjustment::Curves { master, .. }, Some(Value::Array(pts))) = (&mut a, p.get("points")) {
-                let parsed: Vec<CurvePoint> = pts
+            // "points" = master curve; "red"/"green"/"blue" = per-channel curves ([[in, out], …], 0–255).
+            let parse = |v: Option<&Value>| -> Option<Vec<CurvePoint>> {
+                let pts: Vec<CurvePoint> = v?
+                    .as_array()?
                     .iter()
                     .filter_map(|v| {
                         let a = v.as_array()?;
                         Some(CurvePoint { input: a.first()?.as_f64()? as f32 / 255.0, output: a.get(1)?.as_f64()? as f32 / 255.0 })
                     })
                     .collect();
-                if parsed.len() >= 2 {
-                    *master = parsed;
+                (pts.len() >= 2).then_some(pts)
+            };
+            let mut a = Adjustment::identity_curves();
+            if let Adjustment::Curves { master, per_channel } = &mut a {
+                if let Some(m) = parse(p.get("points")) {
+                    *master = m;
+                }
+                for (i, k) in ["red", "green", "blue"].iter().enumerate() {
+                    if let Some(c) = parse(p.get(*k)) {
+                        per_channel[i] = c;
+                    }
                 }
             }
             a
@@ -351,7 +388,7 @@ fn build() -> Vec<CommandSpec> {
             })?;
             Ok(json!({ "layer": gid.0 }))
         }),
-        cmd!("layer.duplicate", "Duplicate Layer…", ["Layer"], Some("Cmd+J"), r##"{"layer":id?}"##, has_layer, |s, p| {
+        cmd!("layer.duplicate", "Duplicate Layer…", ["Layer"], None, r##"{"layer":id?}"##, has_layer, |s, p| {
             let id = layer_param(s, p)?;
             let nid = s.edit("Duplicate Layer", |doc, active| {
                 let mut dup = doc.layer(id).ok_or(EngineError::NoLayer(id))?.duplicate();
@@ -378,7 +415,7 @@ fn build() -> Vec<CommandSpec> {
             s.select_layer(LayerId(id))?;
             Ok(Value::Null)
         }),
-        cmd!("layer.setProps", "Layer Properties", [], None, r##"{"layer":id?,"name":str?,"visible":bool?,"opacity":0..1?,"fill":0..1?,"blend":"Multiply|…"?,"clipped":bool?,"locked":bool?}"##, has_layer, |s, p| {
+        cmd!("layer.setProps", "Layer Properties", [], None, r##"{"layer":id?,"name":str?,"visible":bool?,"opacity":0..1?,"fill":0..1?,"blend":"Multiply|…"?,"clipped":bool?,"locked":bool?,"locks":{"transparency","pixels","position","artboard","all":bool}?}"##, has_layer, |s, p| {
             let id = layer_param(s, p)?;
             let label = if p.get("visible").is_some() && p.as_object().is_some_and(|o| o.len() <= 2) { "Layer Visibility" } else { "Layer Properties" };
             s.edit(label, |doc, _| {
@@ -403,6 +440,19 @@ fn build() -> Vec<CommandSpec> {
                 }
                 if let Some(v) = p.get("locked").and_then(Value::as_bool) {
                     l.locks.all = v;
+                }
+                if let Some(Value::Object(m)) = p.get("locks") {
+                    for (k, v) in m {
+                        let v = v.as_bool().unwrap_or(false);
+                        match k.as_str() {
+                            "transparency" => l.locks.transparency = v,
+                            "pixels" => l.locks.pixels = v,
+                            "position" => l.locks.position = v,
+                            "artboard" => l.locks.artboard = v,
+                            "all" => l.locks.all = v,
+                            other => return Err(bad("layer.setProps", format!("unknown lock `{other}`"))),
+                        }
+                    }
                 }
                 Ok(())
             })?;
@@ -544,11 +594,13 @@ fn build() -> Vec<CommandSpec> {
                 return Ok(Value::Null);
             }
             s.edit("Move", |doc, _| {
+                let snapshot = doc.clone();
                 let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
                 if l.locks.position || l.locks.all {
                     return Err(EngineError::Other(format!("layer \"{}\" is position-locked", l.name)));
                 }
-                translate_layer(l, dx, dy);
+                translate_layer(&snapshot, l, dx, dy);
+                crate::vector_cmds::translate_vectors(&snapshot, l, dx as f64, dy as f64);
                 Ok(())
             })?;
             Ok(Value::Null)
@@ -600,7 +652,7 @@ fn build() -> Vec<CommandSpec> {
             destructive_adjust(s, "Desaturate", Adjustment::HueSaturation { hue: 0.0, saturation: -100.0, lightness: 0.0, colorize: false })
         }),
         // Paint
-        cmd!("paint.stroke", "Brush Stroke", [], None, r##"{"points":[[x,y,pressure?],…],"size":px?,"hardness":0..1?,"opacity":0..1?,"flow":0..1?,"color":"#rrggbb"?=foreground,"erase":bool?,"smoothing":0..1?}"##, has_pixel_layer, |s, p| {
+        cmd!("paint.stroke", "Brush Stroke", [], None, r##"{"points":[[x,y,pressure?],…],"size":px?,"hardness":0..1?,"opacity":0..1?,"flow":0..1?,"color":"#rrggbb"?=foreground,"erase":bool?,"smoothing":0..1?,"target":"pixels|mask"="pixels"}"##, has_paintable, |s, p| {
             let pts: Vec<StrokePoint> = p
                 .get("points")
                 .and_then(Value::as_array)
@@ -625,6 +677,8 @@ fn build() -> Vec<CommandSpec> {
                 erase: p.get("erase").and_then(Value::as_bool).unwrap_or(false),
                 ..base
             };
+            // On a mask the eraser paints the background colour (Photoshop).
+            let brush = if is_mask_target(p) && brush.erase { BrushSettings { erase: false, color: s.tools.background, ..brush } } else { brush };
             let smoothing = f32_or(p, "smoothing", 0.0);
             let stroke = Stroke { brush, points: if smoothing > 0.0 { photocraft_paint::smooth(&pts, smoothing) } else { pts } };
             let id = layer_param(s, p)?;
@@ -632,8 +686,8 @@ fn build() -> Vec<CommandSpec> {
             let dmg = s.edit(label, |doc, _| {
                 let sel = doc.selection.clone();
                 let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-                let lock = l.locks.transparency;
-                let surf = l.surface_mut().ok_or_else(|| EngineError::Other("not a pixel layer".into()))?;
+                let lock = l.locks.transparency && !is_mask_target(p);
+                let surf = paint_surface(l, p)?;
                 Ok(photocraft_paint::apply_stroke(surf, &stroke, sel.as_ref(), lock))
             })?;
             if let Some(st) = s.active_mut() {
@@ -739,6 +793,15 @@ fn build() -> Vec<CommandSpec> {
     }
     v.extend(crate::layer_style::specs());
     v.extend(crate::filters::specs());
+    v.extend(crate::type_cmds::specs());
+    v.extend(crate::transform_cmds::specs());
+    v.extend(crate::vector_cmds::specs());
+    v.extend(crate::smartselect_cmds::specs());
+    v.extend(crate::edit_cmds::specs());
+    v.extend(crate::retouch_cmds::specs());
+    v.extend(crate::image_cmds::specs());
+    v.extend(crate::selection_cmds::specs());
+    v.extend(crate::paint_cmds::specs());
     v
 }
 
@@ -814,17 +877,24 @@ fn combine(a: &Surface, b: &Surface, area: Rect, f: impl Fn(f32, f32) -> f32) ->
     out
 }
 
-fn translate_layer(l: &mut Layer, dx: i32, dy: i32) {
+/// Move a layer's pixels, linked mask and type by whole pixels (vectors move via
+/// `vector_cmds::translate_vectors`).
+fn translate_layer(doc: &Document, l: &mut Layer, dx: i32, dy: i32) {
+    use photocraft_algo::resample::translate_surface;
     if let Some(m) = &mut l.mask
         && m.linked
     {
-        m.surface = pixels::remap_surface(&m.surface, |x, y| (x + dx, y + dy));
+        m.surface = translate_surface(&m.surface, dx, dy);
     }
     match &mut l.content {
-        LayerContent::Raster(s) => *s = pixels::remap_surface(s, |x, y| (x + dx, y + dy)),
+        LayerContent::Raster(s) => *s = translate_surface(s, dx, dy),
+        LayerContent::Text(t) => {
+            t.transform = photocraft_geom::Affine::translate(dx as f64, dy as f64).mul(&t.transform);
+            crate::type_cmds::refresh(doc, t);
+        }
         LayerContent::Group(g) => {
             for c in &mut g.children {
-                translate_layer(c, dx, dy);
+                translate_layer(doc, c, dx, dy);
             }
         }
         _ => {}

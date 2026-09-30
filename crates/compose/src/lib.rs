@@ -21,7 +21,7 @@ use photocraft_color::blend::BlendMode;
 use psblend as blend;
 use photocraft_doc::{Document, Fill, Layer, LayerContent};
 use photocraft_geom::Rect;
-use photocraft_raster::{Rgba8Image, Surface, to_rgba};
+use photocraft_raster::{Rgba8Image, Surface};
 
 /// Straight-alpha RGBA float buffer covering a rectangle.
 #[derive(Clone, Debug, PartialEq)]
@@ -64,11 +64,55 @@ impl Buffer {
     }
 }
 
-/// Composite the whole document over `rect`.
+/// Tile size for parallel rendering (tile results are independent).
+pub const RENDER_TILE: i32 = 256;
+
+/// Composite the whole document over `rect`, in parallel 256² tiles on
+/// native targets (single-threaded on wasm).
 pub fn render(doc: &Document, rect: Rect) -> Buffer {
-    let mut buf = Buffer::transparent(rect);
-    composite_stack(&doc.layers, &mut buf, &Ctx { canvas: doc.bounds(), transfer: adjust::Transfer::for_mode(doc.mode), light: doc.global_light });
-    buf
+    render_tiled(doc, rect, RENDER_TILE)
+}
+
+/// [`render`] with an explicit tile size (tests check tile independence).
+pub fn render_tiled(doc: &Document, rect: Rect, tile: i32) -> Buffer {
+    let cx = Ctx { canvas: doc.bounds(), transfer: adjust::Transfer::for_mode(doc.mode), light: doc.global_light };
+    if rect.width() as i32 <= tile && rect.height() as i32 <= tile {
+        let mut buf = Buffer::transparent(rect);
+        composite_stack(&doc.layers, &mut buf, &cx);
+        return buf;
+    }
+    let mut tiles = Vec::new();
+    let mut y = rect.y0;
+    while y < rect.y1 {
+        let mut x = rect.x0;
+        while x < rect.x1 {
+            tiles.push(Rect::new(x, y, (x + tile).min(rect.x1), (y + tile).min(rect.y1)));
+            x += tile;
+        }
+        y += tile;
+    }
+    let run = |t: &Rect| {
+        let mut b = Buffer::transparent(*t);
+        composite_stack(&doc.layers, &mut b, &cx);
+        b
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let parts: Vec<Buffer> = {
+        use rayon::prelude::*;
+        tiles.par_iter().map(run).collect()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let parts: Vec<Buffer> = tiles.iter().map(run).collect();
+    let mut out = Buffer::transparent(rect);
+    let w = rect.width() as usize;
+    for part in parts {
+        let pw = part.rect.width() as usize;
+        for (row, src) in part.px.chunks_exact(pw).enumerate() {
+            let o = ((part.rect.y0 - rect.y0) as usize + row) * w + (part.rect.x0 - rect.x0) as usize;
+            out.px[o..o + pw].copy_from_slice(src);
+        }
+    }
+    out
 }
 
 /// Composite the full canvas.
@@ -159,8 +203,24 @@ fn layer_bounds(layer: &Layer, canvas: Rect) -> Rect {
     }
 }
 
-fn mask_at(layer: &Layer, x: i32, y: i32) -> f32 {
-    layer.mask.as_ref().map_or(1.0, |m| m.value(x, y))
+/// The layer's effective mask over `rect` (row-major), read once per tile: the pixel mask
+/// times the rasterized vector mask.
+fn mask_vals(layer: &Layer, rect: Rect) -> Option<Vec<f32>> {
+    let vector = layer.vector_mask.as_ref().map(|vm| photocraft_vector::vector_mask_values(vm, rect));
+    let Some(m) = layer.mask.as_ref() else { return vector };
+    let mut v = Vec::new();
+    m.values_into(rect, &mut v);
+    if let Some(vm) = vector {
+        for (a, b) in v.iter_mut().zip(vm) {
+            *a *= b;
+        }
+    }
+    Some(v)
+}
+
+#[inline]
+fn mask_k(m: &Option<Vec<f32>>, i: usize) -> f32 {
+    m.as_ref().map_or(1.0, |v| v[i])
 }
 
 /// Render a layer's own content (no blending into the backdrop yet) into an isolated buffer.
@@ -183,22 +243,17 @@ fn render_content(layer: &Layer, rect: Rect, cx: &Ctx) -> Option<Buffer> {
             None => Buffer::transparent(rect),
         },
     };
-    if layer.mask.is_some() {
-        for y in rect.y0..rect.y1 {
-            for x in rect.x0..rect.x1 {
-                let i = ((y - rect.y0) as usize) * rect.width() as usize + (x - rect.x0) as usize;
-                buf.px[i][3] *= mask_at(layer, x, y);
-            }
+    if let Some(m) = mask_vals(layer, rect) {
+        for (p, k) in buf.px.iter_mut().zip(&m) {
+            p[3] *= k;
         }
     }
     Some(buf)
 }
 
 pub fn surface_to_buffer(s: &Surface, rect: Rect) -> Buffer {
-    let fmt = s.format();
-    let n = fmt.channels();
-    let raw = s.read_region(rect);
-    let px = raw.chunks_exact(n).map(|p| to_rgba(&fmt, p)).collect();
+    let mut px = vec![[0.0f32; 4]; rect.width() as usize * rect.height() as usize];
+    s.read_rgba_into(rect, &mut px);
     Buffer { rect, px }
 }
 
@@ -250,9 +305,29 @@ fn sample_stops(stops: &[(f32, photocraft_color::Color)], t: f32) -> [f32; 4] {
     }
 }
 
+/// `true` when a pixel-backed layer has nothing to contribute in `rect`:
+/// no allocated tiles there, a transparent default, and no effects (which
+/// could reach in from outside). Clipped layers depend on the base, so they
+/// vanish with it.
+fn empty_in(layer: &Layer, rect: Rect) -> bool {
+    if effects::has_effects(layer) {
+        return false;
+    }
+    match &layer.content {
+        LayerContent::Raster(_) | LayerContent::Text(_) | LayerContent::Shape(_) | LayerContent::Smart(_) => match layer.surface() {
+            Some(s) => !s.has_tiles_in(rect) && s.default_pixel().last().is_some_and(|a| *a <= 0.0) && s.format().alpha,
+            None => true,
+        },
+        _ => false,
+    }
+}
+
 /// Composite `layer` (plus its clipping group) onto `backdrop`.
 fn composite_layer(layer: &Layer, clipped: &[Layer], backdrop: &mut Buffer, cx: &Ctx) {
     let rect = backdrop.rect;
+    if empty_in(layer, rect) {
+        return;
+    }
     let opacity = layer.opacity * layer.fill_opacity;
 
     // Pass-through groups composite their children straight into the backdrop.
@@ -262,15 +337,13 @@ fn composite_layer(layer: &Layer, clipped: &[Layer], backdrop: &mut Buffer, cx: 
     {
         let before = backdrop.clone();
         composite_stack(&g.children, backdrop, cx);
-        let needs_mix = opacity < 1.0 || layer.mask.is_some();
+        let needs_mix = opacity < 1.0 || layer.mask.is_some() || layer.vector_mask.is_some();
         if needs_mix {
-            for y in rect.y0..rect.y1 {
-                for x in rect.x0..rect.x1 {
-                    let i = ((y - rect.y0) as usize) * rect.width() as usize + (x - rect.x0) as usize;
-                    let k = opacity * mask_at(layer, x, y);
-                    let (a, b) = (before.px[i], backdrop.px[i]);
-                    backdrop.px[i] = std::array::from_fn(|c| a[c] + (b[c] - a[c]) * k);
-                }
+            let mv = mask_vals(layer, rect);
+            for (i, (p, a)) in backdrop.px.iter_mut().zip(&before.px).enumerate() {
+                let k = opacity * mask_k(&mv, i);
+                let b = *p;
+                *p = std::array::from_fn(|c| a[c] + (b[c] - a[c]) * k);
             }
         }
         // Layers clipped to a pass-through group sit atop the group's
@@ -313,10 +386,11 @@ fn composite_layer(layer: &Layer, clipped: &[Layer], backdrop: &mut Buffer, cx: 
         for c in clipped.iter().filter(|c| c.visible) {
             composite_atop(c, &mut adjusted, cx);
         }
+        let mv = mask_vals(layer, rect);
         for y in rect.y0..rect.y1 {
             for x in rect.x0..rect.x1 {
                 let i = ((y - rect.y0) as usize) * rect.width() as usize + (x - rect.x0) as usize;
-                let k = opacity * mask_at(layer, x, y);
+                let k = opacity * mask_k(&mv, i);
                 if k <= 0.0 {
                     continue;
                 }
@@ -357,10 +431,9 @@ fn composite_atop(layer: &Layer, base: &mut Buffer, cx: &Ctx) {
     if let LayerContent::Adjustment(adj) = &layer.content {
         let mut adjusted = base.clone();
         adjust::apply_with(adj, &mut adjusted, cx.transfer);
+        let mv = mask_vals(layer, rect);
         for (i, p) in base.px.iter_mut().enumerate() {
-            let x = rect.x0 + (i as i32 % rect.width() as i32);
-            let y = rect.y0 + (i as i32 / rect.width() as i32);
-            let k = layer.opacity * layer.fill_opacity * mask_at(layer, x, y);
+            let k = layer.opacity * layer.fill_opacity * mask_k(&mv, i);
             let a = adjusted.px[i];
             let bl = blend::blend_rgb(layer.blend, [p[0], p[1], p[2]], [a[0], a[1], a[2]]);
             for c in 0..3 {

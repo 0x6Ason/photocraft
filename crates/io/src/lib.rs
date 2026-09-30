@@ -24,6 +24,7 @@ mod flat;
 mod pixels;
 mod psd_export;
 mod psd_import;
+pub mod vector_map;
 
 use photocraft_codecs::{CodecError, EncodeOptions};
 use photocraft_doc::Document;
@@ -49,6 +50,9 @@ pub enum IoError {
     /// The requested conversion is not possible.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// Native `.pcraft` bundle failure.
+    #[error("pcraft: {0}")]
+    Pcraft(#[from] photocraft_format::FormatError),
 }
 
 /// Result of [`import`].
@@ -86,6 +90,9 @@ pub fn is_psd(bytes: &[u8]) -> bool {
 /// Imports a file. PSD/PSB are detected by magic; everything else is decoded
 /// with `photocraft-codecs`.
 pub fn import(name: &str, bytes: &[u8]) -> Result<ImportResult, IoError> {
+    if photocraft_format::is_pcraft(bytes) {
+        return Ok(ImportResult { document: photocraft_format::load_from_bytes(bytes)?, warnings: Vec::new() });
+    }
     if is_psd(bytes) {
         let file = PsdFile::from_bytes(bytes)?;
         let (mut document, warnings) = psd_to_document(&file);
@@ -103,6 +110,13 @@ fn extension(name_or_ext: &str) -> String {
 /// bare extension).
 pub fn export(doc: &Document, name_or_ext: &str, opts: &ExportOptions) -> Result<ExportResult, IoError> {
     let ext = extension(name_or_ext);
+    if ext == photocraft_format::EXTENSION {
+        let previews = photocraft_format::SaveOptions {
+            thumbnail: Some(photocraft_compose::thumbnail(doc, 256)),
+            composite: Some(photocraft_compose::thumbnail(doc, 1024)),
+        };
+        return Ok(ExportResult { bytes: photocraft_format::save_to_bytes(doc, &previews)?, warnings: Vec::new() });
+    }
     if ext == "psd" || ext == "psb" {
         let o = PsdExportOptions { force_psb: opts.force_psb || ext == "psb" };
         let (file, warnings) = document_to_psd_with(doc, &o);

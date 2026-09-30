@@ -10,6 +10,15 @@ pub mod commands;
 pub mod inspect;
 pub mod layer_style;
 pub mod filters;
+pub mod type_cmds;
+pub mod transform_cmds;
+pub mod vector_cmds;
+pub mod smartselect_cmds;
+pub mod edit_cmds;
+pub mod retouch_cmds;
+pub mod image_cmds;
+pub mod paint_cmds;
+pub mod selection_cmds;
 mod pixels;
 
 use std::sync::Arc;
@@ -20,6 +29,7 @@ use serde_json::Value;
 
 pub use commands::{CommandSpec, command_specs};
 pub use photocraft_doc as doc;
+pub use photocraft_paint::BrushSettings;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -51,12 +61,14 @@ pub struct DocState {
     pub saved_revision: u64,
     /// Area changed by the latest revision (None = assume everything changed).
     pub last_damage: Option<photocraft_geom::Rect>,
+    /// Coalescing key of the latest history step (see [`Session::execute`]'s `coalesce` param).
+    pub coalesce: Option<String>,
 }
 
 impl DocState {
     pub fn new(doc: Document, path: Option<String>) -> Self {
         let active_layer = doc.top_layer();
-        Self { doc: Arc::new(doc), history: History::default(), active_layer, path, revision: 1, saved_revision: 1, last_damage: None }
+        Self { doc: Arc::new(doc), history: History::default(), active_layer, path, revision: 1, saved_revision: 1, last_damage: None, coalesce: None }
     }
     pub fn is_dirty(&self) -> bool {
         self.revision != self.saved_revision
@@ -84,6 +96,10 @@ pub struct Session {
     pub tools: ToolState,
     /// Log of executed commands (for action recording and debugging).
     pub journal: Vec<(String, Value)>,
+    /// Coalescing key of the command being executed.
+    coalesce_request: Option<String>,
+    /// Pixels copied with Edit › Copy / Cut (shared by all documents, like Photoshop).
+    pub clipboard: Option<edit_cmds::Clip>,
 }
 
 impl Session {
@@ -130,12 +146,19 @@ impl Session {
     }
 
     /// Run a command by id with JSON params. Returns a JSON result.
+    ///
+    /// Any command accepts an optional `"coalesce": "<key>"` param: consecutive edits with the same
+    /// key (and no other edit, undo or redo in between) share one history step, like Photoshop's
+    /// single "Edit Type Layer" step for a whole typing session or one step per slider drag.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if let Err(why) = (spec.enabled)(self) {
             return Err(EngineError::Disabled(id.to_string(), why));
         }
-        let r = (spec.run)(self, &commands::inject_kind(id, params.clone()))?;
+        self.coalesce_request = params.get("coalesce").and_then(Value::as_str).map(str::to_string);
+        let r = (spec.run)(self, &commands::inject_kind(id, params.clone()));
+        self.coalesce_request = None;
+        let r = r?;
         if spec.journal {
             self.journal.push((id.to_string(), params));
         }
@@ -156,7 +179,12 @@ impl Session {
         let r = f(&mut doc, &mut active)?;
         st.doc = Arc::new(doc);
         st.active_layer = active;
-        st.history.record(label, before);
+        let key = self.coalesce_request.clone();
+        let st = self.active_mut().ok_or(EngineError::NoDocument)?;
+        if key.is_none() || st.coalesce != key || !st.history.can_undo() {
+            st.history.record(label, before);
+        }
+        st.coalesce = key;
         st.revision += 1;
         st.last_damage = None;
         Ok(r)
@@ -169,13 +197,19 @@ impl Session {
             return Err(EngineError::NoLayer(id));
         }
         st.active_layer = Some(id);
+        // Selecting a layer is not an edit: keep a clean document clean.
+        let clean = st.saved_revision == st.revision;
         st.revision += 1;
+        if clean {
+            st.saved_revision = st.revision;
+        }
         st.last_damage = Some(photocraft_geom::Rect::EMPTY);
         Ok(())
     }
 
     pub fn undo(&mut self) -> bool {
         let Some(st) = self.active_mut() else { return false };
+        st.coalesce = None;
         match st.history.undo(st.doc.clone()) {
             Some(d) => {
                 st.doc = d;
@@ -190,6 +224,7 @@ impl Session {
 
     pub fn redo(&mut self) -> bool {
         let Some(st) = self.active_mut() else { return false };
+        st.coalesce = None;
         match st.history.redo(st.doc.clone()) {
             Some(d) => {
                 st.doc = d;

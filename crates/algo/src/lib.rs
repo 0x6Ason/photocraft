@@ -22,6 +22,15 @@ mod distort;
 mod image;
 mod noise;
 mod other;
+pub mod paint;
+pub mod resample;
+pub mod selection;
+pub mod segment;
+pub mod matting;
+pub mod transform;
+pub mod poisson;
+pub mod inpaint;
+pub mod retouch;
 mod sharpen;
 mod stylize;
 

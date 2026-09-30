@@ -12,15 +12,17 @@ pub fn parse(s: &str) -> Option<KeyboardShortcut> {
     let mut key = None;
     for part in s.split('+') {
         match part {
-            "Cmd" => mods = mods | Modifiers::COMMAND,
-            "Shift" => mods = mods | Modifiers::SHIFT,
-            "Alt" => mods = mods | Modifiers::ALT,
-            "Ctrl" => mods = mods | Modifiers::CTRL,
+            "Cmd" => mods |= Modifiers::COMMAND,
+            "Shift" => mods |= Modifiers::SHIFT,
+            "Alt" => mods |= Modifiers::ALT,
+            "Ctrl" => mods |= Modifiers::CTRL,
             "" => key = Some(Key::Plus),
             k => key = Key::from_name(k).or(match k {
                 "=" => Some(Key::Equals),
                 "-" => Some(Key::Minus),
                 "[" => Some(Key::OpenBracket),
+                ";" => Some(Key::Semicolon),
+                "'" => Some(Key::Quote),
                 "]" => Some(Key::CloseBracket),
                 _ => None,
             }),
@@ -48,6 +50,30 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
     if ctx.egui_wants_keyboard_input() || !app.ui.dialogs.is_empty() {
         return;
     }
+    // Free Transform: ↩ commits, Esc cancels.
+    if app.ui.transform.is_some() {
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+            crate::transform_tool::commit(app);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            crate::transform_tool::cancel(app);
+            return;
+        }
+    }
+    // Pen path in progress: ↩ finishes (open path), Esc cancels.
+    if app.ui.pen.is_some() {
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+            crate::vector_ui::pen_commit(app, false);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            app.ui.pen = None;
+            return;
+        }
+    }
+    // Inline type editing eats text and navigation keys; ⌘-shortcuts still reach the menus.
+    let editing = crate::type_tool::handle_keys(app, ctx);
     // Registry + UI command shortcuts, most-modifiers first so ⇧⌘Z wins over ⌘Z.
     let mut all: Vec<(String, KeyboardShortcut)> = crate::menus::UI_COMMANDS
         .iter()
@@ -57,6 +83,10 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
         .collect();
     all.sort_by_key(|(_, sc)| std::cmp::Reverse(sc.modifiers.shift as u8 + sc.modifiers.alt as u8 + sc.modifiers.command as u8));
     for (id, sc) in all {
+        // While typing, clipboard/select-all shortcuts belong to the text, not the pixels.
+        if editing && matches!(id.as_str(), "edit.copy" | "edit.cut" | "edit.paste" | "edit.copyMerged" | "select.all" | "edit.pasteSpecial.pasteInPlace") {
+            continue;
+        }
         if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
             if crate::menus::is_enabled(app, &id) {
                 let r = if id.starts_with("image.adjustments.") && !crate::panels::adjustment_sliders(id.rsplit('.').next().unwrap_or("")).is_empty() {
@@ -73,15 +103,36 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
             return;
         }
     }
+    if editing {
+        return;
+    }
     // Single-key tools and colours (no modifiers).
     let pressed = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
+    // Enter / Escape commit or cancel in-progress tool state (polygonal lasso, crop).
+    if !app.ui.polygon.is_empty() || app.ui.crop_rect.is_some() {
+        if pressed(Key::Enter) {
+            if !app.ui.polygon.is_empty() {
+                crate::canvas::commit_polygon(app, Modifiers::NONE);
+            } else {
+                crate::canvas::commit_crop(app);
+            }
+            return;
+        }
+        if pressed(Key::Escape) {
+            app.ui.polygon.clear();
+            app.ui.crop_rect = None;
+            return;
+        }
+    }
+    // Tool keys; pressing the key of the current group cycles within it (Photoshop's Shift+key cycle).
     for t in Tool::ALL {
-        let k = Key::from_name(&t.key().to_string());
-        if let Some(k) = k
-            && pressed(k)
-        {
-            // M toggles between marquee shapes like Photoshop's Shift+M cycling.
-            app.ui.tool = if t.key() == 'M' && app.ui.tool == Tool::RectMarquee { Tool::EllipseMarquee } else if t.key() == 'M' { Tool::RectMarquee } else { t };
+        let Some(k) = Key::from_name(&t.key().to_string()) else { continue };
+        if pressed(k) {
+            let group: Vec<Tool> = Tool::ALL.iter().copied().filter(|x| x.key() == t.key()).collect();
+            app.ui.tool = match group.iter().position(|x| *x == app.ui.tool) {
+                Some(i) => group[(i + 1) % group.len()],
+                None => group[0],
+            };
             return;
         }
     }

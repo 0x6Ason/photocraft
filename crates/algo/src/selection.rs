@@ -1,0 +1,728 @@
+//! Selection algorithms on coverage masks (`w × h` row-major `f32` in
+//! `0..=1` over an area): magic wand / flood regions, colour range,
+//! modify (expand, contract, border, smooth, feather), anti-aliased lasso,
+//! and combining with an existing selection.
+
+use photocraft_color::PixelFormat;
+use photocraft_geom::Rect;
+use photocraft_raster::Surface;
+use serde::{Deserialize, Serialize};
+
+/// How a new selection combines with the current one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum SelectionMode {
+    #[default]
+    Replace,
+    Add,
+    Subtract,
+    Intersect,
+}
+
+impl SelectionMode {
+    /// Parses `replace|add|subtract|intersect` (unknown → replace).
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "add" => SelectionMode::Add,
+            "subtract" => SelectionMode::Subtract,
+            "intersect" => SelectionMode::Intersect,
+            _ => SelectionMode::Replace,
+        }
+    }
+}
+
+/// Reads a selection surface over `area` (no selection → all zero).
+pub fn mask_from_surface(s: Option<&Surface>, area: Rect) -> Vec<f32> {
+    let n = area.width() as usize * area.height() as usize;
+    match s {
+        None => vec![0.0; n],
+        Some(s) => {
+            let mut v = Vec::new();
+            s.read_region_into(area, &mut v);
+            let ch = s.channels();
+            if ch > 1 { v.chunks_exact(ch).map(|p| p[0]).collect() } else { v }
+        }
+    }
+}
+
+/// Builds a GRAY8 selection surface from a mask over `area`.
+pub fn mask_to_surface(m: &[f32], area: Rect) -> Surface {
+    let mut s = Surface::new(PixelFormat::GRAY8);
+    if !area.is_empty() {
+        s.write_region(area, m);
+    }
+    s.prune();
+    s
+}
+
+/// Combines `new` with `old` by `mode`. Returns `None` when nothing is selected.
+pub fn combine(old: Option<&Surface>, new: &[f32], area: Rect, mode: SelectionMode) -> Option<Surface> {
+    let prev = mask_from_surface(old, area);
+    // Quantize to the 8-bit grid selections are stored on, so combining a
+    // mask with itself is exact.
+    let q: Vec<f32> = new.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() / 255.0).collect();
+    let new = &q[..];
+    let out: Vec<f32> = match mode {
+        SelectionMode::Replace => new.to_vec(),
+        SelectionMode::Add => prev.iter().zip(new).map(|(a, b)| a.max(*b)).collect(),
+        SelectionMode::Subtract => prev.iter().zip(new).map(|(a, b)| (a - b).max(0.0)).collect(),
+        SelectionMode::Intersect => prev.iter().zip(new).map(|(a, b)| a.min(*b)).collect(),
+    };
+    // Below half an 8-bit step is nothing (selections are stored as 8-bit).
+    let out: Vec<f32> = out.into_iter().map(|v| if v < 0.5 / 255.0 { 0.0 } else { v }).collect();
+    if out.iter().all(|v| *v <= 0.0) {
+        return None;
+    }
+    Some(mask_to_surface(&out, area))
+}
+
+fn close(a: [f32; 4], b: [f32; 4], tol: f32) -> bool {
+    (0..4).all(|c| (a[c] - b[c]).abs() * 255.0 <= tol + 1e-3)
+}
+
+/// Pixels similar to the seed pixel (per-channel difference ≤ `tolerance`
+/// levels, alpha included). `contiguous` limits to the 4-connected region
+/// around the seed. `px` covers `area`.
+pub fn magic_wand(px: &[[f32; 4]], area: Rect, seed: (i32, i32), tolerance: f32, contiguous: bool, anti_alias: bool) -> Vec<f32> {
+    let (w, h) = (area.width() as usize, area.height() as usize);
+    let mut m = vec![0.0f32; w * h];
+    if !area.contains(seed.0, seed.1) {
+        return m;
+    }
+    let si = (seed.1 - area.y0) as usize * w + (seed.0 - area.x0) as usize;
+    let target = px[si];
+    if contiguous {
+        let mut stack = vec![si];
+        m[si] = 1.0;
+        while let Some(i) = stack.pop() {
+            let (x, y) = (i % w, i / w);
+            let mut visit = |j: usize| {
+                if m[j] == 0.0 && close(px[j], target, tolerance) {
+                    m[j] = 1.0;
+                    stack.push(j);
+                }
+            };
+            if x > 0 {
+                visit(i - 1);
+            }
+            if x + 1 < w {
+                visit(i + 1);
+            }
+            if y > 0 {
+                visit(i - w);
+            }
+            if y + 1 < h {
+                visit(i + w);
+            }
+        }
+    } else {
+        for (v, p) in m.iter_mut().zip(px) {
+            if close(*p, target, tolerance) {
+                *v = 1.0;
+            }
+        }
+    }
+    if anti_alias {
+        antialias(&mut m, w, h);
+    }
+    m
+}
+
+/// Straight RGBA8 copy of `area` of a surface, read in parallel bands on native.
+pub fn rgba8_image(s: &Surface, area: Rect) -> Vec<[u8; 4]> {
+    let (w, h) = (area.width() as usize, area.height() as usize);
+    let mut img = vec![[0u8; 4]; w * h];
+    if w == 0 || h == 0 {
+        return img;
+    }
+    let band = 256usize;
+    let read = |bi: usize, chunk: &mut [[u8; 4]]| {
+        let y0 = area.y0 + (bi * band) as i32;
+        s.read_rgba8_into(Rect::new(area.x0, y0, area.x1, y0 + (chunk.len() / w) as i32), chunk);
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        img.par_chunks_mut(w * band).enumerate().for_each(|(bi, c)| read(bi, c));
+    }
+    #[cfg(target_arch = "wasm32")]
+    img.chunks_mut(w * band).enumerate().for_each(|(bi, c)| read(bi, c));
+    img
+}
+
+/// A selected region: 8-bit coverage over `bbox` (row-major), the bounding box of the pixels
+/// touched (including the anti-aliased fringe).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Region {
+    pub bbox: Rect,
+    pub mask: Vec<u8>,
+}
+
+impl Region {
+    /// Coverage (0–1) at document pixel `(x, y)`; zero outside the box.
+    pub fn at(&self, x: i32, y: i32) -> f32 {
+        if !self.bbox.contains(x, y) {
+            return 0.0;
+        }
+        self.mask[(y - self.bbox.y0) as usize * self.bbox.width() as usize + (x - self.bbox.x0) as usize] as f32 / 255.0
+    }
+}
+
+/// Magic wand on 8-bit pixels: a scanline flood fill (or a global match) that only allocates a
+/// byte mark per pixel, then anti-aliases just the edges inside the touched bounding box.
+/// Matches [`magic_wand`] for 8-bit sources. `None` if the seed is outside `area`.
+pub fn wand_region(img: &[[u8; 4]], area: Rect, seed: (i32, i32), tolerance: f32, contiguous: bool, anti_alias: bool) -> Option<Region> {
+    if !area.contains(seed.0, seed.1) {
+        return None;
+    }
+    let (w, h) = (area.width() as usize, area.height() as usize);
+    let target = img[(seed.1 - area.y0) as usize * w + (seed.0 - area.x0) as usize];
+    let tol = (tolerance + 1e-3).floor().max(0.0) as i32;
+    let similar = |p: [u8; 4]| (0..4).all(|c| (p[c] as i32 - target[c] as i32).abs() <= tol);
+    let mut marks = vec![0u8; w * h];
+    let (mut bx0, mut by0, mut bx1, mut by1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+    if contiguous {
+        // Span fill: fill a run, then scan the rows above and below it for new seeds.
+        let mut stack = vec![((seed.0 - area.x0) as usize, (seed.1 - area.y0) as usize)];
+        while let Some((x, y)) = stack.pop() {
+            let row = y * w;
+            if marks[row + x] != 0 {
+                continue;
+            }
+            let (mut l, mut r) = (x, x);
+            while l > 0 && marks[row + l - 1] == 0 && similar(img[row + l - 1]) {
+                l -= 1;
+            }
+            while r + 1 < w && marks[row + r + 1] == 0 && similar(img[row + r + 1]) {
+                r += 1;
+            }
+            marks[row + l..=row + r].fill(255);
+            (bx0, bx1, by0, by1) = (bx0.min(l), bx1.max(r), by0.min(y), by1.max(y));
+            for ny in [y.wrapping_sub(1), y + 1] {
+                if ny >= h {
+                    continue;
+                }
+                let nrow = ny * w;
+                let mut in_run = false;
+                for nx in l..=r {
+                    let ok = marks[nrow + nx] == 0 && similar(img[nrow + nx]);
+                    if ok && !in_run {
+                        stack.push((nx, ny));
+                    }
+                    in_run = ok;
+                }
+            }
+        }
+    } else {
+        let scan = |y: usize, row: &mut [u8]| -> Option<(usize, usize)> {
+            let mut span: Option<(usize, usize)> = None;
+            for (x, m) in row.iter_mut().enumerate() {
+                if similar(img[y * w + x]) {
+                    *m = 255;
+                    span = Some(span.map_or((x, x), |(a, _)| (a, x)));
+                }
+            }
+            span
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let spans: Vec<Option<(usize, usize)>> = {
+            use rayon::prelude::*;
+            marks.par_chunks_mut(w).enumerate().map(|(y, row)| scan(y, row)).collect()
+        };
+        #[cfg(target_arch = "wasm32")]
+        let spans: Vec<Option<(usize, usize)>> = marks.chunks_mut(w).enumerate().map(|(y, row)| scan(y, row)).collect();
+        for (y, sp) in spans.iter().enumerate() {
+            if let Some((a, b)) = sp {
+                (bx0, bx1, by0, by1) = (bx0.min(*a), bx1.max(*b), by0.min(y), by1.max(y));
+            }
+        }
+    }
+    if bx0 == usize::MAX {
+        return None;
+    }
+    // One pixel of fringe for anti-aliasing, clamped to the area.
+    let pad = anti_alias as usize;
+    let (x0, y0) = (bx0.saturating_sub(pad), by0.saturating_sub(pad));
+    let (x1, y1) = ((bx1 + 1 + pad).min(w), (by1 + 1 + pad).min(h));
+    let bw = x1 - x0;
+    let at = |x: usize, y: usize| marks[y * w + x];
+    let mut mask = vec![0u8; bw * (y1 - y0)];
+    let fill_row = |yy: usize, out: &mut [u8]| {
+        let y = y0 + yy;
+        for (xx, o) in out.iter_mut().enumerate() {
+            let x = x0 + xx;
+            let v = at(x, y);
+            *o = v;
+            if !anti_alias {
+                continue;
+            }
+            // Same rule as `antialias`: edge pixels blend with their 3×3 neighbourhood; neighbours
+            // outside the area count as the pixel itself.
+            let mut sum = 0u32;
+            let mut edge = false;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    let n = if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 { v } else { at(nx as usize, ny as usize) };
+                    edge |= n != v;
+                    sum += n as u32;
+                }
+            }
+            if edge {
+                let avg = sum as f32 / (9.0 * 255.0);
+                let f = if v > 127 { 0.5 + 0.5 * avg } else { 0.5 * avg };
+                *o = (f * 255.0).round() as u8;
+            }
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        mask.par_chunks_mut(bw).enumerate().for_each(|(yy, row)| fill_row(yy, row));
+    }
+    #[cfg(target_arch = "wasm32")]
+    mask.chunks_mut(bw).enumerate().for_each(|(yy, row)| fill_row(yy, row));
+    let bbox = Rect::new(area.x0 + x0 as i32, area.y0 + y0 as i32, area.x0 + x1 as i32, area.y0 + y1 as i32);
+    Some(Region { bbox, mask })
+}
+
+/// Combines a [`Region`] with the current selection, touching only the region's box (outside it
+/// the new mask is zero). Returns `None` when nothing remains selected.
+pub fn combine_region(old: Option<&Surface>, new: Option<&Region>, mode: SelectionMode) -> Option<Surface> {
+    let empty = Region { bbox: Rect::EMPTY, mask: Vec::new() };
+    let new = new.unwrap_or(&empty);
+    let b = new.bbox;
+    let prev_u8 = |s: &Surface| -> Vec<u8> {
+        let mut v = Vec::new();
+        s.read_region_into(b, &mut v);
+        let ch = s.channels();
+        v.chunks_exact(ch).map(|p| (p[0].clamp(0.0, 1.0) * 255.0).round() as u8).collect()
+    };
+    let from_bytes = |bytes: &[u8]| -> Option<Surface> {
+        if b.is_empty() || bytes.iter().all(|v| *v == 0) {
+            return None;
+        }
+        let mut s = Surface::from_interleaved(PixelFormat::GRAY8, b, bytes);
+        s.prune();
+        Some(s)
+    };
+    let nonempty = |s: Surface| -> Option<Surface> { (!s.content_bounds().is_empty()).then_some(s) };
+    match (mode, old) {
+        (SelectionMode::Replace, _) | (SelectionMode::Add, None) => from_bytes(&new.mask),
+        (SelectionMode::Subtract | SelectionMode::Intersect, None) => None,
+        (SelectionMode::Intersect, Some(o)) => {
+            let p = prev_u8(o);
+            from_bytes(&p.iter().zip(&new.mask).map(|(a, b)| *a.min(b)).collect::<Vec<_>>())
+        }
+        (SelectionMode::Add | SelectionMode::Subtract, Some(o)) => {
+            if b.is_empty() {
+                return nonempty(o.clone());
+            }
+            let p = prev_u8(o);
+            let out: Vec<f32> = p
+                .iter()
+                .zip(&new.mask)
+                .map(|(a, n)| if mode == SelectionMode::Add { *a.max(n) } else { a.saturating_sub(*n) } as f32 / 255.0)
+                .collect();
+            let mut s = o.clone();
+            s.write_region(b, &out);
+            s.prune();
+            nonempty(s)
+        }
+    }
+}
+
+/// Softens hard mask edges: edge pixels become the 3×3 average.
+fn antialias(m: &mut [f32], w: usize, h: usize) {
+    let src = m.to_vec();
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let mut sum = 0.0;
+            let mut cnt = 0.0;
+            let mut edge = false;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let (xx, yy) = (x as i32 + dx, y as i32 + dy);
+                    let v = if xx < 0 || yy < 0 || xx >= w as i32 || yy >= h as i32 { src[i] } else { src[yy as usize * w + xx as usize] };
+                    edge |= v != src[i];
+                    sum += v;
+                    cnt += 1.0;
+                }
+            }
+            if edge {
+                // Keep selected pixels mostly selected, add a soft fringe.
+                m[i] = if src[i] > 0.5 { 0.5 + 0.5 * sum / cnt } else { 0.5 * sum / cnt };
+            }
+        }
+    }
+}
+
+/// Colour Range: coverage falls off linearly with the per-channel colour
+/// distance; `fuzziness` in levels (0–200).
+pub fn color_range(px: &[[f32; 4]], color: [f32; 3], fuzziness: f32) -> Vec<f32> {
+    let f = fuzziness.max(0.0) + 1.0;
+    px.iter()
+        .map(|p| {
+            if p[3] <= 0.0 {
+                return 0.0;
+            }
+            let d = (0..3).map(|c| (p[c] - color[c]).abs() * 255.0).fold(0.0f32, f32::max);
+            (1.0 - d / f).clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
+/// 1D squared distance transform (Felzenszwalb & Huttenlocher).
+fn dt1(f: &[f32], out: &mut [f32], v: &mut [usize], z: &mut [f32]) {
+    let n = f.len();
+    let mut k = 0usize;
+    v[0] = 0;
+    z[0] = f32::NEG_INFINITY;
+    z[1] = f32::INFINITY;
+    for q in 1..n {
+        loop {
+            let p = v[k];
+            let s = ((f[q] + (q * q) as f32) - (f[p] + (p * p) as f32)) / (2.0 * (q as f32 - p as f32));
+            if s <= z[k] && k > 0 {
+                k -= 1;
+                continue;
+            }
+            if s <= z[k] {
+                v[0] = q;
+                z[0] = f32::NEG_INFINITY;
+                z[1] = f32::INFINITY;
+                break;
+            }
+            k += 1;
+            v[k] = q;
+            z[k] = s;
+            z[k + 1] = f32::INFINITY;
+            break;
+        }
+    }
+    k = 0;
+    for (q, o) in out.iter_mut().enumerate() {
+        while z[k + 1] < q as f32 {
+            k += 1;
+        }
+        let d = q as f32 - v[k] as f32;
+        *o = d * d + f[v[k]];
+    }
+}
+
+/// Euclidean distance to the nearest `true` pixel.
+pub fn edt(inside: &[bool], w: usize, h: usize) -> Vec<f32> {
+    let mut g: Vec<f32> = inside.iter().map(|&b| if b { 0.0 } else { 1e20 }).collect();
+    let n = w.max(h).max(1);
+    let (mut f, mut o, mut v, mut z) = (vec![0.0; n], vec![0.0; n], vec![0usize; n], vec![0.0f32; n + 1]);
+    for x in 0..w {
+        for y in 0..h {
+            f[y] = g[y * w + x];
+        }
+        dt1(&f[..h], &mut o[..h], &mut v, &mut z);
+        for y in 0..h {
+            g[y * w + x] = o[y];
+        }
+    }
+    for y in 0..h {
+        f[..w].copy_from_slice(&g[y * w..(y + 1) * w]);
+        dt1(&f[..w], &mut o[..w], &mut v, &mut z);
+        for x in 0..w {
+            g[y * w + x] = o[x].sqrt();
+        }
+    }
+    g
+}
+
+/// Grows the selection by `r` pixels.
+pub fn expand(m: &[f32], w: usize, h: usize, r: f32) -> Vec<f32> {
+    let inside: Vec<bool> = m.iter().map(|v| *v >= 0.5).collect();
+    let d = edt(&inside, w, h);
+    // A pixel whose centre is `d` away from the nearest selected centre is
+    // covered when d ≤ r (fractional radii give partial coverage).
+    m.iter().zip(d).map(|(v, d)| v.max((r + 1.0 - d).clamp(0.0, 1.0))).collect()
+}
+
+/// Shrinks the selection by `r` pixels.
+pub fn contract(m: &[f32], w: usize, h: usize, r: f32) -> Vec<f32> {
+    let inv: Vec<f32> = m.iter().map(|v| 1.0 - v).collect();
+    expand(&inv, w, h, r).into_iter().map(|v| 1.0 - v).collect()
+}
+
+/// A band of width `r` straddling the selection edge.
+pub fn border(m: &[f32], w: usize, h: usize, r: f32) -> Vec<f32> {
+    let outer = expand(m, w, h, r / 2.0);
+    let inner = contract(m, w, h, r / 2.0);
+    outer.iter().zip(inner).map(|(o, i)| (o - i).max(0.0)).collect()
+}
+
+fn box_blur(m: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    if r == 0 {
+        return m.to_vec();
+    }
+    let mut tmp = vec![0.0f32; m.len()];
+    let win = (2 * r + 1) as f32;
+    for y in 0..h {
+        for x in 0..w {
+            let mut s = 0.0;
+            for k in x as i64 - r as i64..=x as i64 + r as i64 {
+                s += m[y * w + k.clamp(0, w as i64 - 1) as usize];
+            }
+            tmp[y * w + x] = s / win;
+        }
+    }
+    let mut out = vec![0.0f32; m.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let mut s = 0.0;
+            for k in y as i64 - r as i64..=y as i64 + r as i64 {
+                s += tmp[k.clamp(0, h as i64 - 1) as usize * w + x];
+            }
+            out[y * w + x] = s / win;
+        }
+    }
+    out
+}
+
+/// Smooth: removes specks and rounds corners (box average, then re-threshold).
+pub fn smooth(m: &[f32], w: usize, h: usize, r: f32) -> Vec<f32> {
+    box_blur(m, w, h, r.max(0.0).round() as usize).into_iter().map(|v| ((v - 0.5) * 4.0 + 0.5).clamp(0.0, 1.0)).collect()
+}
+
+/// Feather: Gaussian blur of the mask with sigma = radius / 2.
+pub fn feather(m: &[f32], w: usize, h: usize, radius: f32) -> Vec<f32> {
+    let sigma = radius.max(0.0) / 2.0;
+    if sigma < 0.1 {
+        return m.to_vec();
+    }
+    let r = (sigma * 3.0).ceil() as i64;
+    let k: Vec<f32> = (-r..=r).map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp()).collect();
+    let s: f32 = k.iter().sum();
+    let k: Vec<f32> = k.iter().map(|v| v / s).collect();
+    let mut tmp = vec![0.0f32; m.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let mut a = 0.0;
+            for (i, kv) in k.iter().enumerate() {
+                let xx = x as i64 + i as i64 - r;
+                if xx >= 0 && xx < w as i64 {
+                    a += m[y * w + xx as usize] * kv;
+                }
+            }
+            tmp[y * w + x] = a;
+        }
+    }
+    let mut out = vec![0.0f32; m.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let mut a = 0.0;
+            for (i, kv) in k.iter().enumerate() {
+                let yy = y as i64 + i as i64 - r;
+                if yy >= 0 && yy < h as i64 {
+                    a += tmp[yy as usize * w + x] * kv;
+                }
+            }
+            out[y * w + x] = a;
+        }
+    }
+    out
+}
+
+/// Anti-aliased polygon (even-odd) coverage over `area`: exact horizontal
+/// coverage, 4 sub-rows per pixel row (or 1 when not anti-aliased).
+pub fn polygon(points: &[(f32, f32)], area: Rect, anti_alias: bool) -> Vec<f32> {
+    let (w, h) = (area.width() as usize, area.height() as usize);
+    let mut m = vec![0.0f32; w * h];
+    if points.len() < 3 {
+        return m;
+    }
+    let sub = if anti_alias { 4 } else { 1 };
+    let mut xs: Vec<f32> = Vec::new();
+    for py in 0..h {
+        for s in 0..sub {
+            let y = area.y0 as f32 + py as f32 + (s as f32 + 0.5) / sub as f32;
+            xs.clear();
+            for i in 0..points.len() {
+                let (a, b) = (points[i], points[(i + 1) % points.len()]);
+                if (a.1 <= y && b.1 > y) || (b.1 <= y && a.1 > y) {
+                    xs.push(a.0 + (y - a.1) / (b.1 - a.1) * (b.0 - a.0));
+                }
+            }
+            xs.sort_by(|a, b| a.total_cmp(b));
+            for span in xs.chunks_exact(2) {
+                let (x0, x1) = ((span[0] - area.x0 as f32).max(0.0), (span[1] - area.x0 as f32).min(w as f32));
+                if x1 <= x0 {
+                    continue;
+                }
+                let (c0, c1) = (x0.floor() as usize, (x1.ceil() as usize).min(w));
+                for cx in c0..c1 {
+                    let cov = if anti_alias { ((cx + 1) as f32).min(x1) - (cx as f32).max(x0) } else {
+                        let c = cx as f32 + 0.5;
+                        if c >= x0 && c < x1 { 1.0 } else { 0.0 }
+                    };
+                    m[py * w + cx] += cov.max(0.0) / sub as f32;
+                }
+            }
+        }
+    }
+    for v in &mut m {
+        *v = v.min(1.0);
+    }
+    m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn img(w: usize, h: usize, f: impl Fn(usize, usize) -> [f32; 4]) -> Vec<[f32; 4]> {
+        (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| f(x, y)).collect()
+    }
+
+    #[test]
+    fn wand_contiguous_vs_global() {
+        // Two separate red squares on white.
+        let px = img(20, 10, |x, _| if (2..6).contains(&x) || (12..16).contains(&x) { [1.0, 0.0, 0.0, 1.0] } else { [1.0; 4] });
+        let a = Rect::new(0, 0, 20, 10);
+        let c = magic_wand(&px, a, (3, 3), 10.0, true, false);
+        assert_eq!(c.iter().filter(|v| **v > 0.0).count(), 40);
+        let g = magic_wand(&px, a, (3, 3), 10.0, false, false);
+        assert_eq!(g.iter().filter(|v| **v > 0.0).count(), 80);
+        let aa = magic_wand(&px, a, (3, 3), 10.0, true, true);
+        assert!(aa[3 * 20 + 6] > 0.0 && aa[3 * 20 + 6] < 1.0);
+        assert!(magic_wand(&px, a, (50, 3), 10.0, true, false).iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn wand_tolerance() {
+        let px = img(10, 1, |x, _| [x as f32 * 10.0 / 255.0, 0.0, 0.0, 1.0]);
+        let m = magic_wand(&px, Rect::new(0, 0, 10, 1), (0, 0), 25.0, true, false);
+        assert_eq!(m.iter().filter(|v| **v > 0.0).count(), 3);
+    }
+
+    #[test]
+    fn color_range_falloff() {
+        let px = vec![[1.0, 0.0, 0.0, 1.0], [0.9, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 0.0, 0.0]];
+        let m = color_range(&px, [1.0, 0.0, 0.0], 40.0);
+        assert_eq!(m[0], 1.0);
+        assert!(m[1] > 0.3 && m[1] < 1.0);
+        assert_eq!(m[2], 0.0);
+        assert_eq!(m[3], 0.0);
+    }
+
+    fn square(w: usize, h: usize) -> Vec<f32> {
+        (0..w * h).map(|i| if (5..15).contains(&(i % w)) && (5..15).contains(&(i / w)) { 1.0 } else { 0.0 }).collect()
+    }
+
+    #[test]
+    fn expand_contract_border() {
+        let m = square(20, 20);
+        let e = expand(&m, 20, 20, 2.0);
+        assert_eq!(e[10 * 20 + 3], 1.0);
+        assert_eq!(e[10 * 20 + 2], 0.0);
+        let c = contract(&m, 20, 20, 2.0);
+        assert_eq!(c[10 * 20 + 6], 0.0);
+        assert_eq!(c[10 * 20 + 7], 1.0);
+        let b = border(&m, 20, 20, 4.0);
+        assert_eq!(b[10 * 20 + 10], 0.0);
+        assert!(b[10 * 20 + 5] > 0.5 && b[10 * 20 + 4] > 0.5);
+    }
+
+    #[test]
+    fn smooth_removes_specks_and_feather_softens() {
+        let mut m = square(20, 20);
+        m[2 * 20 + 2] = 1.0;
+        let s = smooth(&m, 20, 20, 1.0);
+        assert_eq!(s[2 * 20 + 2], 0.0);
+        assert_eq!(s[10 * 20 + 10], 1.0);
+        let f = feather(&square(20, 20), 20, 20, 4.0);
+        let edge = f[10 * 20 + 5];
+        assert!(edge > 0.3 && edge < 0.8, "{edge}");
+        let sum: f32 = f.iter().sum();
+        assert!((sum - 100.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn polygon_area_and_aa() {
+        let a = Rect::new(0, 0, 20, 20);
+        let sq = polygon(&[(2.0, 2.0), (12.0, 2.0), (12.0, 12.0), (2.0, 12.0)], a, true);
+        let area: f32 = sq.iter().sum();
+        assert!((area - 100.0).abs() < 1e-3, "{area}");
+        let tri = polygon(&[(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)], a, true);
+        let area: f32 = tri.iter().sum();
+        assert!((area - 50.0).abs() < 1.0, "{area}");
+        assert!(tri.iter().any(|v| *v > 0.0 && *v < 1.0));
+        let hard = polygon(&[(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)], a, false);
+        assert!(hard.iter().all(|v| *v == 0.0 || *v == 1.0));
+        assert!(polygon(&[(0.0, 0.0), (1.0, 1.0)], a, true).iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn combine_modes() {
+        let a = Rect::new(0, 0, 4, 1);
+        let old = mask_to_surface(&[1.0, 1.0, 0.0, 0.0], a);
+        let new = [0.0, 1.0, 1.0, 0.0];
+        let v = |s: Option<Surface>| mask_from_surface(s.as_ref(), a);
+        assert_eq!(v(combine(Some(&old), &new, a, SelectionMode::Replace)), vec![0.0, 1.0, 1.0, 0.0]);
+        assert_eq!(v(combine(Some(&old), &new, a, SelectionMode::Add)), vec![1.0, 1.0, 1.0, 0.0]);
+        assert_eq!(v(combine(Some(&old), &new, a, SelectionMode::Subtract)), vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(v(combine(Some(&old), &new, a, SelectionMode::Intersect)), vec![0.0, 1.0, 0.0, 0.0]);
+        assert!(combine(Some(&old), &[1.0; 4], a, SelectionMode::Subtract).is_none());
+        assert_eq!(SelectionMode::parse("add"), SelectionMode::Add);
+    }
+
+    fn blobs(w: i32, h: i32) -> Vec<[u8; 4]> {
+        // Deterministic blotchy image with gradients and hard edges.
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let v = ((x * 7 + y * 3) % 23 + if (x / 5 + y / 4) % 3 == 0 { 120 } else { 0 }) as u8;
+                [v, v / 2, 255 - v, if x % 11 == 0 { 128 } else { 255 }]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wand_region_matches_reference_magic_wand() {
+        let (w, h) = (37, 29);
+        let area = Rect::new(3, -2, 3 + w, -2 + h);
+        let img = blobs(w, h);
+        let f: Vec<[f32; 4]> = img.iter().map(|p| p.map(|v| v as f32 / 255.0)).collect();
+        for (seed, tol, contiguous, aa) in [((10, 5), 10.0, true, true), ((10, 5), 10.0, true, false), ((20, 20), 40.0, false, true), ((4, -2), 0.0, true, true), ((30, 10), 255.0, true, true)] {
+            let reference = magic_wand(&f, area, seed, tol, contiguous, aa);
+            let r = wand_region(&img, area, seed, tol, contiguous, aa).unwrap();
+            for y in area.y0..area.y1 {
+                for x in area.x0..area.x1 {
+                    let want = (reference[((y - area.y0) * w + x - area.x0) as usize] * 255.0).round();
+                    assert!((r.at(x, y) * 255.0 - want).abs() <= 1.0, "{seed:?} {tol} {contiguous} {aa} at {x},{y}: {} vs {want}", r.at(x, y) * 255.0);
+                }
+            }
+        }
+        assert!(wand_region(&img, area, (0, 0), 10.0, true, true).is_none());
+    }
+
+    #[test]
+    fn combine_region_matches_combine() {
+        let area = Rect::new(0, 0, 40, 30);
+        let mut old = Surface::new(PixelFormat::GRAY8);
+        old.fill_rect(Rect::new(5, 5, 25, 20), &[1.0]);
+        old.fill_rect(Rect::new(8, 8, 10, 10), &[0.4]);
+        let img = blobs(40, 30);
+        let region = wand_region(&img, area, (12, 12), 30.0, true, true).unwrap();
+        let full: Vec<f32> = (0..area.height()).flat_map(|y| (0..area.width()).map(move |x| (x, y))).map(|(x, y)| region.at(x as i32, y as i32)).collect();
+        for mode in [SelectionMode::Replace, SelectionMode::Add, SelectionMode::Subtract, SelectionMode::Intersect] {
+            let a = combine(Some(&old), &full, area, mode);
+            let b = combine_region(Some(&old), Some(&region), mode);
+            assert_eq!(a.is_some(), b.is_some(), "{mode:?}");
+            if let (Some(a), Some(b)) = (a, b) {
+                for y in 0..30 {
+                    for x in 0..40 {
+                        assert!((a.pixel(x, y)[0] - b.pixel(x, y)[0]).abs() < 1.5 / 255.0, "{mode:?} {x},{y}");
+                    }
+                }
+            }
+        }
+        assert!(combine_region(None, None, SelectionMode::Subtract).is_none());
+    }
+}

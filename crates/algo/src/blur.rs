@@ -170,8 +170,7 @@ pub(crate) fn surface(src: &Image, out: Rect, ctx: &Ctx, radius: f32, threshold:
     for y in out.y0..out.y1 {
         for x in out.x0..out.x1 {
             let p = src.px(x, y);
-            for c in 0..cc {
-                let v0 = p[c];
+            for (c, &v0) in p.iter().enumerate().take(cc) {
                 let (mut acc, mut wsum) = (0.0, 0.0);
                 for yy in y - r..=y + r {
                     for xx in x - r..=x + r {

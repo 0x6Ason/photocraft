@@ -6,20 +6,31 @@
 //! part of the interface.
 #![forbid(unsafe_code)]
 
+pub mod actions;
 pub mod canvas;
 pub mod control;
 pub mod dialogs;
+pub mod export_dialog;
 pub mod gpu_canvas;
+pub mod filter_dialog;
 pub mod icons;
 pub mod layer_style;
+pub mod menu_catalog;
 pub mod menus;
 pub mod outline;
 pub mod palette;
 pub mod proxy;
+pub mod retouch_ui;
+pub mod rulers;
 pub mod panels;
 pub mod shortcuts;
+mod sizing;
 pub mod state;
 pub mod theme;
+pub mod tone;
+pub mod transform_tool;
+pub mod type_tool;
+pub mod vector_ui;
 pub mod widgets;
 mod icon_data;
 
@@ -33,24 +44,47 @@ use serde_json::Value;
 pub use control::{ControlRequest, ControlResponse};
 pub use state::{Tool, UiState};
 
+pub type ImportFn = Box<dyn Fn(&str, &[u8]) -> Result<Document, String>>;
+/// Encoder settings chosen in Export As (the file format comes from the name's extension).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExportSettings {
+    /// JPEG quality 1–100 (None = codec default).
+    pub jpeg_quality: Option<u8>,
+}
+
+pub type ExportFn = Box<dyn Fn(&Document, &str, &ExportSettings) -> Result<Vec<u8>, String>>;
+pub type PickOpenFn = Box<dyn FnMut() -> Option<(String, Vec<u8>)>>;
+pub type PickSaveFn = Box<dyn FnMut(&str) -> Option<String>>;
+pub type WriteFn = Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>;
+pub type EncodePngFn = Box<dyn Fn(u32, u32, &[u8]) -> Result<Vec<u8>, String>>;
+/// Put an RGBA8 image (width, height, pixels) on the OS clipboard.
+pub type ClipboardSetFn = Box<dyn FnMut(u32, u32, &[u8]) -> Result<(), String>>;
+/// Read an RGBA8 image from the OS clipboard.
+pub type ClipboardGetFn = Box<dyn FnMut() -> Option<(u32, u32, Vec<u8>)>>;
+/// Shared queue of (file name, bytes) delivered asynchronously.
+pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
 /// Platform services injected by the app binary (file dialogs, codecs), keeping this crate free of
 /// I/O dependencies.
 #[derive(Default)]
 pub struct Services {
     /// Decode a file's bytes into a document (PSD, PNG, JPEG, …).
-    pub import: Option<Box<dyn Fn(&str, &[u8]) -> Result<Document, String>>>,
+    pub import: Option<ImportFn>,
     /// Encode a document for a file name (format chosen by extension).
-    pub export: Option<Box<dyn Fn(&Document, &str) -> Result<Vec<u8>, String>>>,
+    pub export: Option<ExportFn>,
     /// Show an "open file" dialog; returns (name, bytes).
-    pub pick_open: Option<Box<dyn FnMut() -> Option<(String, Vec<u8>)>>>,
+    pub pick_open: Option<PickOpenFn>,
     /// Show a "save file" dialog; returns a path/name to write.
-    pub pick_save: Option<Box<dyn FnMut(&str) -> Option<String>>>,
+    pub pick_save: Option<PickSaveFn>,
     /// Write bytes to a path (native) or trigger a download (web).
-    pub write: Option<Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>>,
+    pub write: Option<WriteFn>,
     /// Encode an RGBA8 image as PNG (used for screenshots and `ui.render`).
-    pub encode_png: Option<Box<dyn Fn(u32, u32, &[u8]) -> Result<Vec<u8>, String>>>,
+    pub encode_png: Option<EncodePngFn>,
     /// Files delivered asynchronously (web file pickers, drag-and-drop): drained every frame.
-    pub inbox: Option<std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>>,
+    pub inbox: Option<Inbox>,
+    /// OS clipboard images: copies go out, screenshots and images from other apps come in.
+    pub clipboard_set_image: Option<ClipboardSetFn>,
+    pub clipboard_get_image: Option<ClipboardGetFn>,
 }
 
 pub struct PhotocraftApp {
@@ -62,6 +96,10 @@ pub struct PhotocraftApp {
     drag: Option<canvas::Drag>,
     control_rx: Option<Receiver<ControlRequest>>,
     pending_screenshots: Vec<(u64, Option<String>, Sender<ControlResponse>)>,
+    /// Screenshots not yet requested from the viewport: (token, earliest time in ms, frames seen).
+    queued_screenshots: Vec<(u64, f64, u32)>,
+    /// Control replies waiting for queued synthetic input to be processed.
+    input_waiters: Vec<Sender<ControlResponse>>,
     /// Live (uncommitted) adjustment edit shown on canvas while a slider is dragged.
     pub live_adjust: Option<(photocraft_doc::LayerId, Value)>,
     /// Frames rendered (for tests and the status bar).
@@ -83,6 +121,29 @@ pub struct PhotocraftApp {
     /// Key of the preview currently uploaded to the GPU (doc, params hash).
     pub(crate) proxy_uploaded: Option<(DocId, u64)>,
     /// Selection outline cache: (doc, revision, segments).
+    /// Live filter preview (proxy document with the filter applied).
+    pub(crate) filter_preview: Option<filter_dialog::FilterPreview>,
+    /// Synthetic input events queued by automation (`ui.click`, `ui.key`, …), injected next frame.
+    pub(crate) synthetic: Vec<egui::Event>,
+    /// Levels/Curves histogram cache: (document, adjustment layer, revision it is valid for).
+    pub(crate) tone_hist: Option<(DocId, photocraft_doc::LayerId, u64, std::sync::Arc<tone::Histograms>)>,
+    /// Histogram panel cache: (document, revision, computed at ms, histograms).
+    pub(crate) doc_hist: Option<(DocId, u64, f64, std::sync::Arc<tone::Histograms>)>,
+    /// Free Transform preview (document without the moving pixels + their texture).
+    pub(crate) transform_preview: Option<transform_tool::TransformPreview>,
+    /// Signature of the image we last put on the OS clipboard (to tell ours from other apps').
+    os_clip_sig: Option<u64>,
+    /// Pointer position over the canvas (document px), for the Info panel and status bar.
+    pub(crate) hover_doc: Option<[f64; 2]>,
+    /// Info panel sample cache: ((x, y, revision), composite RGBA).
+    info_sample: Option<((i32, i32, u64), [f32; 4])>,
+    /// Guide being dragged (from a ruler or with the Move tool).
+    pub(crate) guide_drag: Option<rulers::GuideDrag>,
+    /// Type tool layout cache: ((doc, revision, layer), layout).
+    pub(crate) type_layout: Option<((u64, u64, u64), std::sync::Arc<photocraft_text::TextLayout>)>,
+    /// Channel thumbnails (composite + per channel) cached per (doc, revision).
+    channel_thumbs: Option<(DocId, u64, Vec<egui::TextureHandle>)>,
+    /// Selection outline keyed by (document, mask identity × step × visible region).
     pub(crate) outline_cache: Option<(DocId, u64, std::sync::Arc<Vec<outline::Segment>>)>,
     /// GPU canvas renderer, when running on the wgpu backend (see [`Self::set_wgpu`]).
     gpu: Option<gpu_canvas::GpuCanvas>,
@@ -103,6 +164,8 @@ impl PhotocraftApp {
             drag: None,
             control_rx: None,
             pending_screenshots: Vec::new(),
+            queued_screenshots: Vec::new(),
+            input_waiters: Vec::new(),
             live_adjust: None,
             frame: 0,
             styled: false,
@@ -116,6 +179,17 @@ impl PhotocraftApp {
             proxy: None,
             proxy_uploaded: None,
             outline_cache: None,
+            filter_preview: None,
+            synthetic: Vec::new(),
+            channel_thumbs: None,
+            type_layout: None,
+            guide_drag: None,
+            hover_doc: None,
+            info_sample: None,
+            os_clip_sig: None,
+            transform_preview: None,
+            tone_hist: None,
+            doc_hist: None,
             gpu: None,
             perf: Default::default(),
             #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
@@ -137,7 +211,16 @@ impl PhotocraftApp {
 
     /// Run an engine command, reporting errors in the status bar.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        let t0 = gpu_canvas::now_ms();
+        if matches!(id, "edit.paste" | "edit.pasteSpecial.pasteInPlace") {
+            self.import_os_clipboard();
+        }
         let r = self.session.execute(id, params).map_err(|e| e.to_string());
+        if r.is_ok() && matches!(id, "edit.copy" | "edit.cut" | "edit.copyMerged") {
+            self.export_os_clipboard();
+        }
+        self.perf.last_command = id.to_string();
+        self.perf.command_ms = gpu_canvas::now_ms() - t0;
         match &r {
             Ok(_) => {
                 self.sync_views();
@@ -187,7 +270,7 @@ impl PhotocraftApp {
             None => self.services.pick_save.as_mut().and_then(|f| f(&suggested)).ok_or("cancelled")?,
         };
         let export = self.services.export.as_ref().ok_or("no exporter configured")?;
-        let bytes = export(&st.doc, &path)?;
+        let bytes = export(&st.doc, &path, &ExportSettings::default())?;
         let write = self.services.write.as_mut().ok_or("no writer configured")?;
         write(&path, &bytes)?;
         if let Some(st) = self.session.active_mut() {
@@ -206,10 +289,29 @@ impl PhotocraftApp {
                 control::Outcome::Done(v) => {
                     let _ = reply.send(v);
                 }
-                control::Outcome::Screenshot { token, path } => self.pending_screenshots.push((token, path, reply)),
+                control::Outcome::AfterInput => self.input_waiters.push(reply),
+                control::Outcome::Screenshot { token, path } => {
+                    // Wait out egui's fade animations (~83 ms) and a few rendered frames first.
+                    let settle = ctx.global_style().animation_time as f64 * 2000.0 + 60.0;
+                    self.queued_screenshots.push((token, gpu_canvas::now_ms() + settle, 0));
+                    self.pending_screenshots.push((token, path, reply));
+                }
             }
         }
         self.control_rx = Some(rx);
+    }
+
+    fn issue_screenshots(&mut self, ctx: &egui::Context) {
+        let now = gpu_canvas::now_ms();
+        self.queued_screenshots.retain_mut(|(token, at, frames)| {
+            *frames += 1;
+            if now >= *at && *frames >= 3 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(*token)));
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn collect_screenshots(&mut self, ctx: &egui::Context) {
@@ -260,7 +362,20 @@ impl eframe::App for PhotocraftApp {
             self.checker = None;
         }
         self.drain_control(ctx);
+        if self.ui.text_edit.is_some() && self.ui.tool != state::Tool::Type {
+            type_tool::commit(self);
+        }
+        if self.ui.pen.is_some() && self.ui.tool != state::Tool::Pen {
+            vector_ui::pen_commit(self, false);
+        }
+        // A transform whose layer or document went away (undo, close) ends silently.
+        if let Some(t) = &self.ui.transform
+            && self.session.active().and_then(|s| s.doc.layer(photocraft_doc::LayerId(t.layer))).is_none()
+        {
+            transform_tool::cancel(self);
+        }
         self.collect_screenshots(ctx);
+        self.issue_screenshots(ctx);
         shortcuts::handle(self, ctx);
         let arrived: Vec<(String, Vec<u8>)> = self.services.inbox.as_ref().map(|q| std::mem::take(&mut *q.lock().unwrap_or_else(|e| e.into_inner()))).unwrap_or_default();
         for (name, bytes) in arrived {
@@ -282,9 +397,15 @@ impl eframe::App for PhotocraftApp {
                 Err(e) => self.ui.status = format!("Couldn't read {name}: {e}"),
             }
         }
-        if self.control_rx.is_some() || !self.pending_screenshots.is_empty() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        // The control transport wakes the UI on arrival (ctx.request_repaint); only poll while a
+        // screenshot is pending. (Polling every 50 ms here made idle apps render at 20 fps.)
+        if !self.pending_screenshots.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
+    }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        raw_input.events.extend(self.take_synthetic_step());
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -315,6 +436,15 @@ impl eframe::App for PhotocraftApp {
         dialogs::show(self, &ctx);
         canvas::extra_windows(self, &ctx);
         self.perf.frame(gpu_canvas::now_ms() - t0);
+        // Synthetic input is injected one press/release step per frame: keep frames coming until
+        // the queue is empty, then release control replies waiting on it.
+        if !self.synthetic.is_empty() {
+            ctx.request_repaint();
+        } else if !self.input_waiters.is_empty() {
+            for w in self.input_waiters.drain(..) {
+                let _ = w.send(serde_json::json!({"ok": true, "result": null}));
+            }
+        }
     }
 }
 
@@ -338,28 +468,37 @@ impl PhotocraftApp {
 
     /// Cached 64px thumbnail of a pixel-ish layer, laid out in document space.
     pub fn layer_thumb(&mut self, ctx: &egui::Context, doc: &Document, layer: &photocraft_doc::Layer) -> egui::TextureId {
-        let rev = self.session.active().map_or(0, |d| d.revision);
+        // Key by content, not document revision: COW tiles change pointer only when their pixels
+        // change, so unrelated edits (e.g. painting another layer) don't rebuild this thumbnail.
+        let rev = layer.surface().map_or(0, surface_fingerprint) ^ (doc.size.width as u64) << 40;
         let key = (layer.id, false);
         if let Some((r, tex)) = self.thumbs.get(&key)
             && *r == rev
         {
             return tex.id();
         }
-        let img = thumb_image(doc, 64, |x, y| layer.surface().map_or([0.0; 4], |s| s.rgba(x, y)));
+        let mut px = [0.0f32; 8];
+        let img = thumb_image(doc, 64, |x, y| {
+            let Some(s) = layer.surface() else { return [0.0; 4] };
+            let n = s.channels();
+            s.read_pixel(x, y, &mut px[..n]);
+            photocraft_raster::to_rgba(&s.format(), &px[..n])
+        });
         self.store_thumb(ctx, key, rev, img)
     }
 
     pub fn mask_thumb(&mut self, ctx: &egui::Context, doc: &Document, id: photocraft_doc::LayerId, mask: &photocraft_doc::LayerMask) -> egui::TextureId {
-        let rev = self.session.active().map_or(0, |d| d.revision);
+        let rev = surface_fingerprint(&mask.surface) ^ (doc.size.width as u64) << 40;
         let key = (id, true);
         if let Some((r, tex)) = self.thumbs.get(&key)
             && *r == rev
         {
             return tex.id();
         }
+        let mut v = [0.0f32; 1];
         let img = thumb_image(doc, 64, |x, y| {
-            let v = mask.surface.pixel(x, y)[0];
-            [v, v, v, 1.0]
+            mask.surface.read_pixel(x, y, &mut v);
+            [v[0], v[0], v[0], 1.0]
         });
         self.store_thumb(ctx, key, rev, img)
     }
@@ -381,8 +520,18 @@ impl PhotocraftApp {
     }
 }
 
+/// Cheap identity of a surface's pixels: tile coordinates and `Arc` pointers.
+pub fn surface_fingerprint(s: &photocraft_raster::Surface) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ s.tile_count() as u64;
+    for (c, t) in s.tiles() {
+        let p = std::sync::Arc::as_ptr(t) as usize as u64;
+        h = (h ^ p ^ ((c.tx as u64) << 32 | c.ty as u32 as u64)).wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
 /// Square thumbnail of the canvas area, letterboxed, sampling `f(x, y)` in document space.
-fn thumb_image(doc: &Document, side: usize, f: impl Fn(i32, i32) -> [f32; 4]) -> egui::ColorImage {
+fn thumb_image(doc: &Document, side: usize, mut f: impl FnMut(i32, i32) -> [f32; 4]) -> egui::ColorImage {
     let (w, h) = (doc.size.width.max(1) as f32, doc.size.height.max(1) as f32);
     let scale = w.max(h) / side as f32;
     let (ox, oy) = ((side as f32 - w / scale) / 2.0, (side as f32 - h / scale) / 2.0);
@@ -403,6 +552,14 @@ fn thumb_image(doc: &Document, side: usize, f: impl Fn(i32, i32) -> [f32; 4]) ->
 }
 
 impl PhotocraftApp {
+    /// Next step of queued synthetic input (automation): events up to and including the first
+    /// release, so egui sees press and release in separate frames. Hosts that don't call
+    /// `raw_input_hook` (offscreen harnesses) feed these to their input themselves.
+    pub fn take_synthetic_step(&mut self) -> Vec<egui::Event> {
+        let n = self.synthetic.iter().position(|e| matches!(e, egui::Event::PointerButton { pressed: false, .. } | egui::Event::Key { pressed: false, .. })).map_or(self.synthetic.len(), |i| i + 1);
+        self.synthetic.drain(..n).collect()
+    }
+
     /// Install fonts, image loaders and the theme. Call from the app creator when possible so the
     /// very first frame renders; otherwise `logic` does it and the first frame is skipped.
     pub fn setup_context(ctx: &egui::Context, kind: theme::ThemeKind) {
@@ -413,9 +570,9 @@ impl PhotocraftApp {
 }
 
 impl PhotocraftApp {
-    /// Cached `Surface::content_bounds` keyed by an id and the active document revision.
+    /// Cached `Surface::content_bounds` keyed by an id and the surface's tile identity.
     pub fn cached_bounds(&mut self, key: u64, surface: &photocraft_raster::Surface) -> photocraft_geom::Rect {
-        let rev = self.session.active().map_or(0, |d| d.revision);
+        let rev = surface_fingerprint(surface);
         if let Some((r, b)) = self.bounds_cache.get(&key)
             && *r == rev
         {
@@ -427,5 +584,126 @@ impl PhotocraftApp {
         }
         self.bounds_cache.insert(key, (rev, b));
         b
+    }
+}
+
+impl PhotocraftApp {
+    /// Zoom of the active document's main view (screen points per document pixel).
+    pub fn current_zoom(&self) -> f32 {
+        self.session.active_index().and_then(|i| self.ui.views.get(i)).map_or(1.0, |v| v.zoom)
+    }
+}
+
+impl PhotocraftApp {
+    /// Composite + per-channel grayscale thumbnails of the active document (cached per revision).
+    pub fn channel_thumbs(&mut self, ctx: &egui::Context) -> Vec<egui::TextureId> {
+        let Some(st) = self.session.active() else { return Vec::new() };
+        let (id, rev, doc) = (st.doc.id, st.revision, st.doc.clone());
+        if !matches!(&self.channel_thumbs, Some((d, r, _)) if *d == id && *r == rev) {
+            let comp = photocraft_compose::thumbnail(&doc, 56);
+            let (w, h) = (comp.width as usize, comp.height as usize);
+            let side = w.max(h);
+            let make = |f: &dyn Fn(&[u8]) -> egui::Color32, name: &str| {
+                let mut px = vec![egui::Color32::TRANSPARENT; side * side];
+                let (ox, oy) = ((side - w) / 2, (side - h) / 2);
+                for y in 0..h {
+                    for x in 0..w {
+                        let o = (y * w + x) * 4;
+                        px[(y + oy) * side + x + ox] = f(&comp.pixels[o..o + 4]);
+                    }
+                }
+                ctx.load_texture(format!("chan-{name}"), egui::ColorImage::new([side, side], px), egui::TextureOptions::LINEAR)
+            };
+            let texs = vec![
+                make(&|p| egui::Color32::from_rgb(p[0], p[1], p[2]), "rgb"),
+                make(&|p| egui::Color32::from_gray(p[0]), "r"),
+                make(&|p| egui::Color32::from_gray(p[1]), "g"),
+                make(&|p| egui::Color32::from_gray(p[2]), "b"),
+            ];
+            self.channel_thumbs = Some((id, rev, texs));
+        }
+        self.channel_thumbs.as_ref().map(|(_, _, t)| t.iter().map(|t| t.id()).collect()).unwrap_or_default()
+    }
+}
+
+fn clip_signature(w: u32, h: u32, px: &[u8]) -> u64 {
+    let mut sig = (w as u64) << 32 | h as u64;
+    for b in px.iter().step_by(997) {
+        sig = sig.rotate_left(5) ^ *b as u64;
+    }
+    sig
+}
+
+impl PhotocraftApp {
+    /// Mirror the session clipboard onto the OS clipboard (RGBA8).
+    fn export_os_clipboard(&mut self) {
+        let (Some(set), Some(clip)) = (self.services.clipboard_set_image.as_mut(), self.session.clipboard.as_ref()) else { return };
+        let b = clip.bounds;
+        if b.is_empty() {
+            return;
+        }
+        let mut px = vec![[0u8; 4]; b.width() as usize * b.height() as usize];
+        clip.surface.read_rgba8_into(b, &mut px);
+        let bytes: Vec<u8> = px.into_iter().flatten().collect();
+        if set(b.width(), b.height(), &bytes).is_ok() {
+            self.os_clip_sig = Some(clip_signature(b.width(), b.height(), &bytes));
+        }
+    }
+
+    /// If the OS clipboard holds an image that isn't the one we put there, make it the session
+    /// clipboard (so ⌘V pastes screenshots and images copied in other apps, like Photoshop).
+    /// Returns true when a new external image was imported.
+    pub(crate) fn import_os_clipboard(&mut self) -> bool {
+        let Some(get) = self.services.clipboard_get_image.as_mut() else { return false };
+        let Some((w, h, bytes)) = get() else { return false };
+        if w == 0 || h == 0 || bytes.len() != w as usize * h as usize * 4 {
+            return false;
+        }
+        let sig = clip_signature(w, h, &bytes);
+        if self.os_clip_sig == Some(sig) && self.session.clipboard.is_some() {
+            return false;
+        }
+        let r = photocraft_geom::Rect::new(0, 0, w as i32, h as i32);
+        let mut surface = photocraft_raster::Surface::from_interleaved(photocraft_color::PixelFormat::RGBA8, r, &bytes);
+        surface.prune();
+        self.session.clipboard = Some(photocraft_engine::edit_cmds::Clip { surface, bounds: r });
+        self.os_clip_sig = Some(sig);
+        true
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn os_clipboard_bridge() {
+        type OsClip = Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>;
+        let os: OsClip = Arc::default();
+        let (a, b) = (os.clone(), os.clone());
+        let services = Services {
+            clipboard_set_image: Some(Box::new(move |w: u32, h: u32, px: &[u8]| {
+                *a.lock().unwrap() = Some((w, h, px.to_vec()));
+                Ok(())
+            })),
+            clipboard_get_image: Some(Box::new(move || b.lock().unwrap().clone())),
+            ..Default::default()
+        };
+        let mut app = PhotocraftApp::new(Session::new(), services);
+        app.session.execute("file.new", serde_json::json!({"width": 64, "height": 64})).unwrap();
+        app.sync_views();
+        app.run("select.rect", serde_json::json!({"x": 0, "y": 0, "width": 8, "height": 4})).unwrap();
+        app.run("edit.copy", serde_json::json!({})).unwrap();
+        let (w, h, px) = os.lock().unwrap().clone().unwrap();
+        assert_eq!((w, h, px.len()), (8, 4, 8 * 4 * 4));
+        // Our own image comes back unchanged (no re-import, keeps the original position).
+        assert!(!app.import_os_clipboard());
+        // Another app puts a 3×2 red image on the clipboard: ⌘V pastes it.
+        *os.lock().unwrap() = Some((3, 2, [255u8, 0, 0, 255].repeat(6)));
+        app.run("edit.paste", serde_json::json!({})).unwrap();
+        let st = app.session.active().unwrap();
+        let surf = st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap();
+        assert_eq!(surf.content_bounds().width(), 3);
     }
 }

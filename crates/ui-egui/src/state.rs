@@ -8,15 +8,76 @@ pub enum Tool {
     Move,
     RectMarquee,
     EllipseMarquee,
+    Lasso,
+    PolygonLasso,
+    MagicWand,
+    Crop,
+    Eyedropper,
     Brush,
     Eraser,
-    Eyedropper,
+    Gradient,
+    PaintBucket,
+    Type,
     Hand,
     Zoom,
+    SpotHealing,
+    Healing,
+    CloneStamp,
+    HistoryBrush,
+    Blur,
+    Sharpen,
+    Smudge,
+    Dodge,
+    Burn,
+    Sponge,
+    QuickSelection,
+    ObjectSelection,
+    Pen,
+    PathSelection,
+    Rectangle,
+    EllipseShape,
+    Triangle,
+    Polygon,
+    Line,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 8] = [Tool::Move, Tool::RectMarquee, Tool::EllipseMarquee, Tool::Brush, Tool::Eraser, Tool::Eyedropper, Tool::Hand, Tool::Zoom];
+    pub const ALL: [Tool; 34] = [
+        Tool::Move,
+        Tool::RectMarquee,
+        Tool::EllipseMarquee,
+        Tool::Lasso,
+        Tool::PolygonLasso,
+        Tool::MagicWand,
+        Tool::Crop,
+        Tool::Eyedropper,
+        Tool::Brush,
+        Tool::Eraser,
+        Tool::Gradient,
+        Tool::PaintBucket,
+        Tool::Type,
+        Tool::Hand,
+        Tool::Zoom,
+        Tool::SpotHealing,
+        Tool::Healing,
+        Tool::CloneStamp,
+        Tool::HistoryBrush,
+        Tool::Blur,
+        Tool::Sharpen,
+        Tool::Smudge,
+        Tool::Dodge,
+        Tool::Burn,
+        Tool::Sponge,
+        Tool::QuickSelection,
+        Tool::ObjectSelection,
+        Tool::Pen,
+        Tool::PathSelection,
+        Tool::Rectangle,
+        Tool::EllipseShape,
+        Tool::Triangle,
+        Tool::Polygon,
+        Tool::Line,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -26,11 +87,41 @@ impl Tool {
             Tool::Brush => "Brush Tool",
             Tool::Eraser => "Eraser Tool",
             Tool::Eyedropper => "Eyedropper Tool",
+            Tool::Lasso => "Lasso Tool",
+            Tool::PolygonLasso => "Polygonal Lasso Tool",
+            Tool::MagicWand => "Magic Wand Tool",
+            Tool::Crop => "Crop Tool",
+            Tool::Gradient => "Gradient Tool",
+            Tool::PaintBucket => "Paint Bucket Tool",
+            Tool::Type => "Horizontal Type Tool",
             Tool::Hand => "Hand Tool",
             Tool::Zoom => "Zoom Tool",
+            Tool::SpotHealing => "Spot Healing Brush Tool",
+            Tool::Healing => "Healing Brush Tool",
+            Tool::CloneStamp => "Clone Stamp Tool",
+            Tool::HistoryBrush => "History Brush Tool",
+            Tool::Blur => "Blur Tool",
+            Tool::Sharpen => "Sharpen Tool",
+            Tool::Smudge => "Smudge Tool",
+            Tool::Dodge => "Dodge Tool",
+            Tool::Burn => "Burn Tool",
+            Tool::Sponge => "Sponge Tool",
+            Tool::QuickSelection => "Quick Selection Tool",
+            Tool::ObjectSelection => "Object Selection Tool",
+            Tool::Pen => "Pen Tool",
+            Tool::PathSelection => "Path Selection Tool",
+            Tool::Rectangle => "Rectangle Tool",
+            Tool::EllipseShape => "Ellipse Tool",
+            Tool::Triangle => "Triangle Tool",
+            Tool::Polygon => "Polygon Tool",
+            Tool::Line => "Line Tool",
         }
     }
-    /// Photoshop default single-key shortcut.
+    /// Retouching and painting tools that stroke with the brush (share the brush cursor and chip).
+    pub fn is_brushlike(self) -> bool {
+        matches!(self, Tool::Brush | Tool::Eraser | Tool::SpotHealing | Tool::Healing | Tool::CloneStamp | Tool::HistoryBrush | Tool::Blur | Tool::Sharpen | Tool::Smudge | Tool::Dodge | Tool::Burn | Tool::Sponge)
+    }
+    /// Photoshop default single-key shortcut (`'\0'` = none, e.g. the Blur group).
     pub fn key(self) -> char {
         match self {
             Tool::Move => 'V',
@@ -38,8 +129,22 @@ impl Tool {
             Tool::Brush => 'B',
             Tool::Eraser => 'E',
             Tool::Eyedropper => 'I',
+            Tool::Lasso | Tool::PolygonLasso => 'L',
+            Tool::MagicWand => 'W',
+            Tool::Crop => 'C',
+            Tool::Gradient | Tool::PaintBucket => 'G',
+            Tool::Type => 'T',
             Tool::Hand => 'H',
             Tool::Zoom => 'Z',
+            Tool::SpotHealing | Tool::Healing => 'J',
+            Tool::CloneStamp => 'S',
+            Tool::HistoryBrush => 'Y',
+            Tool::Blur | Tool::Sharpen | Tool::Smudge => '\0',
+            Tool::Dodge | Tool::Burn | Tool::Sponge => 'O',
+            Tool::QuickSelection | Tool::ObjectSelection => 'W',
+            Tool::Pen => 'P',
+            Tool::PathSelection => 'A',
+            Tool::Rectangle | Tool::EllipseShape | Tool::Triangle | Tool::Polygon | Tool::Line => 'U',
         }
     }
     /// Glyph drawn in the toolbar (vector icons come later).
@@ -51,8 +156,14 @@ impl Tool {
             Tool::Brush => "🖌",
             Tool::Eraser => "⌫",
             Tool::Eyedropper => "💧",
+            Tool::Lasso | Tool::PolygonLasso => "L",
+            Tool::MagicWand => "W",
+            Tool::Crop => "C",
+            Tool::Gradient | Tool::PaintBucket => "G",
+            Tool::Type => "T",
             Tool::Hand => "✋",
             Tool::Zoom => "🔍",
+            _ => "•",
         }
     }
     pub fn from_name(s: &str) -> Option<Tool> {
@@ -111,11 +222,14 @@ pub struct View {
     pub center: [f32; 2],
     /// Recompute fit-to-screen on next frame.
     pub fit_pending: bool,
+    /// Document size this view last showed; a change (Image/Canvas Size, crop) re-centres it.
+    #[serde(default)]
+    pub doc_size: [u32; 2],
 }
 
 impl Default for View {
     fn default() -> Self {
-        Self { zoom: 1.0, center: [0.0, 0.0], fit_pending: true }
+        Self { zoom: 1.0, center: [0.0, 0.0], fit_pending: true, doc_size: [0, 0] }
     }
 }
 
@@ -128,17 +242,182 @@ pub struct DocWindow {
     pub open: bool,
 }
 
+/// Options-bar state for tools (Photoshop keeps these per tool).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolOptions {
+    pub tolerance: f32,
+    pub contiguous: bool,
+    pub anti_alias: bool,
+    pub sample_all_layers: bool,
+    pub feather: f32,
+    /// linear | radial | angle | reflected | diamond
+    pub gradient_style: String,
+    pub gradient_reverse: bool,
+    pub fill_opacity: f32,
+    /// Type tool: family, style name, size (pt), anti-aliasing and paragraph alignment.
+    pub type_font: String,
+    pub type_style: String,
+    pub type_size: f32,
+    pub type_aa: String,
+    pub type_align: String,
+    /// Clone Stamp / Healing Brush.
+    pub clone_aligned: bool,
+    /// current | currentAndBelow | all
+    pub clone_sample: String,
+    /// Spot Healing: contentAware | createTexture | proximityMatch
+    pub spot_type: String,
+    /// Dodge/Burn: shadows | midtones | highlights, exposure %, protect tones.
+    pub tone_range: String,
+    pub exposure: f32,
+    pub protect_tones: bool,
+    /// Sponge: desaturate | saturate, vibrance.
+    pub sponge_mode: String,
+    pub vibrance: bool,
+    /// Blur/Sharpen/Smudge strength %, Sharpen protect detail, Smudge finger painting.
+    pub strength: f32,
+    pub protect_detail: bool,
+    pub finger_painting: bool,
+    /// Quick Selection enhance edge.
+    pub enhance_edge: bool,
+    /// Pen: "path" (work path) or "shape" (shape layer).
+    pub vector_mode: String,
+    /// Shape tools: fill with the foreground colour, stroke width (0 = none), rectangle corner
+    /// radius, polygon sides, line weight.
+    pub shape_fill: bool,
+    pub stroke_width: f32,
+    pub corner_radius: f32,
+    pub polygon_sides: u32,
+    pub line_weight: f32,
+}
+
+impl Default for ToolOptions {
+    fn default() -> Self {
+        Self {
+            tolerance: 32.0,
+            contiguous: true,
+            anti_alias: true,
+            sample_all_layers: false,
+            feather: 0.0,
+            gradient_style: "linear".into(),
+            gradient_reverse: false,
+            fill_opacity: 100.0,
+            type_font: "Inter".into(),
+            type_style: "Regular".into(),
+            type_size: 48.0,
+            type_aa: "sharp".into(),
+            type_align: "left".into(),
+            clone_aligned: true,
+            clone_sample: "current".into(),
+            spot_type: "contentAware".into(),
+            tone_range: "midtones".into(),
+            exposure: 50.0,
+            protect_tones: true,
+            sponge_mode: "desaturate".into(),
+            vibrance: true,
+            strength: 50.0,
+            protect_detail: true,
+            finger_painting: false,
+            enhance_edge: false,
+            vector_mode: "path".into(),
+            shape_fill: true,
+            stroke_width: 0.0,
+            corner_radius: 0.0,
+            polygon_sides: 5,
+            line_weight: 3.0,
+        }
+    }
+}
+
+/// Free Transform in progress: the source frame `rect` and where its corners currently are.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TransformSession {
+    pub session: u64,
+    pub layer: u64,
+    pub rect: [f64; 4],
+    /// Corners clockwise from top-left (document px).
+    pub quad: [[f64; 2]; 4],
+    /// Reference point (rotation / ⌥-scale centre).
+    pub pivot: [f64; 2],
+    pub interpolation: String,
+}
+
+/// In-progress inline type editing (Type tool). Offsets are character indices.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextEdit {
+    pub layer: u64,
+    pub caret: usize,
+    pub anchor: usize,
+    /// History coalescing key: the whole editing session is one "Edit Type Layer" step.
+    pub session: String,
+    /// The layer was created by this session (its name follows the text; empty on commit = delete).
+    pub created: bool,
+    #[serde(skip)]
+    pub dragging: bool,
+}
+
+/// View-menu overlays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Extras {
+    pub rulers: bool,
+    pub grid: bool,
+    pub guides: bool,
+    pub snap: bool,
+    pub lock_guides: bool,
+}
+
+impl Default for Extras {
+    fn default() -> Self {
+        Self { rulers: false, grid: false, guides: true, snap: true, lock_guides: false }
+    }
+}
+
 /// Selected tab per dock card.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DockTabs {
     pub properties: usize,
     pub color: usize,
     pub layers: usize,
+    /// Navigator | Histogram | Info.
+    pub navigator: usize,
+    /// History | Actions.
+    pub history: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiState {
     pub tool: Tool,
+    /// Inline type editing session, if any.
+    #[serde(default)]
+    pub text_edit: Option<TextEdit>,
+    /// Free Transform session, if any.
+    #[serde(default)]
+    pub transform: Option<TransformSession>,
+    /// Clone Stamp / Healing source point (⌥-click) and the aligned offset once a stroke started.
+    #[serde(default)]
+    pub clone_source: Option<[f64; 2]>,
+    #[serde(default)]
+    pub clone_offset: Option<[f64; 2]>,
+    /// Painting targets the active layer's mask instead of its pixels.
+    #[serde(default)]
+    pub mask_target: bool,
+    /// Pen path under construction.
+    #[serde(default)]
+    pub pen: Option<crate::vector_ui::PenPath>,
+    /// Selected row in the Paths panel ("work" or a saved path name).
+    #[serde(default)]
+    pub selected_path: Option<String>,
+    /// Layers panel kind filter ("pixel", "adjustment", "type", "shape", "smart"); empty = all.
+    #[serde(default)]
+    pub layer_filter: Vec<String>,
+    /// Recorded actions (Actions panel).
+    #[serde(default)]
+    pub actions: crate::actions::Actions,
+    /// View extras: rulers (⌘R), grid (⌘'), guides (⌘;), snapping (⇧⌘;), locked guides (⌥⌘;).
+    #[serde(default)]
+    pub extras: Extras,
     pub panels: Panels,
     /// Views per open document (index-aligned with the session's documents).
     pub views: Vec<View>,
@@ -151,6 +430,14 @@ pub struct UiState {
     /// Marquee options-bar mode: 0 new, 1 add, 2 subtract, 3 intersect (modifier keys override).
     #[serde(default)]
     pub selection_mode: u8,
+    #[serde(default)]
+    pub tool_options: ToolOptions,
+    /// In-progress polygonal lasso vertices (document coordinates).
+    #[serde(default)]
+    pub polygon: Vec<[f64; 2]>,
+    /// Crop tool rectangle being edited [x0, y0, x1, y1] (document coordinates).
+    #[serde(default)]
+    pub crop_rect: Option<[f64; 4]>,
     pub next_id: u64,
     /// Last status message (errors from commands, hints).
     pub status: String,
@@ -163,6 +450,16 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             tool: Tool::Brush,
+            text_edit: None,
+            transform: None,
+            mask_target: false,
+            clone_source: None,
+            clone_offset: None,
+            extras: Extras::default(),
+            actions: Default::default(),
+            layer_filter: Vec::new(),
+            pen: None,
+            selected_path: None,
             panels: Panels::default(),
             views: Vec::new(),
             dialogs: Vec::new(),
@@ -172,6 +469,9 @@ impl Default for UiState {
             palette_open: false,
             dock_tabs: DockTabs::default(),
             selection_mode: 0,
+            tool_options: ToolOptions::default(),
+            polygon: Vec::new(),
+            crop_rect: None,
             next_id: 1,
             status: String::new(),
             status_error: false,

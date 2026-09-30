@@ -20,9 +20,11 @@ pub fn adjust_surface(s: &mut Surface, adj: &Adjustment, selection: Option<&Surf
     let w = r.width() as usize;
     let mut out = Vec::with_capacity(raw.len());
     for (i, (a, o)) in buf.px.iter().zip(&orig.px).enumerate() {
-        let k = selection.map_or(1.0, |sel| sel.pixel(r.x0 + (i % w) as i32, r.y0 + (i / w) as i32)[0]);
+        let k = selection.map_or(1.0, |sel| sel.sample_channel(r.x0 + (i % w) as i32, r.y0 + (i / w) as i32, 0));
         let mixed: [f32; 4] = std::array::from_fn(|c| o[c] + (a[c] - o[c]) * k);
-        out.extend(from_rgba(&fmt, mixed));
+        let mut enc = [0.0f32; 8];
+        let m = photocraft_raster::from_rgba_into(&fmt, mixed, &mut enc);
+        out.extend_from_slice(&enc[..m]);
     }
     s.write_region(r, &out);
 }
@@ -36,7 +38,7 @@ pub fn fill_surface(s: &mut Surface, area: Rect, color: [f32; 4], selection: Opt
     for (i, px) in region.chunks_exact_mut(n).enumerate() {
         let x = area.x0 + (i % w) as i32;
         let y = area.y0 + (i / w) as i32;
-        let k = selection.map_or(1.0, |sel| sel.pixel(x, y)[0]);
+        let k = selection.map_or(1.0, |sel| sel.sample_channel(x, y, 0));
         if k <= 0.0 {
             continue;
         }
@@ -50,7 +52,9 @@ pub fn fill_surface(s: &mut Surface, area: Rect, color: [f32; 4], selection: Opt
             }
         }
         o[3] = if lock_transparency { d[3] } else { oa };
-        px.copy_from_slice(&from_rgba(&fmt, o)[..n]);
+        let mut enc = [0.0f32; 8];
+        photocraft_raster::from_rgba_into(&fmt, o, &mut enc);
+        px.copy_from_slice(&enc[..n]);
     }
     s.write_region(area, &region);
 }
@@ -65,8 +69,12 @@ pub fn clear_surface(s: &mut Surface, area: Rect, selection: Option<&Surface>) {
     let mut region = s.read_region(area);
     let w = area.width() as usize;
     for (i, px) in region.chunks_exact_mut(n).enumerate() {
-        let k = selection.map_or(1.0, |sel| sel.pixel(area.x0 + (i % w) as i32, area.y0 + (i / w) as i32)[0]);
+        let k = selection.map_or(1.0, |sel| sel.sample_channel(area.x0 + (i % w) as i32, area.y0 + (i / w) as i32, 0));
         px[n - 1] *= 1.0 - k;
+        // Fully cleared pixels become the empty pixel, so bounds and tile pruning see them as gone.
+        if px[n - 1] <= 0.0 {
+            px.fill(0.0);
+        }
     }
     s.write_region(area, &region);
     s.prune();

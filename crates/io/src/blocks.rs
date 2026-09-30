@@ -210,19 +210,25 @@ pub(crate) fn gradient_desc(stops: &[(f32, Color)], opacity: &[(f32, f32)]) -> D
 pub fn parse_fill(key: &[u8; 4], data: &[u8]) -> Option<Fill> {
     // Block data may carry trailing padding after the descriptor.
     let d = parse_prefix_versioned(data)?;
+    fill_from_desc(key, &d)
+}
+
+/// A fill from its descriptor (`SoCo`/`GdFl`/`PtFl` layout; also the `solidColorLayer`,
+/// `gradientLayer` and `patternLayer` contents of shape strokes).
+pub fn fill_from_desc(key: &[u8; 4], d: &Descriptor) -> Option<Fill> {
     match key {
-        b"SoCo" => Some(Fill::Solid(color_from_desc(get_desc(&d, "Clr ")?)?)),
+        b"SoCo" => Some(Fill::Solid(color_from_desc(get_desc(d, "Clr ")?)?)),
         b"GdFl" => {
             let angle = num(d.get("Angl")).unwrap_or(90.0) as f32;
             let scale = num(d.get("Scl ")).map_or(1.0, |v| v as f32 / 100.0);
-            let (mut stops, _) = get_desc(&d, "Grad").map(gradient_stops).unwrap_or_default();
+            let (mut stops, _) = get_desc(d, "Grad").map(gradient_stops).unwrap_or_default();
             if stops.is_empty() {
                 stops = vec![(0.0, Color::BLACK), (1.0, Color::WHITE)];
             }
-            Some(Fill::Gradient { stops, angle, scale, style: gradient_style(&d), reverse: bool_of(&d, "Rvrs") })
+            Some(Fill::Gradient { stops, angle, scale, style: gradient_style(d), reverse: bool_of(d, "Rvrs") })
         }
         b"PtFl" => {
-            let name = get_desc(&d, "Ptrn")
+            let name = get_desc(d, "Ptrn")
                 .and_then(|p| match p.get("Nm  ") {
                     Some(Value::Text(t)) => Some(t.to_string_lossy()),
                     _ => None,
@@ -237,11 +243,14 @@ pub fn parse_fill(key: &[u8; 4], data: &[u8]) -> Option<Fill> {
 
 /// Serializes a fill to its block.
 pub fn write_fill(f: &Fill) -> ([u8; 4], Vec<u8>) {
+    let (k, d) = fill_to_desc(f);
+    (k, VersionedDescriptor::new(d).to_bytes())
+}
+
+/// A fill as (block key, descriptor with class `null`).
+pub fn fill_to_desc(f: &Fill) -> ([u8; 4], Descriptor) {
     match f {
-        Fill::Solid(c) => {
-            let d = Descriptor::new("null").with("Clr ", Value::Descriptor(color_to_desc(c)));
-            (*b"SoCo", VersionedDescriptor::new(d).to_bytes())
-        }
+        Fill::Solid(c) => (*b"SoCo", Descriptor::new("null").with("Clr ", Value::Descriptor(color_to_desc(c)))),
         Fill::Gradient { stops, angle, scale, style, reverse } => {
             let mut d = Descriptor::new("null")
                 .with("Angl", Value::UnitFloat { unit: *b"#Ang", value: f64::from(*angle) })
@@ -251,14 +260,16 @@ pub fn write_fill(f: &Fill) -> ([u8; 4], Vec<u8>) {
             if *reverse {
                 d = d.with("Rvrs", Value::Boolean(true));
             }
-            (*b"GdFl", VersionedDescriptor::new(d).to_bytes())
+            (*b"GdFl", d)
         }
         Fill::Pattern { name, scale } => {
             let p = Descriptor::new("Ptrn").with("Nm  ", Value::Text(UnicodeString::new_nul(name)));
-            let d = Descriptor::new("null")
-                .with("Scl ", Value::UnitFloat { unit: *b"#Prc", value: f64::from(scale * 100.0) })
-                .with("Ptrn", Value::Descriptor(p));
-            (*b"PtFl", VersionedDescriptor::new(d).to_bytes())
+            (
+                *b"PtFl",
+                Descriptor::new("null")
+                    .with("Scl ", Value::UnitFloat { unit: *b"#Prc", value: f64::from(scale * 100.0) })
+                    .with("Ptrn", Value::Descriptor(p)),
+            )
         }
     }
 }
@@ -280,7 +291,7 @@ pub fn parse_tysh(data: &[u8]) -> Option<(String, Affine)> {
 }
 
 /// Parses a version-16 descriptor at the start of `data` (trailing bytes allowed).
-fn parse_prefix_versioned(data: &[u8]) -> Option<Descriptor> {
+pub(crate) fn parse_prefix_versioned(data: &[u8]) -> Option<Descriptor> {
     VersionedDescriptor::parse_prefix(data).ok().map(|(v, _)| v.descriptor)
 }
 

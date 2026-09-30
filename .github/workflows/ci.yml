@@ -90,6 +90,7 @@ jobs:
           - { crate: codecs, name: decode_jpeg }
           - { crate: codecs, name: decode_tiff }
           - { crate: codecs, name: decode_exr }
+          - { crate: format, name: load }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

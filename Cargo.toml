@@ -19,9 +19,14 @@ photocraft-ops = { path = "crates/ops" }
 photocraft-psd = { path = "crates/psd" }
 photocraft-codecs = { path = "crates/codecs" }
 photocraft-compose = { path = "crates/compose" }
+photocraft-gpu = { path = "crates/gpu" }
 photocraft-paint = { path = "crates/paint" }
 photocraft-algo = { path = "crates/algo" }
 photocraft-io = { path = "crates/io" }
+photocraft-text = { path = "crates/text" }
+photocraft-vector = { path = "crates/vector" }
+photocraft-format = { path = "crates/format" }
+photocraft-automation = { path = "crates/automation" }
 photocraft-engine = { path = "crates/engine" }
 photocraft-ui-egui = { path = "crates/ui-egui" }
 photocraft-testkit = { path = "crates/testkit" }
@@ -41,6 +46,7 @@ egui_kittest = "0.36"
 rfd = "0.17"
 log = "0.4"
 rayon = "1"
+criterion = { version = "0.5", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

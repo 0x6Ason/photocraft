@@ -7,8 +7,10 @@
 #![forbid(unsafe_code)]
 
 use photocraft_geom::{Point, Rect};
-use photocraft_raster::{Surface, from_rgba, to_rgba};
+use photocraft_raster::{Surface, to_rgba};
 use serde::{Deserialize, Serialize};
+
+pub mod retouch;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StrokePoint {
@@ -128,40 +130,19 @@ pub fn dab_coverage(d: f32, radius: f32, hardness: f32) -> f32 {
 /// Returns the damaged rectangle.
 pub fn apply_stroke(target: &mut Surface, stroke: &Stroke, selection: Option<&Surface>, lock_transparency: bool) -> Rect {
     let b = &stroke.brush;
-    let ds = dabs(stroke);
-    if ds.is_empty() {
+    if stroke.points.is_empty() {
         return Rect::EMPTY;
     }
-    let bounds = ds.iter().fold(Rect::EMPTY, |r, d| {
-        let rr = d.radius.ceil() as i32 + 1;
-        r.union(&Rect::new(d.center.x as i32 - rr, d.center.y as i32 - rr, d.center.x as i32 + rr + 1, d.center.y as i32 + rr + 1))
-    });
-    // Accumulate stroke coverage (max-combined dabs × flow), then composite once at stroke opacity.
+    // Accumulate stroke coverage (dabs × flow build up), then composite once at stroke opacity.
+    let (bounds, cov) = retouch::stroke_coverage(stroke);
     let w = bounds.width() as usize;
-    let mut cov = vec![0.0f32; w * bounds.height() as usize];
-    for d in &ds {
-        let rr = d.radius.ceil() as i32 + 1;
-        let (cx, cy) = (d.center.x as f32, d.center.y as f32);
-        for y in (d.center.y as i32 - rr)..=(d.center.y as i32 + rr) {
-            for x in (d.center.x as i32 - rr)..=(d.center.x as i32 + rr) {
-                if !bounds.contains(x, y) {
-                    continue;
-                }
-                let dist = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
-                let c = dab_coverage(dist, d.radius, b.hardness) * d.alpha;
-                let i = (y - bounds.y0) as usize * w + (x - bounds.x0) as usize;
-                // flow build-up within the stroke, capped at 1
-                cov[i] = cov[i] + c * (1.0 - cov[i]);
-            }
-        }
-    }
     let fmt = target.format();
     let mut region = target.read_region(bounds);
     let n = fmt.channels();
     for (i, c) in cov.iter().enumerate() {
         let x = bounds.x0 + (i % w) as i32;
         let y = bounds.y0 + (i / w) as i32;
-        let sel = selection.map_or(1.0, |s| s.pixel(x, y)[0]);
+        let sel = selection.map_or(1.0, |s| s.sample_channel(x, y, 0));
         let k = (c * b.opacity * sel).min(1.0);
         if k <= 0.0 {
             continue;
@@ -185,7 +166,8 @@ pub fn apply_stroke(target: &mut Surface, stroke: &Stroke, selection: Option<&Su
             }
             o
         };
-        let enc = from_rgba(&fmt, out);
+        let mut enc = [0.0f32; 8];
+        photocraft_raster::from_rgba_into(&fmt, out, &mut enc);
         px.copy_from_slice(&enc[..n]);
     }
     target.write_region(bounds, &region);

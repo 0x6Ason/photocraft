@@ -48,6 +48,8 @@ pub(crate) struct Ctx<'a> {
     pub cc: usize,
     pub cmyk: bool,
     pub warnings: Vec<String>,
+    /// Document resolution (type sizes are converted to points with it).
+    pub dpi: f32,
 }
 
 fn doc_mode(m: PsdMode) -> Option<ColorMode> {
@@ -198,16 +200,15 @@ impl Ctx<'_> {
                 _ => adjust_map::Channels::Other,
             }))
         } else if rec.block(b"TySh").is_some() {
-            let (text, transform) = rec.block(b"TySh").and_then(|b| blocks::parse_tysh(&b.data)).unwrap_or_default();
-            LayerContent::Text(TextLayer {
-                text,
-                font_family: String::new(),
-                size_pt: 0.0,
-                color: photocraft_color::Color::BLACK,
-                transform,
-                cache: Some(self.record_surface(rec, &name)),
-                psd_raw: principal(b"TySh"),
-            })
+            // Typed model from TySh/EngineData (photocraft-text); Photoshop's pixels stay the cache.
+            let data = rec.block(b"TySh").map(|b| b.data.clone()).unwrap_or_default();
+            let mut t = photocraft_text::psd::text_layer_from_tysh(&data, self.dpi).unwrap_or_else(|| {
+                let (text, transform) = blocks::parse_tysh(&data).unwrap_or_default();
+                TextLayer { text, transform, ..Default::default() }
+            });
+            t.cache = Some(self.record_surface(rec, &name));
+            t.psd_raw = principal(b"TySh");
+            LayerContent::Text(t)
         } else if let Some(k) = smart_key {
             let (id, transform) = rec.block(k).map(|b| blocks::parse_smart(k, &b.data)).unwrap_or_default();
             LayerContent::Smart(SmartObject {
@@ -217,13 +218,12 @@ impl Ctx<'_> {
                 cache: Some(self.record_surface(rec, &name)),
                 psd_raw: principal(k),
             })
-        } else if (vector_key.is_some() && fill_key.is_some()) || rec.block(b"vscg").is_some() {
+        } else if (vector_key.is_some() && (fill_key.is_some() || rec.block(b"vstk").is_some())) || rec.block(b"vscg").is_some() {
             let fill = fill_key.and_then(|k| rec.block(k).and_then(|b| blocks::parse_fill(k, &b.data)));
-            LayerContent::Shape(ShapeLayer {
-                fill,
-                cache: Some(self.record_surface(rec, &name)),
-                psd_raw: vector_key.and_then(principal),
-            })
+            let mut sh = ShapeLayer { fill, cache: Some(self.record_surface(rec, &name)), psd_raw: vector_key.and_then(principal), ..Default::default() };
+            let lookup = |k: &[u8; 4]| rec.block(k).map(|b| b.data.clone());
+            crate::vector_map::shape_from_blocks(&mut sh, &lookup, self.file.header.width, self.file.header.height, self.dpi);
+            LayerContent::Shape(sh)
         } else if let Some(k) = fill_key {
             match rec.block(k).and_then(|b| blocks::parse_fill(k, &b.data)) {
                 Some(f) => {
@@ -252,7 +252,28 @@ impl Ctx<'_> {
         if rendered && rec.layer_mask().is_some_and(|m| m.flags & 8 != 0) {
             l.mask = None;
         }
+        if !matches!(l.content, LayerContent::Shape(_)) {
+            self.apply_vector_mask(&mut l, rec);
+        }
         l
+    }
+
+    /// Typed vector mask from `vsms`/`vmsk` (non-shape layers). A user mask that Photoshop
+    /// rendered from the vector data (flag bit 3, no separate real mask) is dropped: the
+    /// compositor rasterizes the vector mask itself.
+    fn apply_vector_mask(&mut self, l: &mut Layer, rec: &LayerRecord) {
+        let Some(b) = rec.block(b"vsms").or_else(|| rec.block(b"vmsk")) else { return };
+        let Some(mut vm) = crate::vector_map::vector_mask_from_block(&b.data, self.file.header.width, self.file.header.height) else { return };
+        if let Some(m) = rec.layer_mask() {
+            if let Some(p) = m.parameters {
+                vm.density = p.vector_density.map_or(1.0, |d| f32::from(d) / 255.0);
+                vm.feather = p.vector_feather.map_or(0.0, |f| f as f32);
+            }
+            if m.flags & 8 != 0 && m.real.is_none() {
+                l.mask = None;
+            }
+        }
+        l.vector_mask = Some(vm);
     }
 
     fn build(&mut self, nodes: &[LayerNode]) -> Vec<Layer> {
@@ -269,6 +290,7 @@ impl Ctx<'_> {
                     let mut l = Layer::new(rec.name(), LayerContent::Group(Group { children, expanded }));
                     l.psd_blocks = preserved_blocks(rec);
                     self.apply_common(&mut l, rec, sd.and_then(|s| s.blend_mode));
+                    self.apply_vector_mask(&mut l, rec);
                     l
                 }
             })
@@ -348,6 +370,26 @@ pub fn psd_to_document(file: &PsdFile) -> (Document, Vec<String>) {
                     }
                 }
             }
+            id if crate::vector_map::SAVED_PATHS.contains(&id) => {
+                match crate::vector_map::path_from_resource(&r.data, h.width, h.height) {
+                    Some(path) => doc.paths.push(photocraft_doc::NamedPath {
+                        name: String::from_utf8_lossy(&r.name).into_owned(),
+                        path,
+                        psd_raw: Some(Arc::new(r.data.clone())),
+                    }),
+                    None => doc.metadata.psd_resources.push((id, String::from_utf8_lossy(&r.name).into_owned(), Arc::new(r.data.clone()))),
+                }
+            }
+            crate::vector_map::WORK_PATH => {
+                doc.work_path = crate::vector_map::path_from_resource(&r.data, h.width, h.height);
+            }
+            crate::vector_map::CLIPPING_PATH => {
+                // Kept raw (layout beyond the name is not modelled); the name is exposed.
+                let n = usize::from(r.data.first().copied().unwrap_or(0));
+                let name = r.data.get(1..1 + n).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+                doc.clipping_path = Some(photocraft_doc::ClippingPath { name, flatness: 0.0 });
+                doc.metadata.psd_resources.push((r.id, String::from_utf8_lossy(&r.name).into_owned(), Arc::new(r.data.clone())));
+            }
             id if MAPPED_RESOURCES.contains(&id) => {}
             id => doc.metadata.psd_resources.push((id, String::from_utf8_lossy(&r.name).into_owned(), Arc::new(r.data.clone()))),
         }
@@ -365,6 +407,7 @@ pub fn psd_to_document(file: &PsdFile) -> (Document, Vec<String>) {
         cc,
         cmyk: fmt.mode == ColorMode::Cmyk,
         warnings,
+        dpi: doc.resolution_dpi,
     };
 
     let (w, hh) = (h.width as usize, h.height as usize);
