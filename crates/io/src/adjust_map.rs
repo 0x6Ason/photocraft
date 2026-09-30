@@ -1,0 +1,367 @@
+//! Mapping between PSD adjustment-layer blocks and [`Adjustment`].
+//!
+//! Binary layouts follow the Adobe spec ("Adjustment layer" section). The
+//! mapped subset keeps the master/composite parameters; other channels of
+//! Levels/Curves/Hue-Sat are written back with defaults.
+
+use photocraft_doc::Adjustment;
+use photocraft_doc::adjust::{CurvePoint, LevelsChannel};
+use photocraft_psd::descriptor::{Descriptor, Value, VersionedDescriptor};
+
+/// All PSD adjustment keys recognized as adjustment layers.
+pub const ADJUSTMENT_KEYS: [&[u8; 4]; 16] = [
+    b"levl", b"curv", b"hue2", b"brit", b"nvrt", b"thrs", b"post", b"expA", b"vibA", b"blnc", b"mixr", b"grdm", b"phfl",
+    b"selc", b"blwh", b"clrL",
+];
+
+fn be16(d: &[u8], at: usize) -> Option<u16> {
+    d.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]))
+}
+fn bei16(d: &[u8], at: usize) -> Option<i16> {
+    be16(d, at).map(|v| v as i16)
+}
+fn bef32(d: &[u8], at: usize) -> Option<f32> {
+    d.get(at..at + 4).map(|b| f32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn unsupported(key: &[u8; 4], data: &[u8]) -> Adjustment {
+    Adjustment::Unsupported { psd_key: String::from_utf8_lossy(key).into_owned(), raw: data.to_vec() }
+}
+
+fn levels_rec(d: &[u8], at: usize) -> Option<LevelsChannel> {
+    Some(LevelsChannel {
+        in_black: f32::from(be16(d, at)?) / 255.0,
+        in_white: f32::from(be16(d, at + 2)?) / 255.0,
+        out_black: f32::from(be16(d, at + 4)?) / 255.0,
+        out_white: f32::from(be16(d, at + 6)?) / 255.0,
+        gamma: f32::from(be16(d, at + 8)?) / 100.0,
+    })
+}
+
+fn parse_curves(d: &[u8]) -> Option<Adjustment> {
+    // pad(1) version(2) bitmap(4)
+    let version = be16(d, 1)?;
+    if version != 1 && version != 4 {
+        return None;
+    }
+    let bits = u32::from_be_bytes(d.get(3..7)?.try_into().ok()?);
+    let mut at = 7;
+    let line = || vec![CurvePoint { input: 0.0, output: 0.0 }, CurvePoint { input: 1.0, output: 1.0 }];
+    let mut curves: Vec<Vec<CurvePoint>> = vec![line(), line(), line(), line()];
+    for bit in 0..32usize {
+        if bits & (1 << bit) == 0 {
+            continue;
+        }
+        let n = usize::from(be16(d, at)?);
+        at += 2;
+        let mut pts = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            let out = be16(d, at)?;
+            let inp = be16(d, at + 2)?;
+            at += 4;
+            pts.push(CurvePoint { input: f32::from(inp) / 255.0, output: f32::from(out) / 255.0 });
+        }
+        if let Some(slot) = curves.get_mut(bit) {
+            *slot = pts;
+        }
+    }
+    let mut it = curves.into_iter();
+    let master = it.next()?;
+    let (r, g, b) = (it.next()?, it.next()?, it.next()?);
+    Some(Adjustment::Curves { master, per_channel: [r, g, b] })
+}
+
+fn desc_num(d: &Descriptor, key: &str) -> Option<f32> {
+    match d.get(key)? {
+        Value::Integer(v) => Some(*v as f32),
+        Value::Double(v) => Some(*v as f32),
+        Value::UnitFloat { value, .. } => Some(*value as f32),
+        _ => None,
+    }
+}
+
+fn desc_bool(d: &Descriptor, key: &str) -> Option<bool> {
+    match d.get(key)? {
+        Value::Boolean(b) => Some(*b),
+        _ => None,
+    }
+}
+
+/// Channel interpretation of per-channel Levels/Curves records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channels {
+    /// Records 1..=3 are R, G, B.
+    Rgb,
+    /// Record 1 is the gray channel (applied to all three display channels).
+    Gray,
+    /// Channel records do not map to display RGB (CMYK, Lab); ignored.
+    Other,
+}
+
+/// Parses an adjustment block. `cged` is the optional `CgEd` block data
+/// (modern brightness/contrast parameters). Levels/Curves store the
+/// composite record first, then one per document channel (see [`Channels`]).
+pub fn parse(key: &[u8; 4], data: &[u8], cged: Option<&[u8]>, channels: Channels) -> Adjustment {
+    let mut a = parse_any(key, data, cged);
+    match (&mut a, channels) {
+        (_, Channels::Rgb) => {}
+        (Adjustment::Levels { per_channel, .. }, Channels::Gray) => {
+            let g = per_channel[0].clone();
+            *per_channel = [g.clone(), g.clone(), g];
+        }
+        (Adjustment::Curves { per_channel, .. }, Channels::Gray) => {
+            let g = per_channel[0].clone();
+            *per_channel = [g.clone(), g.clone(), g];
+        }
+        (Adjustment::Levels { per_channel, .. }, Channels::Other) => *per_channel = Default::default(),
+        (Adjustment::Curves { per_channel, .. }, Channels::Other) => {
+            let line = || vec![CurvePoint { input: 0.0, output: 0.0 }, CurvePoint { input: 1.0, output: 1.0 }];
+            *per_channel = [line(), line(), line()];
+        }
+        _ => {}
+    }
+    a
+}
+
+fn parse_any(key: &[u8; 4], data: &[u8], cged: Option<&[u8]>) -> Adjustment {
+    let parsed = match key {
+        b"nvrt" => Some(Adjustment::Invert),
+        b"thrs" => be16(data, 0).map(|v| Adjustment::Threshold { level: f32::from(v) / 255.0 }),
+        b"post" => be16(data, 0).map(|v| Adjustment::Posterize { levels: u32::from(v) }),
+        b"brit" => {
+            let modern = cged.and_then(|c| VersionedDescriptor::parse_prefix(c).ok()).and_then(|(v, _)| {
+                let d = v.descriptor;
+                Some(Adjustment::BrightnessContrast {
+                    brightness: desc_num(&d, "Brgh")?,
+                    contrast: desc_num(&d, "Cntr")?,
+                    legacy: desc_bool(&d, "useLegacy").unwrap_or(false),
+                })
+            });
+            modern.or_else(|| {
+                Some(Adjustment::BrightnessContrast {
+                    brightness: f32::from(bei16(data, 0)?),
+                    contrast: f32::from(bei16(data, 2)?),
+                    legacy: true,
+                })
+            })
+        }
+        b"hue2" => (|| {
+            let colorize = *data.get(2)? != 0;
+            let base = if colorize { 4 } else { 10 };
+            Some(Adjustment::HueSaturation {
+                hue: f32::from(bei16(data, base)?),
+                saturation: f32::from(bei16(data, base + 2)?),
+                lightness: f32::from(bei16(data, base + 4)?),
+                colorize,
+            })
+        })(),
+        b"expA" => (|| {
+            Some(Adjustment::Exposure { exposure: bef32(data, 2)?, offset: bef32(data, 6)?, gamma: bef32(data, 10)? })
+        })(),
+        b"levl" => (|| {
+            let m = levels_rec(data, 2)?;
+            let r = levels_rec(data, 12)?;
+            let g = levels_rec(data, 22)?;
+            let b = levels_rec(data, 32)?;
+            Some(Adjustment::Levels { master: m, per_channel: [r, g, b] })
+        })(),
+        b"curv" => parse_curves(data),
+        _ => None,
+    };
+    parsed.unwrap_or_else(|| unsupported(key, data))
+}
+
+fn put16(v: &mut Vec<u8>, x: u16) {
+    v.extend_from_slice(&x.to_be_bytes());
+}
+fn q255(v: f32) -> u16 {
+    (v.clamp(0.0, 1.0) * 255.0).round() as u16
+}
+fn clamp_i16(v: f32) -> i16 {
+    v.round().clamp(-32768.0, 32767.0) as i16
+}
+
+fn levels_write(v: &mut Vec<u8>, c: &LevelsChannel) {
+    put16(v, q255(c.in_black));
+    put16(v, q255(c.in_white));
+    put16(v, q255(c.out_black));
+    put16(v, q255(c.out_white));
+    put16(v, (c.gamma * 100.0).round().clamp(1.0, 999.0) as u16);
+}
+
+/// Serializes an adjustment into its PSD blocks: `(key, data)` pairs
+/// (Brightness/Contrast also writes a `CgEd` descriptor).
+pub fn write(adj: &Adjustment) -> Vec<([u8; 4], Vec<u8>)> {
+    let mut v = Vec::new();
+    match adj {
+        Adjustment::Invert => return vec![(*b"nvrt", Vec::new())],
+        Adjustment::Threshold { level } => {
+            put16(&mut v, q255(*level).max(1));
+            put16(&mut v, 0);
+            return vec![(*b"thrs", v)];
+        }
+        Adjustment::Posterize { levels } => {
+            put16(&mut v, (*levels).clamp(2, 255) as u16);
+            put16(&mut v, 0);
+            return vec![(*b"post", v)];
+        }
+        Adjustment::BrightnessContrast { brightness, contrast, legacy } => {
+            v.extend_from_slice(&clamp_i16(*brightness).to_be_bytes());
+            v.extend_from_slice(&clamp_i16(*contrast).to_be_bytes());
+            put16(&mut v, 127);
+            v.push(0);
+            let d = Descriptor::new("null")
+                .with("Vrsn", Value::Integer(1))
+                .with("Brgh", Value::Integer(brightness.round() as i32))
+                .with("Cntr", Value::Integer(contrast.round() as i32))
+                .with("means", Value::Integer(127))
+                .with("Lab ", Value::Boolean(false))
+                .with("useLegacy", Value::Boolean(*legacy))
+                .with("Auto", Value::Boolean(false));
+            return vec![(*b"brit", v), (*b"CgEd", VersionedDescriptor::new(d).to_bytes())];
+        }
+        Adjustment::HueSaturation { hue, saturation, lightness, colorize } => {
+            put16(&mut v, 2);
+            v.push(u8::from(*colorize));
+            v.push(0);
+            for _ in 0..2 {
+                for x in [hue, saturation, lightness] {
+                    v.extend_from_slice(&clamp_i16(*x).to_be_bytes());
+                }
+            }
+            // Six default hue ranges (reds, yellows, greens, cyans, blues, magentas).
+            let ranges: [[u16; 4]; 6] = [
+                [315, 345, 15, 45],
+                [15, 45, 75, 105],
+                [75, 105, 135, 165],
+                [135, 165, 195, 225],
+                [195, 225, 255, 285],
+                [255, 285, 315, 345],
+            ];
+            for r in ranges {
+                for x in r {
+                    put16(&mut v, x);
+                }
+                v.extend_from_slice(&[0; 6]);
+            }
+            return vec![(*b"hue2", v)];
+        }
+        Adjustment::Exposure { exposure, offset, gamma } => {
+            put16(&mut v, 1);
+            for x in [exposure, offset, gamma] {
+                v.extend_from_slice(&x.to_be_bytes());
+            }
+            v.push(1); // color space flag (spec: "1 byte")
+            return vec![(*b"expA", v)];
+        }
+        Adjustment::Levels { master, per_channel } => {
+            put16(&mut v, 2);
+            levels_write(&mut v, master);
+            for c in per_channel {
+                levels_write(&mut v, c);
+            }
+            for _ in 4..29 {
+                levels_write(&mut v, &LevelsChannel::default());
+            }
+            return vec![(*b"levl", v)];
+        }
+        Adjustment::Curves { master, per_channel } => {
+            v.push(0);
+            put16(&mut v, 1);
+            v.extend_from_slice(&0b1111u32.to_be_bytes());
+            for c in std::iter::once(master).chain(per_channel.iter()) {
+                put16(&mut v, c.len().min(19) as u16);
+                for p in c.iter().take(19) {
+                    put16(&mut v, q255(p.output));
+                    put16(&mut v, q255(p.input));
+                }
+            }
+            return vec![(*b"curv", v)];
+        }
+        Adjustment::Unsupported { psd_key, raw } => {
+            let k = psd_key.as_bytes();
+            if k.len() == 4 {
+                return vec![([k[0], k[1], k[2], k[3]], raw.clone())];
+            }
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rt(a: Adjustment) {
+        let blocks = write(&a);
+        assert!(!blocks.is_empty(), "{a:?}");
+        let cged = blocks.iter().find(|b| &b.0 == b"CgEd").map(|b| &b.1[..]);
+        let back = parse(&blocks[0].0, &blocks[0].1, cged, Channels::Rgb);
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn roundtrips() {
+        rt(Adjustment::Invert);
+        rt(Adjustment::Threshold { level: 128.0 / 255.0 });
+        rt(Adjustment::Posterize { levels: 4 });
+        rt(Adjustment::BrightnessContrast { brightness: 20.0, contrast: -10.0, legacy: false });
+        rt(Adjustment::BrightnessContrast { brightness: -150.0, contrast: 100.0, legacy: true });
+        rt(Adjustment::HueSaturation { hue: 30.0, saturation: -20.0, lightness: 5.0, colorize: false });
+        rt(Adjustment::HueSaturation { hue: 200.0, saturation: 50.0, lightness: 0.0, colorize: true });
+        rt(Adjustment::Exposure { exposure: 1.5, offset: -0.01, gamma: 0.9 });
+        let lc = |a: u16, b: u16| LevelsChannel {
+            in_black: f32::from(a) / 255.0,
+            in_white: f32::from(b) / 255.0,
+            gamma: 1.2,
+            out_black: 0.0,
+            out_white: 1.0,
+        };
+        rt(Adjustment::Levels { master: lc(10, 240), per_channel: [lc(0, 255), lc(5, 250), lc(20, 200)] });
+        let pts = |v: &[(u8, u8)]| {
+            v.iter().map(|&(i, o)| CurvePoint { input: f32::from(i) / 255.0, output: f32::from(o) / 255.0 }).collect::<Vec<_>>()
+        };
+        rt(Adjustment::Curves {
+            master: pts(&[(0, 0), (128, 150), (255, 255)]),
+            per_channel: [pts(&[(0, 10), (255, 255)]), pts(&[(0, 0), (255, 245)]), pts(&[(0, 0), (64, 32), (255, 255)])],
+        });
+        rt(Adjustment::Unsupported { psd_key: "selc".into(), raw: vec![1, 2, 3] });
+    }
+
+    #[test]
+    fn malformed_falls_back_to_unsupported() {
+        assert!(matches!(parse(b"levl", &[0, 2, 1], None, Channels::Rgb), Adjustment::Unsupported { .. }));
+        assert!(matches!(parse(b"curv", &[0, 0, 9], None, Channels::Rgb), Adjustment::Unsupported { .. }));
+        assert!(matches!(parse(b"thrs", &[], None, Channels::Rgb), Adjustment::Unsupported { .. }));
+        assert!(matches!(parse(b"blnc", &[0; 40], None, Channels::Rgb), Adjustment::Unsupported { .. }));
+    }
+
+    #[test]
+    fn non_rgb_ignores_channel_records() {
+        let lc = LevelsChannel { in_black: 0.1, ..Default::default() };
+        let a = Adjustment::Levels { master: LevelsChannel::default(), per_channel: [lc.clone(), lc.clone(), lc] };
+        let b = write(&a);
+        match parse(&b[0].0, &b[0].1, None, Channels::Other) {
+            Adjustment::Levels { per_channel, .. } => assert_eq!(per_channel, <[LevelsChannel; 3]>::default()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn gray_uses_first_channel_record_for_all() {
+        let lc = LevelsChannel { in_black: 44.0 / 255.0, ..Default::default() };
+        let a = Adjustment::Levels { master: LevelsChannel::default(), per_channel: [lc.clone(), Default::default(), Default::default()] };
+        let b = write(&a);
+        match parse(&b[0].0, &b[0].1, None, Channels::Gray) {
+            Adjustment::Levels { per_channel, .. } => assert_eq!(per_channel, [lc.clone(), lc.clone(), lc]),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_brit_without_cged() {
+        let a = parse(b"brit", &[0, 10, 0xff, 0xf6, 0, 127, 0], None, Channels::Rgb);
+        assert_eq!(a, Adjustment::BrightnessContrast { brightness: 10.0, contrast: -10.0, legacy: true });
+    }
+}

@@ -1,0 +1,634 @@
+//! The Photocraft document model: pure data, no rendering, no UI.
+//!
+//! Layer order: inside every group (and the root), `children[0]` is the **bottom** layer, matching
+//! compositing order and the PSD file order. UIs display the list reversed.
+//!
+//! Non-destructive kinds (adjustment, fill, text, shape, smart object) and colour modes beyond RGB are
+//! part of the model from day one, even where rendering support lands later (architecture §1.1).
+#![forbid(unsafe_code)]
+
+pub mod adjust;
+pub mod effects;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub use adjust::Adjustment;
+pub use effects::{
+    Bevel, BevelStyle, BevelTechnique, Contour, Effect, FxCommon, FxPaint, GlobalLight, Glow, GlowSource, GlowTechnique, Gradient,
+    GradientStyle, Satin, Shadow, StrokeFx, StrokePosition,
+};
+pub use photocraft_color::{BlendMode, Color, ColorMode, PixelFormat, SampleType};
+pub use photocraft_geom::{Affine, Rect, Size};
+pub use photocraft_raster::Surface;
+use serde::{Deserialize, Serialize};
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_id() -> u64 {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LayerId(pub u64);
+
+impl LayerId {
+    pub fn fresh() -> Self {
+        LayerId(next_id())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DocId(pub u64);
+
+impl DocId {
+    pub fn fresh() -> Self {
+        DocId(next_id())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Locks {
+    pub transparency: bool,
+    pub pixels: bool,
+    pub position: bool,
+    pub artboard: bool,
+    pub all: bool,
+}
+
+/// Photoshop layer colour labels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LabelColor {
+    #[default]
+    None,
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Blue,
+    Violet,
+    Gray,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerMask {
+    /// Grayscale surface; untouched pixels read as `default` (0 = hide, 1 = reveal).
+    pub surface: Surface,
+    pub enabled: bool,
+    pub linked: bool,
+    pub density: f32,
+    pub feather: f32,
+}
+
+impl LayerMask {
+    pub fn reveal_all() -> Self {
+        Self { surface: Surface::with_default(PixelFormat::GRAY8, &[1.0]), enabled: true, linked: true, density: 1.0, feather: 0.0 }
+    }
+    pub fn hide_all() -> Self {
+        Self { surface: Surface::with_default(PixelFormat::GRAY8, &[0.0]), ..Self::reveal_all() }
+    }
+    /// Effective mask value at a pixel, including density.
+    pub fn value(&self, x: i32, y: i32) -> f32 {
+        if !self.enabled {
+            return 1.0;
+        }
+        let v = self.surface.pixel(x, y)[0];
+        1.0 - self.density * (1.0 - v)
+    }
+}
+
+/// Layer styles. Parsed PSD effect data is kept raw until the effects engine lands (M9).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Effects {
+    pub enabled: bool,
+    pub items: Vec<Effect>,
+    /// Original PSD `lfx2` (`lfxs` on groups) block data (object-effects version + descriptor),
+    /// written back verbatim on PSD export. Not duplicated in `Layer::psd_blocks`.
+    pub psd_raw: Option<Arc<Vec<u8>>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Group {
+    pub children: Vec<Layer>,
+    pub expanded: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Fill {
+    Solid(Color),
+    /// Gradient between stops at `angle` degrees (`style` geometry, optionally reversed).
+    Gradient { stops: Vec<(f32, Color)>, angle: f32, scale: f32, style: GradientStyle, reverse: bool },
+    Pattern { name: String, scale: f32 },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextLayer {
+    pub text: String,
+    pub font_family: String,
+    pub size_pt: f32,
+    pub color: Color,
+    pub transform: Affine,
+    /// Rasterized appearance (from PSD or our text engine).
+    pub cache: Option<Surface>,
+    /// Data of the PSD `TySh` block. On export it replaces the `TySh` entry in
+    /// [`Layer::psd_blocks`] (the text engine updates this field when it edits text).
+    pub psd_raw: Option<Arc<Vec<u8>>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShapeLayer {
+    pub fill: Option<Fill>,
+    pub cache: Option<Surface>,
+    /// Data of the PSD vector mask block (`vsms`, else `vmsk`). On export it
+    /// replaces that entry in [`Layer::psd_blocks`].
+    pub psd_raw: Option<Arc<Vec<u8>>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SmartObject {
+    /// Embedded source file bytes (PSD, PNG, …) or linked path.
+    pub source: SmartSource,
+    pub transform: Affine,
+    pub smart_filters: Vec<SmartFilter>,
+    /// Rendered appearance.
+    pub cache: Option<Surface>,
+    /// Data of the PSD placed-layer block (`SoLd`, `PlLd` or `SoLE`). On export
+    /// it replaces that entry in [`Layer::psd_blocks`].
+    pub psd_raw: Option<Arc<Vec<u8>>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SmartSource {
+    Embedded { file_name: String, bytes: Arc<Vec<u8>> },
+    Linked { path: String },
+}
+
+/// A filter applied non-destructively: a command id plus its parameters (data, not code).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SmartFilter {
+    pub command: String,
+    pub params: serde_json::Value,
+    pub blend: BlendMode,
+    pub opacity: f32,
+    pub visible: bool,
+}
+
+/// Pixels rendered by another application (Photoshop) for a fill layer.
+///
+/// Used by the compositor instead of rendering [`Fill`] itself, but only while
+/// `fill` still equals the layer's current fill (editing the fill invalidates
+/// the cache automatically).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FillCache {
+    /// The fill these pixels were rendered for.
+    pub fill: Fill,
+    /// Rendered pixels in document coordinates.
+    pub surface: Surface,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayerContent {
+    Raster(Surface),
+    Group(Group),
+    Adjustment(Adjustment),
+    Fill(Fill),
+    Text(TextLayer),
+    Shape(ShapeLayer),
+    Smart(SmartObject),
+}
+
+impl LayerContent {
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            LayerContent::Raster(_) => "Pixel",
+            LayerContent::Group(_) => "Group",
+            LayerContent::Adjustment(_) => "Adjustment",
+            LayerContent::Fill(_) => "Fill",
+            LayerContent::Text(_) => "Type",
+            LayerContent::Shape(_) => "Shape",
+            LayerContent::Smart(_) => "Smart Object",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Layer {
+    pub id: LayerId,
+    pub name: String,
+    pub visible: bool,
+    pub locks: Locks,
+    pub blend: BlendMode,
+    /// Layer opacity (applies to content and effects).
+    pub opacity: f32,
+    /// Fill opacity (applies to content but not effects).
+    pub fill_opacity: f32,
+    /// Clipped to the layer below (clipping mask).
+    pub clipped: bool,
+    pub mask: Option<LayerMask>,
+    pub effects: Effects,
+    pub label: LabelColor,
+    pub content: LayerContent,
+    /// Preserved PSD additional-layer-info blocks (key, data) for lossless
+    /// round-trip of anything not modelled above: vector masks, blending
+    /// options, layer version, and the original adjustment/fill blocks (the
+    /// PSD writer reuses an adjustment or fill block verbatim while it still
+    /// decodes to the layer's current parameters, so Levels/Curves/Hue-Sat
+    /// extras survive). Keys regenerated from the fields above (`luni`,
+    /// `lyid`, `lsct`, `lsdk`, `iOpa`, `lspf`, `lclr`, `lfx2`) are not stored.
+    pub psd_blocks: Vec<([u8; 4], Arc<Vec<u8>>)>,
+    /// PSD layer id (`lyid`), kept so ids stay stable across round trips.
+    /// Cleared by [`Layer::duplicate`].
+    pub psd_id: Option<u32>,
+    /// Photoshop-rendered pixels for fill layers (see [`FillCache`]).
+    pub fill_cache: Option<FillCache>,
+}
+
+impl Layer {
+    pub fn new(name: impl Into<String>, content: LayerContent) -> Self {
+        Layer {
+            id: LayerId::fresh(),
+            name: name.into(),
+            visible: true,
+            locks: Locks::default(),
+            blend: BlendMode::Normal,
+            opacity: 1.0,
+            fill_opacity: 1.0,
+            clipped: false,
+            mask: None,
+            effects: Effects { enabled: true, ..Default::default() },
+            label: LabelColor::None,
+            content,
+            psd_blocks: Vec::new(),
+            psd_id: None,
+            fill_cache: None,
+        }
+    }
+    pub fn raster(name: impl Into<String>, format: PixelFormat) -> Self {
+        Self::new(name, LayerContent::Raster(Surface::new(format)))
+    }
+    pub fn group(name: impl Into<String>, children: Vec<Layer>) -> Self {
+        let mut l = Self::new(name, LayerContent::Group(Group { children, expanded: true }));
+        l.blend = BlendMode::PassThrough;
+        l
+    }
+    pub fn is_group(&self) -> bool {
+        matches!(self.content, LayerContent::Group(_))
+    }
+    pub fn children(&self) -> Option<&[Layer]> {
+        match &self.content {
+            LayerContent::Group(g) => Some(&g.children),
+            _ => None,
+        }
+    }
+    pub fn children_mut(&mut self) -> Option<&mut Vec<Layer>> {
+        match &mut self.content {
+            LayerContent::Group(g) => Some(&mut g.children),
+            _ => None,
+        }
+    }
+    pub fn surface(&self) -> Option<&Surface> {
+        match &self.content {
+            LayerContent::Raster(s) => Some(s),
+            LayerContent::Text(t) => t.cache.as_ref(),
+            LayerContent::Shape(s) => s.cache.as_ref(),
+            LayerContent::Smart(s) => s.cache.as_ref(),
+            _ => None,
+        }
+    }
+    pub fn surface_mut(&mut self) -> Option<&mut Surface> {
+        match &mut self.content {
+            LayerContent::Raster(s) => Some(s),
+            _ => None,
+        }
+    }
+    /// Deep copy with fresh ids (for Duplicate Layer).
+    pub fn duplicate(&self) -> Layer {
+        let mut l = self.clone();
+        l.reassign_ids();
+        l
+    }
+    fn reassign_ids(&mut self) {
+        self.id = LayerId::fresh();
+        self.psd_id = None;
+        if let Some(ch) = self.children_mut() {
+            for c in ch {
+                c.reassign_ids();
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Guides {
+    pub horizontal: Vec<f32>,
+    pub vertical: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlphaChannel {
+    pub name: String,
+    pub surface: Surface,
+    /// Spot colour channels carry their ink colour and solidity.
+    pub spot: Option<(Color, f32)>,
+}
+
+/// A raw PSD global tagged block: (signature, key, data).
+pub type PsdGlobalBlock = ([u8; 4], [u8; 4], Arc<Vec<u8>>);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Metadata {
+    pub xmp: Option<String>,
+    pub exif: Option<Arc<Vec<u8>>>,
+    /// Raw PSD image resources we don't model yet: (id, name, data), for lossless round-trip.
+    pub psd_resources: Vec<(u16, String, Arc<Vec<u8>>)>,
+    /// Raw PSD global additional-layer-info blocks: (signature, key, data),
+    /// e.g. `lnk2` embedded smart-object files, `Patt` patterns, `Txt2`.
+    pub psd_global_blocks: Vec<PsdGlobalBlock>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Document {
+    pub id: DocId,
+    pub name: String,
+    pub size: Size,
+    pub resolution_dpi: f32,
+    pub mode: ColorMode,
+    pub depth: SampleType,
+    pub icc_profile: Option<Arc<Vec<u8>>>,
+    /// Bottom-to-top.
+    pub layers: Vec<Layer>,
+    pub channels: Vec<AlphaChannel>,
+    pub guides: Guides,
+    /// Active selection as a grayscale coverage surface (None = no selection).
+    pub selection: Option<Surface>,
+    pub metadata: Metadata,
+    /// Global light used by layer effects (PSD resources 1037/1049).
+    pub global_light: GlobalLight,
+}
+
+/// Where a layer lives in the tree: indices from the root down.
+pub type LayerPath = Vec<usize>;
+
+impl Document {
+    pub fn new(name: impl Into<String>, size: Size, mode: ColorMode, depth: SampleType) -> Self {
+        Document {
+            id: DocId::fresh(),
+            name: name.into(),
+            size,
+            resolution_dpi: 72.0,
+            mode,
+            depth,
+            icc_profile: None,
+            layers: Vec::new(),
+            channels: Vec::new(),
+            guides: Guides::default(),
+            selection: None,
+            metadata: Metadata::default(),
+            global_light: GlobalLight::default(),
+        }
+    }
+
+    /// New document with a filled "Background" layer (like File → New).
+    pub fn with_background(name: impl Into<String>, size: Size, mode: ColorMode, depth: SampleType, fill: Color) -> Self {
+        let mut d = Self::new(name, size, mode, depth);
+        let mut bg = Layer::raster("Background", d.pixel_format());
+        bg.locks.transparency = true;
+        bg.locks.position = true;
+        if let Some(s) = bg.surface_mut() {
+            let rgba = fill.to_rgb();
+            let px = photocraft_raster::from_rgba(&s.format(), [rgba[0], rgba[1], rgba[2], fill.alpha]);
+            s.fill_rect(d.bounds(), &px);
+        }
+        d.layers.push(bg);
+        d
+    }
+
+    /// Pixel format for new raster layers in this document.
+    pub fn pixel_format(&self) -> PixelFormat {
+        let mode = match self.mode {
+            ColorMode::Indexed | ColorMode::Multichannel => ColorMode::Rgb,
+            ColorMode::Bitmap | ColorMode::Duotone => ColorMode::Grayscale,
+            m => m,
+        };
+        PixelFormat::new(mode, self.depth, true)
+    }
+
+    pub fn bounds(&self) -> Rect {
+        Rect::from_size(self.size)
+    }
+
+    /// Depth-first walk yielding `(path, depth, layer)` bottom-to-top.
+    pub fn walk(&self) -> Vec<(LayerPath, usize, &Layer)> {
+        fn rec<'a>(layers: &'a [Layer], prefix: &mut LayerPath, out: &mut Vec<(LayerPath, usize, &'a Layer)>) {
+            for (i, l) in layers.iter().enumerate() {
+                prefix.push(i);
+                out.push((prefix.clone(), prefix.len() - 1, l));
+                if let Some(ch) = l.children() {
+                    rec(ch, prefix, out);
+                }
+                prefix.pop();
+            }
+        }
+        let mut out = Vec::new();
+        rec(&self.layers, &mut Vec::new(), &mut out);
+        out
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.walk().len()
+    }
+
+    pub fn path_of(&self, id: LayerId) -> Option<LayerPath> {
+        self.walk().into_iter().find(|(_, _, l)| l.id == id).map(|(p, _, _)| p)
+    }
+
+    pub fn layer(&self, id: LayerId) -> Option<&Layer> {
+        let path = self.path_of(id)?;
+        self.layer_at(&path)
+    }
+
+    pub fn layer_mut(&mut self, id: LayerId) -> Option<&mut Layer> {
+        let path = self.path_of(id)?;
+        self.layer_at_mut(&path)
+    }
+
+    pub fn layer_at(&self, path: &[usize]) -> Option<&Layer> {
+        let (first, rest) = path.split_first()?;
+        let mut cur = self.layers.get(*first)?;
+        for &i in rest {
+            cur = cur.children()?.get(i)?;
+        }
+        Some(cur)
+    }
+
+    pub fn layer_at_mut(&mut self, path: &[usize]) -> Option<&mut Layer> {
+        let (first, rest) = path.split_first()?;
+        let mut cur = self.layers.get_mut(*first)?;
+        for &i in rest {
+            cur = cur.children_mut()?.get_mut(i)?;
+        }
+        Some(cur)
+    }
+
+    /// The sibling list containing `path` and the index within it.
+    fn siblings_mut(&mut self, path: &[usize]) -> Option<(&mut Vec<Layer>, usize)> {
+        let (&last, parent) = path.split_last()?;
+        if parent.is_empty() {
+            return Some((&mut self.layers, last));
+        }
+        let p = self.layer_at_mut(parent)?;
+        Some((p.children_mut()?, last))
+    }
+
+    /// Insert `layer` directly above the layer `above` (or at the top of the root if None).
+    pub fn insert_above(&mut self, above: Option<LayerId>, layer: Layer) -> LayerId {
+        let id = layer.id;
+        match above.and_then(|a| self.path_of(a)) {
+            Some(path) => {
+                let (sib, idx) = self.siblings_mut(&path).expect("valid path");
+                sib.insert(idx + 1, layer);
+            }
+            None => self.layers.push(layer),
+        }
+        id
+    }
+
+    pub fn remove(&mut self, id: LayerId) -> Option<Layer> {
+        let path = self.path_of(id)?;
+        let (sib, idx) = self.siblings_mut(&path)?;
+        Some(sib.remove(idx))
+    }
+
+    /// Move a layer up (+1) or down (-1) among its siblings. Returns false at the ends.
+    pub fn shift(&mut self, id: LayerId, delta: i32) -> bool {
+        let Some(path) = self.path_of(id) else { return false };
+        let Some((sib, idx)) = self.siblings_mut(&path) else { return false };
+        let to = idx as i64 + delta as i64;
+        if to < 0 || to >= sib.len() as i64 {
+            return false;
+        }
+        let l = sib.remove(idx);
+        sib.insert(to as usize, l);
+        true
+    }
+
+    /// Next unused "Layer N" name.
+    pub fn next_layer_name(&self, base: &str) -> String {
+        let names: std::collections::HashSet<&str> = self.walk().into_iter().map(|(_, _, l)| l.name.as_str()).collect();
+        (1..).map(|n| format!("{base} {n}")).find(|n| !names.contains(n.as_str())).expect("infinite")
+    }
+
+    /// Top-most layer id, useful as the default active layer.
+    pub fn top_layer(&self) -> Option<LayerId> {
+        self.layers.last().map(|l| l.id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc() -> Document {
+        Document::with_background("t", Size::new(100, 50), ColorMode::Rgb, SampleType::U8, Color::WHITE)
+    }
+
+    #[test]
+    fn new_document_has_locked_background() {
+        let d = doc();
+        assert_eq!(d.layers.len(), 1);
+        let bg = &d.layers[0];
+        assert_eq!(bg.name, "Background");
+        assert!(bg.locks.transparency);
+        let s = bg.surface().unwrap();
+        assert_eq!(s.pixel(0, 0), vec![1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(s.pixel(99, 49), vec![1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(s.pixel(100, 0), vec![0.0; 4]);
+    }
+
+    #[test]
+    fn pixel_format_follows_mode_and_depth() {
+        let d = Document::new("c", Size::new(1, 1), ColorMode::Cmyk, SampleType::U16);
+        assert_eq!(d.pixel_format(), PixelFormat::new(ColorMode::Cmyk, SampleType::U16, true));
+        let b = Document::new("b", Size::new(1, 1), ColorMode::Bitmap, SampleType::U8);
+        assert_eq!(b.pixel_format().mode, ColorMode::Grayscale);
+    }
+
+    #[test]
+    fn insert_remove_shift() {
+        let mut d = doc();
+        let bg = d.layers[0].id;
+        let a = d.insert_above(Some(bg), Layer::raster("A", d.pixel_format()));
+        let b = d.insert_above(Some(bg), Layer::raster("B", d.pixel_format()));
+        // order bottom->top: bg, B, A
+        let names: Vec<_> = d.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["Background", "B", "A"]);
+        assert!(d.shift(b, 1));
+        assert_eq!(d.layers[2].id, b);
+        assert!(!d.shift(b, 1));
+        assert_eq!(d.remove(a).unwrap().name, "A");
+        assert!(d.layer(a).is_none());
+    }
+
+    #[test]
+    fn groups_walk_and_paths() {
+        let mut d = doc();
+        let inner = Layer::raster("inner", d.pixel_format());
+        let inner_id = inner.id;
+        let g = Layer::group("G", vec![inner]);
+        let gid = d.insert_above(None, g);
+        let walk: Vec<_> = d.walk().into_iter().map(|(p, depth, l)| (p, depth, l.name.clone())).collect();
+        assert_eq!(walk, vec![(vec![0], 0, "Background".into()), (vec![1], 0, "G".into()), (vec![1, 0], 1, "inner".into())]);
+        assert_eq!(d.path_of(inner_id), Some(vec![1, 0]));
+        assert_eq!(d.layer(gid).unwrap().blend, BlendMode::PassThrough);
+        // insert above a nested layer stays inside the group
+        let n = d.insert_above(Some(inner_id), Layer::raster("n", d.pixel_format()));
+        assert_eq!(d.path_of(n), Some(vec![1, 1]));
+        assert_eq!(d.layer_count(), 4);
+    }
+
+    #[test]
+    fn duplicate_assigns_fresh_ids_recursively() {
+        let g = Layer::group("G", vec![Layer::raster("x", PixelFormat::RGBA8)]);
+        let dup = g.duplicate();
+        assert_ne!(g.id, dup.id);
+        assert_ne!(g.children().unwrap()[0].id, dup.children().unwrap()[0].id);
+        assert_eq!(dup.children().unwrap()[0].name, "x");
+    }
+
+    #[test]
+    fn duplicate_clears_psd_id_but_keeps_blocks() {
+        let mut l = Layer::raster("x", PixelFormat::RGBA8);
+        l.psd_id = Some(7);
+        l.psd_blocks.push((*b"vmsk", Arc::new(vec![1])));
+        let d = l.duplicate();
+        assert_eq!(d.psd_id, None);
+        assert_eq!(d.psd_blocks, l.psd_blocks);
+    }
+
+    #[test]
+    fn layer_names_increment() {
+        let mut d = doc();
+        assert_eq!(d.next_layer_name("Layer"), "Layer 1");
+        d.insert_above(None, Layer::raster("Layer 1", d.pixel_format()));
+        assert_eq!(d.next_layer_name("Layer"), "Layer 2");
+    }
+
+    #[test]
+    fn mask_density() {
+        let mut m = LayerMask::hide_all();
+        assert_eq!(m.value(5, 5), 0.0);
+        m.density = 0.5;
+        assert!((m.value(5, 5) - 0.5).abs() < 1e-6);
+        m.enabled = false;
+        assert_eq!(m.value(5, 5), 1.0);
+    }
+
+    #[test]
+    fn snapshot_clone_is_independent() {
+        let mut d = doc();
+        let snap = d.clone();
+        let bg = d.layers[0].id;
+        d.layer_mut(bg).unwrap().surface_mut().unwrap().write_pixel(0, 0, &[0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(snap.layers[0].surface().unwrap().pixel(0, 0), vec![1.0; 4]);
+    }
+}

@@ -1,1 +1,6 @@
 *~
+plan/
+/target
+/dist
+/corpus
+/log

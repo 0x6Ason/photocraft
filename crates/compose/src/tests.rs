@@ -1,0 +1,568 @@
+use super::*;
+use photocraft_color::{Color, ColorMode, PixelFormat, SampleType};
+use photocraft_doc::adjust::{CurvePoint, LevelsChannel};
+use photocraft_doc::{Adjustment, Document, Fill, Layer, LayerContent, LayerMask};
+use photocraft_geom::Size;
+
+const E: f32 = 2.0 / 255.0;
+
+fn close4(a: [f32; 4], b: [f32; 4]) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x - y).abs() <= E)
+}
+
+fn doc_white(w: u32, h: u32) -> Document {
+    Document::with_background("t", Size::new(w, h), ColorMode::Rgb, SampleType::U8, Color::WHITE)
+}
+
+fn solid_layer(name: &str, rect: Rect, rgba: [f32; 4]) -> Layer {
+    let mut l = Layer::raster(name, PixelFormat::RGBA8);
+    l.surface_mut().unwrap().fill_rect(rect, &rgba);
+    l
+}
+
+fn px(doc: &Document, x: i32, y: i32) -> [f32; 4] {
+    render(doc, Rect::from_xywh(x, y, 1, 1)).px[0]
+}
+
+#[test]
+fn background_only() {
+    let d = doc_white(8, 8);
+    assert!(close4(px(&d, 3, 3), [1.0; 4]));
+    // outside canvas the background layer has no pixels
+    assert!(close4(px(&d, 20, 3), [0.0; 4]));
+}
+
+#[test]
+fn normal_layer_over_background() {
+    let mut d = doc_white(8, 8);
+    d.layers.push(solid_layer("red", Rect::new(0, 0, 4, 8), [1.0, 0.0, 0.0, 1.0]));
+    assert!(close4(px(&d, 1, 1), [1.0, 0.0, 0.0, 1.0]));
+    assert!(close4(px(&d, 5, 1), [1.0; 4]));
+}
+
+#[test]
+fn opacity_and_fill_multiply() {
+    let mut d = doc_white(4, 4);
+    let mut l = solid_layer("k", Rect::new(0, 0, 4, 4), [0.0, 0.0, 0.0, 1.0]);
+    l.opacity = 0.5;
+    l.fill_opacity = 0.5;
+    d.layers.push(l);
+    let p = px(&d, 0, 0);
+    assert!((p[0] - 0.75).abs() <= E, "{p:?}");
+}
+
+#[test]
+fn hidden_layers_skipped() {
+    let mut d = doc_white(4, 4);
+    let mut l = solid_layer("k", Rect::new(0, 0, 4, 4), [0.0, 0.0, 0.0, 1.0]);
+    l.visible = false;
+    d.layers.push(l);
+    assert!(close4(px(&d, 0, 0), [1.0; 4]));
+}
+
+#[test]
+fn every_blend_mode_matches_reference_on_opaque_pixels() {
+    let backdrop = [0.6, 0.3, 0.2, 1.0];
+    let source = [0.2, 0.7, 0.5, 1.0];
+    for mode in BlendMode::LAYER_MODES {
+        if mode == BlendMode::Dissolve {
+            continue;
+        }
+        let mut d = Document::new("b", Size::new(2, 2), ColorMode::Rgb, SampleType::F32);
+        let mut bottom = Layer::raster("b", PixelFormat::RGBA32F);
+        bottom.surface_mut().unwrap().fill_rect(Rect::new(0, 0, 2, 2), &backdrop);
+        let mut top = Layer::raster("t", PixelFormat::RGBA32F);
+        top.surface_mut().unwrap().fill_rect(Rect::new(0, 0, 2, 2), &source);
+        top.blend = mode;
+        d.layers = vec![bottom, top];
+        let got = px(&d, 0, 0);
+        let want = blend::blend_rgb(mode, [0.6, 0.3, 0.2], [0.2, 0.7, 0.5]);
+        for i in 0..3 {
+            assert!((got[i] - want[i]).abs() < 1e-5, "{mode:?}: {got:?} vs {want:?}");
+        }
+        assert!((got[3] - 1.0).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn layer_mask_hides_pixels() {
+    let mut d = doc_white(4, 4);
+    let mut l = solid_layer("k", Rect::new(0, 0, 4, 4), [0.0, 0.0, 0.0, 1.0]);
+    let mut m = LayerMask::reveal_all();
+    m.surface.fill_rect(Rect::new(0, 0, 2, 4), &[0.0]);
+    l.mask = Some(m);
+    d.layers.push(l);
+    assert!(close4(px(&d, 0, 0), [1.0; 4]));
+    assert!(close4(px(&d, 3, 0), [0.0, 0.0, 0.0, 1.0]));
+}
+
+#[test]
+fn disabled_mask_is_ignored() {
+    let mut d = doc_white(2, 2);
+    let mut l = solid_layer("k", Rect::new(0, 0, 2, 2), [0.0, 0.0, 0.0, 1.0]);
+    let mut m = LayerMask::hide_all();
+    m.enabled = false;
+    l.mask = Some(m);
+    d.layers.push(l);
+    assert!(close4(px(&d, 0, 0), [0.0, 0.0, 0.0, 1.0]));
+}
+
+#[test]
+fn clipping_mask_restricts_to_base_alpha() {
+    let mut d = doc_white(8, 8);
+    d.layers.push(solid_layer("base", Rect::new(0, 0, 4, 8), [0.0, 0.0, 1.0, 1.0]));
+    let mut clip = solid_layer("clip", Rect::new(0, 0, 8, 8), [1.0, 0.0, 0.0, 1.0]);
+    clip.clipped = true;
+    d.layers.push(clip);
+    assert!(close4(px(&d, 1, 1), [1.0, 0.0, 0.0, 1.0]), "inside base: clipped layer visible");
+    assert!(close4(px(&d, 6, 1), [1.0; 4]), "outside base: clipped layer hidden");
+}
+
+#[test]
+fn hidden_base_hides_clipping_group() {
+    let mut d = doc_white(4, 4);
+    let mut base = solid_layer("base", Rect::new(0, 0, 4, 4), [0.0, 0.0, 1.0, 1.0]);
+    base.visible = false;
+    d.layers.push(base);
+    let mut clip = solid_layer("clip", Rect::new(0, 0, 4, 4), [1.0, 0.0, 0.0, 1.0]);
+    clip.clipped = true;
+    d.layers.push(clip);
+    assert!(close4(px(&d, 1, 1), [1.0; 4]));
+}
+
+#[test]
+fn isolated_group_differs_from_pass_through() {
+    // A Multiply layer inside a group: pass-through multiplies with the background,
+    // an isolated (Normal) group multiplies only with its own (empty) contents.
+    let make = |blend: BlendMode| {
+        let mut d = doc_white(2, 2);
+        d.layers[0].surface_mut().unwrap().fill_rect(Rect::new(0, 0, 2, 2), &[0.5, 0.5, 0.5, 1.0]);
+        let mut m = solid_layer("m", Rect::new(0, 0, 2, 2), [0.5, 0.5, 0.5, 1.0]);
+        m.blend = BlendMode::Multiply;
+        let mut g = Layer::group("g", vec![m]);
+        g.blend = blend;
+        d.layers.push(g);
+        px(&d, 0, 0)
+    };
+    let pass = make(BlendMode::PassThrough);
+    let iso = make(BlendMode::Normal);
+    assert!((pass[0] - 0.25).abs() <= E, "{pass:?}");
+    assert!((iso[0] - 0.5).abs() <= E, "{iso:?}");
+}
+
+#[test]
+fn group_opacity_applies_once() {
+    let mut d = doc_white(2, 2);
+    let a = solid_layer("a", Rect::new(0, 0, 2, 2), [0.0, 0.0, 0.0, 1.0]);
+    let b = solid_layer("b", Rect::new(0, 0, 2, 2), [0.0, 0.0, 0.0, 1.0]);
+    let mut g = Layer::group("g", vec![a, b]);
+    g.blend = BlendMode::Normal;
+    g.opacity = 0.5;
+    d.layers.push(g);
+    assert!((px(&d, 0, 0)[0] - 0.5).abs() <= E);
+}
+
+#[test]
+fn pass_through_group_opacity_mixes() {
+    let mut d = doc_white(2, 2);
+    let a = solid_layer("a", Rect::new(0, 0, 2, 2), [0.0, 0.0, 0.0, 1.0]);
+    let mut g = Layer::group("g", vec![a]);
+    g.opacity = 0.25;
+    d.layers.push(g);
+    assert!((px(&d, 0, 0)[0] - 0.75).abs() <= E);
+}
+
+#[test]
+fn invert_adjustment_layer() {
+    let mut d = doc_white(2, 2);
+    d.layers[0].surface_mut().unwrap().fill_rect(Rect::new(0, 0, 2, 2), &[0.2, 0.4, 0.6, 1.0]);
+    d.layers.push(Layer::new("inv", LayerContent::Adjustment(Adjustment::Invert)));
+    assert!(close4(px(&d, 0, 0), [0.8, 0.6, 0.4, 1.0]));
+}
+
+#[test]
+fn adjustment_opacity_and_mask() {
+    let mut d = doc_white(4, 1);
+    d.layers[0].surface_mut().unwrap().fill_rect(Rect::new(0, 0, 4, 1), &[0.0, 0.0, 0.0, 1.0]);
+    let mut adj = Layer::new("inv", LayerContent::Adjustment(Adjustment::Invert));
+    adj.opacity = 0.5;
+    let mut m = LayerMask::reveal_all();
+    m.surface.fill_rect(Rect::new(2, 0, 4, 1), &[0.0]);
+    adj.mask = Some(m);
+    d.layers.push(adj);
+    assert!((px(&d, 0, 0)[0] - 0.5).abs() <= E);
+    assert!(px(&d, 3, 0)[0].abs() <= E);
+}
+
+#[test]
+fn clipped_adjustment_only_affects_base() {
+    let mut d = doc_white(4, 1);
+    d.layers.push(solid_layer("base", Rect::new(0, 0, 2, 1), [0.0, 0.0, 0.0, 1.0]));
+    let mut adj = Layer::new("inv", LayerContent::Adjustment(Adjustment::Invert));
+    adj.clipped = true;
+    d.layers.push(adj);
+    assert!(close4(px(&d, 0, 0), [1.0; 4]), "base inverted to white");
+    assert!(close4(px(&d, 3, 0), [1.0; 4]), "background untouched (white)");
+}
+
+#[test]
+fn threshold_posterize_levels_curves() {
+    let mut buf = Buffer::filled(Rect::new(0, 0, 1, 1), [0.3, 0.3, 0.3, 1.0]);
+    adjust::apply(&Adjustment::Threshold { level: 0.5 }, &mut buf);
+    assert!(close4(buf.px[0], [0.0, 0.0, 0.0, 1.0]));
+
+    let mut buf = Buffer::filled(Rect::new(0, 0, 1, 1), [0.3, 0.6, 0.9, 1.0]);
+    adjust::apply(&Adjustment::Posterize { levels: 2 }, &mut buf);
+    assert!(close4(buf.px[0], [0.0, 1.0, 1.0, 1.0]));
+
+    let lv = LevelsChannel { in_black: 0.2, in_white: 0.8, ..Default::default() };
+    assert!((adjust::levels(&lv, 0.5) - 0.5).abs() < 1e-6);
+    assert!((adjust::levels(&lv, 0.2)).abs() < 1e-6);
+    assert!((adjust::levels(&lv, 0.9) - 1.0).abs() < 1e-6);
+
+    let identity = adjust::curve_lut(&[CurvePoint { input: 0.0, output: 0.0 }, CurvePoint { input: 1.0, output: 1.0 }]);
+    for (i, v) in identity.iter().enumerate().step_by(97) {
+        assert!((v - i as f32 / (identity.len() - 1) as f32).abs() < 1e-4);
+    }
+    let s = adjust::curve_lut(&[
+        CurvePoint { input: 0.0, output: 0.0 },
+        CurvePoint { input: 0.25, output: 0.15 },
+        CurvePoint { input: 0.75, output: 0.85 },
+        CurvePoint { input: 1.0, output: 1.0 },
+    ]);
+    assert!(s.windows(2).all(|w| w[1] >= w[0] - 1e-6), "monotone");
+    assert!(s[s.len() / 4] < 0.25 && s[3 * s.len() / 4] > 0.75);
+}
+
+#[test]
+fn hue_saturation_roundtrips_and_desaturates() {
+    let c = [0.8, 0.3, 0.1];
+    let (h, s, l) = adjust::rgb_to_hsl(c);
+    let back = adjust::hsl_to_rgb(h, s, l);
+    for i in 0..3 {
+        assert!((back[i] - c[i]).abs() < 1e-5);
+    }
+    let mut buf = Buffer::filled(Rect::new(0, 0, 1, 1), [0.8, 0.3, 0.1, 1.0]);
+    adjust::apply(&Adjustment::HueSaturation { hue: 0.0, saturation: -100.0, lightness: 0.0, colorize: false }, &mut buf);
+    let p = buf.px[0];
+    assert!((p[0] - p[1]).abs() < 1e-5 && (p[1] - p[2]).abs() < 1e-5);
+    let mut buf = Buffer::filled(Rect::new(0, 0, 1, 1), [1.0, 0.0, 0.0, 1.0]);
+    adjust::apply(&Adjustment::HueSaturation { hue: 120.0, saturation: 0.0, lightness: 0.0, colorize: false }, &mut buf);
+    assert!(close4(buf.px[0], [0.0, 1.0, 0.0, 1.0]));
+}
+
+#[test]
+fn solid_and_gradient_fill_layers() {
+    let mut d = doc_white(10, 1);
+    d.layers.push(Layer::new("fill", LayerContent::Fill(Fill::Solid(Color::rgb(0.0, 0.0, 1.0)))));
+    assert!(close4(px(&d, 5, 0), [0.0, 0.0, 1.0, 1.0]));
+
+    let g = Fill::Gradient { stops: vec![(0.0, Color::BLACK), (1.0, Color::WHITE)], angle: 0.0, scale: 1.0, style: photocraft_doc::GradientStyle::Linear, reverse: false };
+    let buf = render_fill(&g, Rect::new(0, 0, 10, 1), Rect::new(0, 0, 10, 1));
+    // tile independence: a 1px render of the right edge equals the full render
+    let one = render_fill(&g, Rect::new(9, 0, 10, 1), Rect::new(0, 0, 10, 1));
+    assert_eq!(one.px[0], buf.px[9]);
+    assert!(buf.px[0][0] < buf.px[9][0], "left dark, right light");
+}
+
+#[test]
+fn dissolve_coverage_matches_opacity() {
+    let mut d = Document::new("d", Size::new(64, 64), ColorMode::Rgb, SampleType::U8);
+    let mut l = solid_layer("k", Rect::new(0, 0, 64, 64), [0.0, 0.0, 0.0, 1.0]);
+    l.blend = BlendMode::Dissolve;
+    l.opacity = 0.3;
+    d.layers.push(l);
+    let b = flatten(&d);
+    let covered = b.px.iter().filter(|p| p[3] > 0.5).count() as f32 / b.px.len() as f32;
+    assert!((covered - 0.3).abs() < 0.05, "{covered}");
+    // deterministic
+    assert_eq!(flatten(&d), b);
+}
+
+#[test]
+fn render_is_tile_independent() {
+    // Rendering a sub-rect must equal the same region of a full render.
+    let mut d = doc_white(300, 300);
+    let mut l = solid_layer("a", Rect::new(20, 20, 280, 280), [0.1, 0.5, 0.9, 0.7]);
+    l.blend = BlendMode::Overlay;
+    d.layers.push(l);
+    let full = flatten(&d);
+    let sub = render(&d, Rect::new(250, 250, 270, 262));
+    for y in 250..262 {
+        for x in 250..270 {
+            assert_eq!(full.get(x, y), sub.get(x, y));
+        }
+    }
+}
+
+#[test]
+fn cmyk_document_renders_via_rgb() {
+    let mut d = Document::new("c", Size::new(2, 2), ColorMode::Cmyk, SampleType::U8);
+    let mut l = Layer::raster("k", d.pixel_format());
+    l.surface_mut().unwrap().fill_rect(Rect::new(0, 0, 2, 2), &[0.0, 0.0, 0.0, 1.0, 1.0]);
+    d.layers.push(l);
+    assert!(close4(px(&d, 0, 0), [0.0, 0.0, 0.0, 1.0]));
+}
+
+#[test]
+fn sixteen_bit_and_float_layers_composite() {
+    for fmt in [PixelFormat::RGBA16, PixelFormat::RGBA32F] {
+        let mut d = Document::new("x", Size::new(2, 2), ColorMode::Rgb, fmt.sample);
+        let mut l = Layer::raster("a", fmt);
+        l.surface_mut().unwrap().fill_rect(Rect::new(0, 0, 2, 2), &[0.25, 0.5, 0.75, 1.0]);
+        d.layers.push(l);
+        assert!(close4(px(&d, 1, 1), [0.25, 0.5, 0.75, 1.0]), "{fmt:?}");
+    }
+}
+
+#[test]
+fn thumbnail_dimensions() {
+    let d = doc_white(400, 200);
+    let t = thumbnail(&d, 100);
+    assert_eq!((t.width, t.height), (100, 50));
+    assert_eq!(&t.pixels[0..4], &[255, 255, 255, 255]);
+    let small = doc_white(10, 5);
+    let t = thumbnail(&small, 100);
+    assert_eq!((t.width, t.height), (10, 5));
+}
+
+#[test]
+fn buffer_over_background() {
+    let b = Buffer::filled(Rect::new(0, 0, 1, 1), [0.0, 0.0, 0.0, 0.5]);
+    let o = b.over_background([1.0, 1.0, 1.0]);
+    assert!(close4(o.px[0], [0.5, 0.5, 0.5, 1.0]));
+    assert_eq!(b.to_rgba8().pixels, vec![0, 0, 0, 128]);
+}
+
+// ---------- layer effects ----------
+
+use photocraft_doc::{Effect, FxCommon, FxPaint, Glow, GlowSource, GlowTechnique, Gradient, GradientStyle, Satin, Shadow, StrokeFx, StrokePosition};
+
+fn fx_doc(effects: Vec<Effect>) -> Document {
+    let mut d = doc_white(40, 40);
+    let mut l = solid_layer("sq", Rect::new(10, 10, 30, 30), [1.0, 0.0, 0.0, 1.0]);
+    l.effects.items = effects;
+    d.layers.push(l);
+    d
+}
+
+fn stroke(size: f32, position: StrokePosition) -> Effect {
+    Effect::Stroke(StrokeFx { common: FxCommon::new(photocraft_color::BlendMode::Normal, 1.0), size, position, paint: FxPaint::Color(Color::rgb(0.0, 0.0, 1.0)) })
+}
+
+#[test]
+fn outside_stroke_width() {
+    let d = fx_doc(vec![stroke(3.0, StrokePosition::Outside)]);
+    assert!(close4(px(&d, 8, 20), [0.0, 0.0, 1.0, 1.0]));
+    assert!(close4(px(&d, 7, 20), [0.0, 0.0, 1.0, 1.0]));
+    assert!(close4(px(&d, 5, 20), [1.0; 4]), "{:?}", px(&d, 5, 20));
+    assert!(close4(px(&d, 20, 20), [1.0, 0.0, 0.0, 1.0]), "interior untouched");
+}
+
+#[test]
+fn inside_and_center_strokes() {
+    let d = fx_doc(vec![stroke(2.0, StrokePosition::Inside)]);
+    assert!(close4(px(&d, 10, 20), [0.0, 0.0, 1.0, 1.0]));
+    assert!(close4(px(&d, 11, 20), [0.0, 0.0, 1.0, 1.0]));
+    assert!(close4(px(&d, 13, 20), [1.0, 0.0, 0.0, 1.0]));
+    assert!(close4(px(&d, 9, 20), [1.0; 4]));
+    let d = fx_doc(vec![stroke(4.0, StrokePosition::Center)]);
+    assert!(close4(px(&d, 8, 20), [0.0, 0.0, 1.0, 1.0]));
+    assert!(close4(px(&d, 11, 20), [0.0, 0.0, 1.0, 1.0]));
+    assert!(close4(px(&d, 13, 20), [1.0, 0.0, 0.0, 1.0]));
+}
+
+#[test]
+fn master_switch_and_per_effect_enable() {
+    let mut d = fx_doc(vec![stroke(3.0, StrokePosition::Outside)]);
+    d.layers[1].effects.enabled = false;
+    assert!(close4(px(&d, 8, 20), [1.0; 4]));
+    let mut d = fx_doc(vec![stroke(3.0, StrokePosition::Outside)]);
+    if let Effect::Stroke(s) = &mut d.layers[1].effects.items[0] {
+        s.common.enabled = false;
+    }
+    assert!(close4(px(&d, 8, 20), [1.0; 4]));
+}
+
+#[test]
+fn color_overlay_ignores_fill_opacity_but_not_opacity() {
+    let mut d = fx_doc(vec![Effect::ColorOverlay { common: FxCommon::new(photocraft_color::BlendMode::Normal, 1.0), color: Color::rgb(0.0, 1.0, 0.0) }]);
+    d.layers[1].fill_opacity = 0.0;
+    assert!(close4(px(&d, 20, 20), [0.0, 1.0, 0.0, 1.0]), "overlay shows at fill 0");
+    d.layers[1].opacity = 0.5;
+    assert!(close4(px(&d, 20, 20), [0.5, 1.0, 0.5, 1.0]), "{:?}", px(&d, 20, 20));
+}
+
+fn shadow(distance: f32, angle: f32) -> Shadow {
+    Shadow {
+        common: FxCommon::new(photocraft_color::BlendMode::Normal, 1.0),
+        color: Color::BLACK,
+        angle,
+        use_global_light: false,
+        distance,
+        spread: 1.0,
+        size: 0.0,
+        contour: photocraft_doc::Contour::Linear,
+        anti_alias: false,
+        noise: 0.0,
+        knocks_out: true,
+    }
+}
+
+#[test]
+fn drop_shadow_falls_away_from_light() {
+    // Light from the top (90°): shadow below the square.
+    let d = fx_doc(vec![Effect::DropShadow(shadow(5.0, 90.0))]);
+    assert!(close4(px(&d, 20, 32), [0.0, 0.0, 0.0, 1.0]), "{:?}", px(&d, 20, 32));
+    assert!(close4(px(&d, 20, 8), [1.0; 4]));
+    // Light from the right (0°, 3 o'clock): shadow to the left.
+    let d = fx_doc(vec![Effect::DropShadow(shadow(5.0, 0.0))]);
+    assert!(close4(px(&d, 8, 20), [0.0, 0.0, 0.0, 1.0]));
+    assert!(close4(px(&d, 32, 20), [1.0; 4]));
+}
+
+#[test]
+fn drop_shadow_uses_global_light_and_knockout() {
+    let mut d = fx_doc(vec![Effect::DropShadow(Shadow { use_global_light: true, ..shadow(5.0, 0.0) })]);
+    d.global_light.angle = 90.0;
+    assert!(close4(px(&d, 20, 32), [0.0, 0.0, 0.0, 1.0]));
+    // Knock-out: with fill 0 the shadow does not show through the layer.
+    d.layers[1].fill_opacity = 0.0;
+    assert!(close4(px(&d, 20, 28), [1.0; 4]), "{:?}", px(&d, 20, 28));
+    if let Effect::DropShadow(s) = &mut d.layers[1].effects.items[0] {
+        s.knocks_out = false;
+    }
+    assert!(close4(px(&d, 20, 28), [0.0, 0.0, 0.0, 1.0]));
+}
+
+#[test]
+fn soft_shadow_is_blurred_and_bounded() {
+    let d = fx_doc(vec![Effect::DropShadow(Shadow { spread: 0.0, size: 6.0, ..shadow(0.0, 90.0) })]);
+    let edge = px(&d, 30, 20); // just outside the right edge
+    let far = px(&d, 39, 20);
+    assert!(edge[0] < 0.8 && edge[0] > 0.2, "{edge:?}");
+    assert!(far[0] > 0.99, "{far:?}");
+}
+
+#[test]
+fn inner_shadow_only_inside() {
+    let d = fx_doc(vec![Effect::InnerShadow(Shadow { knocks_out: false, ..shadow(4.0, 90.0) })]);
+    // Top rows of the square are shadowed (light from the top pushes the
+    // outside's shadow down into the shape).
+    assert!(close4(px(&d, 20, 11), [0.0, 0.0, 0.0, 1.0]), "{:?}", px(&d, 20, 11));
+    assert!(close4(px(&d, 20, 25), [1.0, 0.0, 0.0, 1.0]));
+    assert!(close4(px(&d, 20, 5), [1.0; 4]));
+}
+
+fn glow(technique: GlowTechnique, source: GlowSource) -> Glow {
+    Glow {
+        common: FxCommon::new(photocraft_color::BlendMode::Normal, 1.0),
+        paint: FxPaint::Color(Color::rgb(0.0, 1.0, 0.0)),
+        technique,
+        spread: 0.0,
+        size: 4.0,
+        contour: photocraft_doc::Contour::Linear,
+        anti_alias: false,
+        range: 0.5,
+        jitter: 0.0,
+        noise: 0.0,
+        source,
+    }
+}
+
+#[test]
+fn outer_and_inner_glow_regions() {
+    let d = fx_doc(vec![Effect::OuterGlow(glow(GlowTechnique::Precise, GlowSource::Edge))]);
+    let near = px(&d, 9, 20);
+    assert!(near[1] > 0.7 && near[0] < 0.3, "{near:?}");
+    assert!(close4(px(&d, 3, 20), [1.0; 4]));
+    assert!(close4(px(&d, 20, 20), [1.0, 0.0, 0.0, 1.0]));
+    let d = fx_doc(vec![Effect::InnerGlow(glow(GlowTechnique::Softer, GlowSource::Edge))]);
+    let edge = px(&d, 10, 20);
+    assert!(edge[1] > 0.3, "{edge:?}");
+    assert!(close4(px(&d, 20, 20), [1.0, 0.0, 0.0, 1.0]));
+    assert!(close4(px(&d, 5, 20), [1.0; 4]));
+}
+
+#[test]
+fn gradient_overlay_follows_angle_and_reverse() {
+    let g = Gradient { stops: vec![(0.0, Color::BLACK), (1.0, Color::WHITE)], angle: 0.0, ..Gradient::default() };
+    let d = fx_doc(vec![Effect::GradientOverlay { common: FxCommon::new(photocraft_color::BlendMode::Normal, 1.0), gradient: g.clone(), dither: false }]);
+    let (l, r) = (px(&d, 10, 20), px(&d, 29, 20));
+    assert!(l[0] < 0.1 && r[0] > 0.9, "{l:?} {r:?}");
+    let d = fx_doc(vec![Effect::GradientOverlay {
+        common: FxCommon::new(photocraft_color::BlendMode::Normal, 1.0),
+        gradient: Gradient { reverse: true, style: GradientStyle::Linear, ..g },
+        dither: false,
+    }]);
+    assert!(px(&d, 10, 20)[0] > 0.9);
+}
+
+#[test]
+fn satin_and_bevel_stay_inside_shape() {
+    let satin = Effect::Satin(Satin {
+        common: FxCommon::new(photocraft_color::BlendMode::Multiply, 1.0),
+        color: Color::BLACK,
+        angle: 19.0,
+        distance: 4.0,
+        size: 4.0,
+        contour: photocraft_doc::Contour::Linear,
+        anti_alias: true,
+        invert: false,
+    });
+    let d = fx_doc(vec![satin, Effect::BevelEmboss(photocraft_doc::Bevel {
+        enabled: true,
+        style: photocraft_doc::BevelStyle::InnerBevel,
+        technique: photocraft_doc::BevelTechnique::Smooth,
+        depth: 1.0,
+        up: true,
+        size: 4.0,
+        soften: 0.0,
+        angle: 90.0,
+        altitude: 30.0,
+        use_global_light: false,
+        gloss_contour: photocraft_doc::Contour::Linear,
+        highlight: FxCommon::new(photocraft_color::BlendMode::Screen, 0.75),
+        highlight_color: Color::WHITE,
+        shadow: FxCommon::new(photocraft_color::BlendMode::Multiply, 0.75),
+        shadow_color: Color::BLACK,
+    })]);
+    for (x, y) in [(5, 5), (35, 20), (20, 35)] {
+        assert!(close4(px(&d, x, y), [1.0; 4]), "({x},{y}) {:?}", px(&d, x, y));
+    }
+    // Light from the top: the top bevel edge is brighter than the bottom one.
+    let (top, bot) = (px(&d, 20, 11), px(&d, 20, 28));
+    assert!(top[1] > bot[1], "{top:?} {bot:?}");
+}
+
+#[test]
+fn clipped_layer_effects_are_clipped_to_base() {
+    let mut d = doc_white(40, 40);
+    d.layers.push(solid_layer("base", Rect::new(10, 10, 30, 30), [1.0, 0.0, 0.0, 1.0]));
+    let mut c = solid_layer("clip", Rect::new(20, 10, 40, 30), [0.0, 1.0, 0.0, 1.0]);
+    c.clipped = true;
+    c.effects.items.push(stroke(3.0, StrokePosition::Outside));
+    d.layers.push(c);
+    assert!(close4(px(&d, 18, 20), [0.0, 0.0, 1.0, 1.0]), "stroke inside base");
+    assert!(close4(px(&d, 20, 8), [1.0; 4]), "stroke clipped outside base");
+}
+
+#[test]
+fn group_effects_apply_to_group_shape() {
+    let mut d = doc_white(40, 40);
+    let mut g = Layer::group("g", vec![solid_layer("a", Rect::new(10, 10, 20, 30), [1.0, 0.0, 0.0, 1.0]), solid_layer("b", Rect::new(20, 10, 30, 30), [1.0, 0.0, 0.0, 1.0])]);
+    g.effects.items.push(stroke(2.0, StrokePosition::Outside));
+    d.layers.push(g);
+    assert!(close4(px(&d, 9, 20), [0.0, 0.0, 1.0, 1.0]));
+    assert!(close4(px(&d, 20, 20), [1.0, 0.0, 0.0, 1.0]), "no stroke at the seam between children");
+}
+
+#[test]
+fn effects_render_identically_in_tiles() {
+    let d = fx_doc(vec![Effect::DropShadow(Shadow { spread: 0.0, size: 5.0, ..shadow(4.0, 120.0) }), stroke(2.0, StrokePosition::Outside)]);
+    let full = flatten(&d);
+    for (x, y) in [(33, 33), (8, 20), (31, 12)] {
+        let t = render(&d, Rect::from_xywh(x, y, 1, 1)).px[0];
+        assert!(close4(t, full.get(x, y)), "({x},{y})");
+    }
+}

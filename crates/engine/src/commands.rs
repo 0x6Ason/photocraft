@@ -1,0 +1,837 @@
+//! The command registry. Ids follow Photoshop's menu structure (see the parity checklist).
+
+use photocraft_color::{BlendMode, Color, ColorMode, SampleType};
+use photocraft_doc::adjust::CurvePoint;
+use photocraft_doc::{Adjustment, Document, Fill, Layer, LayerContent, LayerId, LayerMask, Size};
+use photocraft_geom::Rect;
+use photocraft_paint::{BrushSettings, Stroke, StrokePoint};
+use photocraft_raster::Surface;
+use serde_json::{Value, json};
+
+use crate::{EngineError, Result, Session, inspect, pixels};
+
+type Run = fn(&mut Session, &Value) -> Result<Value>;
+type Enabled = fn(&Session) -> std::result::Result<(), String>;
+
+/// Metadata + implementation for one command.
+pub struct CommandSpec {
+    pub id: &'static str,
+    pub label: &'static str,
+    /// Menu placement, e.g. `["Layer", "New"]`. Empty = not in menus.
+    pub menu: &'static [&'static str],
+    /// Default shortcut in egui-style notation (`Cmd+Shift+N`), mapped per platform by the UI.
+    pub shortcut: Option<&'static str>,
+    /// Human/agent-readable parameter description (JSON-ish).
+    pub params: &'static str,
+    pub enabled: Enabled,
+    pub run: Run,
+    /// Record in the session journal (false for queries).
+    pub journal: bool,
+}
+
+fn always(_: &Session) -> std::result::Result<(), String> {
+    Ok(())
+}
+fn has_doc(s: &Session) -> std::result::Result<(), String> {
+    s.active().map(|_| ()).ok_or_else(|| "no document open".into())
+}
+fn has_layer(s: &Session) -> std::result::Result<(), String> {
+    let d = s.active().ok_or("no document open")?;
+    d.active_layer.filter(|id| d.doc.layer(*id).is_some()).map(|_| ()).ok_or_else(|| "no active layer".into())
+}
+fn has_pixel_layer(s: &Session) -> std::result::Result<(), String> {
+    has_layer(s)?;
+    let d = s.active().unwrap();
+    let l = d.doc.layer(d.active_layer.unwrap()).unwrap();
+    if matches!(l.content, LayerContent::Raster(_)) { Ok(()) } else { Err(format!("active layer is a {} layer, not a pixel layer", l.content.kind_name())) }
+}
+fn can_undo(s: &Session) -> std::result::Result<(), String> {
+    s.active().filter(|d| d.history.can_undo()).map(|_| ()).ok_or_else(|| "nothing to undo".into())
+}
+fn can_redo(s: &Session) -> std::result::Result<(), String> {
+    s.active().filter(|d| d.history.can_redo()).map(|_| ()).ok_or_else(|| "nothing to redo".into())
+}
+fn has_selection(s: &Session) -> std::result::Result<(), String> {
+    s.active().filter(|d| d.doc.selection.is_some()).map(|_| ()).ok_or_else(|| "no selection".into())
+}
+
+macro_rules! cmd {
+    ($id:literal, $label:literal, [$($m:literal),*], $sc:expr, $params:literal, $en:expr, $run:expr) => {
+        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: $sc, params: $params, enabled: $en, run: $run, journal: true }
+    };
+}
+
+pub fn command_specs() -> &'static [CommandSpec] {
+    static SPECS: std::sync::OnceLock<Vec<CommandSpec>> = std::sync::OnceLock::new();
+    SPECS.get_or_init(build)
+}
+
+pub fn find(id: &str) -> Option<&'static CommandSpec> {
+    command_specs().iter().find(|c| c.id == id)
+}
+
+// ---------- param helpers ----------
+
+fn bad(cmd: &str, msg: impl Into<String>) -> EngineError {
+    EngineError::BadParams { cmd: cmd.into(), msg: msg.into() }
+}
+/// Integer parameter that also accepts JSON floats (UIs send `12.0`); rounds.
+fn int(p: &Value, key: &str) -> Option<i64> {
+    p.get(key).and_then(|v| v.as_i64().or_else(|| v.as_f64().filter(|f| f.is_finite()).map(|f| f.round() as i64)))
+}
+
+fn f32_or(p: &Value, key: &str, default: f32) -> f32 {
+    p.get(key).and_then(Value::as_f64).map(|v| v as f32).unwrap_or(default)
+}
+fn color_param(p: &Value, key: &str, default: [f32; 4]) -> [f32; 4] {
+    match p.get(key) {
+        Some(Value::Array(a)) if a.len() >= 3 => {
+            let v: Vec<f32> = a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect();
+            [v[0], v[1], v[2], v.get(3).copied().unwrap_or(1.0)]
+        }
+        Some(Value::String(s)) => parse_hex(s).unwrap_or(default),
+        _ => default,
+    }
+}
+fn parse_hex(s: &str) -> Option<[f32; 4]> {
+    let s = s.trim_start_matches('#');
+    let b = |i: usize| u8::from_str_radix(s.get(i..i + 2)?, 16).ok().map(|v| v as f32 / 255.0);
+    match s.len() {
+        6 => Some([b(0)?, b(2)?, b(4)?, 1.0]),
+        8 => Some([b(0)?, b(2)?, b(4)?, b(6)?]),
+        _ => None,
+    }
+}
+fn layer_param(s: &Session, p: &Value) -> Result<LayerId> {
+    match p.get("layer").and_then(Value::as_u64) {
+        Some(id) => Ok(LayerId(id)),
+        None => s.active().and_then(|d| d.active_layer).ok_or(EngineError::Other("no active layer".into())),
+    }
+}
+pub fn blend_from_str(s: &str) -> Option<BlendMode> {
+    let norm = |x: &str| x.to_ascii_lowercase().replace([' ', '_', '-', '(', ')'], "");
+    let want = norm(s);
+    std::iter::once(BlendMode::PassThrough).chain(BlendMode::LAYER_MODES).find(|m| norm(m.label()) == want || norm(&format!("{m:?}")) == want)
+}
+
+fn new_adjustment(s: &mut Session, adj: Adjustment) -> Result<Value> {
+    let label = format!("New {} Layer", adj.label());
+    let name = adj.label().to_string();
+    let id = s.edit(&label, |doc, active| {
+        let l = Layer::new(doc.next_layer_name(&name), LayerContent::Adjustment(adj));
+        let id = doc.insert_above(*active, l);
+        *active = Some(id);
+        Ok(id)
+    })?;
+    Ok(json!({ "layer": id.0 }))
+}
+
+fn destructive_adjust(s: &mut Session, label: &str, adj: Adjustment) -> Result<Value> {
+    let id = layer_param(s, &Value::Null)?;
+    s.edit(label, |doc, _| {
+        let sel = doc.selection.clone();
+        let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+        let surf = l.surface_mut().ok_or_else(|| EngineError::Other("not a pixel layer".into()))?;
+        pixels::adjust_surface(surf, &adj, sel.as_ref());
+        Ok(())
+    })?;
+    Ok(Value::Null)
+}
+
+pub fn adjustment_from_params(kind: &str, p: &Value) -> Adjustment {
+    match kind {
+        "invert" => Adjustment::Invert,
+        "hueSaturation" => Adjustment::HueSaturation {
+            hue: f32_or(p, "hue", 0.0),
+            saturation: f32_or(p, "saturation", 0.0),
+            lightness: f32_or(p, "lightness", 0.0),
+            colorize: p.get("colorize").and_then(Value::as_bool).unwrap_or(false),
+        },
+        "brightnessContrast" => Adjustment::BrightnessContrast { brightness: f32_or(p, "brightness", 0.0), contrast: f32_or(p, "contrast", 0.0), legacy: false },
+        "threshold" => Adjustment::Threshold { level: f32_or(p, "level", 128.0) / 255.0 },
+        "posterize" => Adjustment::Posterize { levels: f32_or(p, "levels", 4.0) as u32 },
+        "exposure" => Adjustment::Exposure { exposure: f32_or(p, "exposure", 0.0), offset: f32_or(p, "offset", 0.0), gamma: f32_or(p, "gamma", 1.0) },
+        "vibrance" => Adjustment::Vibrance { vibrance: f32_or(p, "vibrance", 0.0), saturation: f32_or(p, "saturation", 0.0) },
+        "levels" => {
+            let mut a = Adjustment::identity_levels();
+            if let Adjustment::Levels { master, .. } = &mut a {
+                master.in_black = f32_or(p, "inBlack", 0.0) / 255.0;
+                master.in_white = f32_or(p, "inWhite", 255.0) / 255.0;
+                master.gamma = f32_or(p, "gamma", 1.0);
+            }
+            a
+        }
+        "curves" => {
+            let mut a = Adjustment::identity_curves();
+            if let (Adjustment::Curves { master, .. }, Some(Value::Array(pts))) = (&mut a, p.get("points")) {
+                let parsed: Vec<CurvePoint> = pts
+                    .iter()
+                    .filter_map(|v| {
+                        let a = v.as_array()?;
+                        Some(CurvePoint { input: a.first()?.as_f64()? as f32 / 255.0, output: a.get(1)?.as_f64()? as f32 / 255.0 })
+                    })
+                    .collect();
+                if parsed.len() >= 2 {
+                    *master = parsed;
+                }
+            }
+            a
+        }
+        "blackWhite" => Adjustment::BlackWhite { weights: [40.0, 60.0, 40.0, 60.0, 20.0, 80.0], tint: None },
+        "photoFilter" => Adjustment::PhotoFilter { color: [0.925, 0.541, 0.0], density: f32_or(p, "density", 25.0) / 100.0, preserve_luminosity: true },
+        "channelMixer" => Adjustment::ChannelMixer { matrix: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], monochrome: false },
+        "colorBalance" => Adjustment::ColorBalance { shadows: [0.0; 3], midtones: [0.0; 3], highlights: [0.0; 3], preserve_luminosity: true },
+        "gradientMap" => Adjustment::GradientMap { stops: vec![(0.0, [0.0; 3]), (1.0, [1.0; 3])], reverse: false },
+        _ => Adjustment::Invert,
+    }
+}
+
+// ---------- the table ----------
+
+#[allow(clippy::too_many_lines)]
+fn build() -> Vec<CommandSpec> {
+    let mut v = vec![
+        // File
+        cmd!("file.new", "New…", ["File"], Some("Cmd+N"), r##"{"width":u32=1920,"height":u32=1080,"mode":"rgb|gray|cmyk|lab"="rgb","depth":8|16|32=8,"background":"white|black|transparent|#rrggbb"="white","name":str}"##, always, |s, p| {
+            let w = p.get("width").and_then(Value::as_u64).unwrap_or(1920).clamp(1, 300_000) as u32;
+            let h = p.get("height").and_then(Value::as_u64).unwrap_or(1080).clamp(1, 300_000) as u32;
+            let mode = match p.get("mode").and_then(Value::as_str).unwrap_or("rgb") {
+                "gray" | "grayscale" => ColorMode::Grayscale,
+                "cmyk" => ColorMode::Cmyk,
+                "lab" => ColorMode::Lab,
+                _ => ColorMode::Rgb,
+            };
+            let depth = match p.get("depth").and_then(Value::as_u64).unwrap_or(8) {
+                16 => SampleType::U16,
+                32 => SampleType::F32,
+                _ => SampleType::U8,
+            };
+            let name = p.get("name").and_then(Value::as_str).unwrap_or("Untitled").to_string();
+            let doc = match p.get("background").and_then(Value::as_str).unwrap_or("white") {
+                "transparent" => {
+                    let mut d = Document::new(name, Size::new(w, h), mode, depth);
+                    d.layers.push(Layer::raster("Layer 1", d.pixel_format()));
+                    d
+                }
+                "black" => Document::with_background(name, Size::new(w, h), mode, depth, Color::BLACK),
+                other => {
+                    let c = parse_hex(other).unwrap_or([1.0; 4]);
+                    Document::with_background(name, Size::new(w, h), mode, depth, Color::rgba(c[0], c[1], c[2], c[3]))
+                }
+            };
+            let i = s.add_document(doc, None);
+            Ok(json!({ "document": i }))
+        }),
+        cmd!("file.close", "Close", ["File"], Some("Cmd+W"), r##"{"document":index?}"##, has_doc, |s, p| {
+            let i = p.get("document").and_then(Value::as_u64).map(|v| v as usize).or(s.active_index()).ok_or(EngineError::NoDocument)?;
+            s.close(i).ok_or(EngineError::NoDocument)?;
+            Ok(Value::Null)
+        }),
+        // Edit
+        cmd!("edit.undo", "Undo", ["Edit"], Some("Cmd+Z"), "{}", can_undo, |s, _| Ok(json!(s.undo()))),
+        cmd!("edit.redo", "Redo", ["Edit"], Some("Cmd+Shift+Z"), "{}", can_redo, |s, _| Ok(json!(s.redo()))),
+        cmd!("edit.fill", "Fill…", ["Edit"], Some("Shift+F5"), r##"{"color":"#rrggbb|[r,g,b,a]"=foreground}"##, has_pixel_layer, |s, p| {
+            let color = color_param(p, "color", s.tools.foreground);
+            let id = layer_param(s, p)?;
+            s.edit("Fill", |doc, _| {
+                let sel = doc.selection.clone();
+                let area = sel.as_ref().map(|m| m.content_bounds()).unwrap_or(doc.bounds());
+                let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+                let lock = l.locks.transparency;
+                let surf = l.surface_mut().ok_or_else(|| EngineError::Other("not a pixel layer".into()))?;
+                pixels::fill_surface(surf, area, color, sel.as_ref(), lock);
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("edit.clear", "Clear", ["Edit"], Some("Delete"), "{}", has_pixel_layer, |s, p| {
+            let id = layer_param(s, p)?;
+            s.edit("Clear", |doc, _| {
+                let sel = doc.selection.clone();
+                let area = sel.as_ref().map(|m| m.content_bounds()).unwrap_or(doc.bounds());
+                let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+                pixels::clear_surface(l.surface_mut().ok_or_else(|| EngineError::Other("not a pixel layer".into()))?, area, sel.as_ref());
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        // Select
+        cmd!("select.all", "All", ["Select"], Some("Cmd+A"), "{}", has_doc, |s, _| {
+            s.edit("Select All", |doc, _| {
+                let mut m = Surface::new(photocraft_color::PixelFormat::GRAY8);
+                m.fill_rect(doc.bounds(), &[1.0]);
+                doc.selection = Some(m);
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("select.deselect", "Deselect", ["Select"], Some("Cmd+D"), "{}", has_selection, |s, _| {
+            s.edit("Deselect", |doc, _| {
+                doc.selection = None;
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("select.inverse", "Inverse", ["Select"], Some("Cmd+Shift+I"), "{}", has_selection, |s, _| {
+            s.edit("Inverse", |doc, _| {
+                let old = doc.selection.take().unwrap_or_else(|| Surface::new(photocraft_color::PixelFormat::GRAY8));
+                let b = doc.bounds();
+                let data: Vec<f32> = old.read_region(b).into_iter().map(|v| 1.0 - v).collect();
+                let mut m = Surface::new(photocraft_color::PixelFormat::GRAY8);
+                m.write_region(b, &data);
+                m.prune();
+                doc.selection = Some(m);
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("select.rect", "Rectangular Selection", [], None, r##"{"x":i32,"y":i32,"width":u32,"height":u32,"mode":"replace|add|subtract|intersect"="replace","ellipse":bool=false}"##, has_doc, |s, p| {
+            let get = |k: &str| int(p, k).ok_or_else(|| bad("select.rect", format!("missing `{k}`")));
+            let r = Rect::from_xywh(get("x")? as i32, get("y")? as i32, get("width")?.max(0) as u32, get("height")?.max(0) as u32);
+            let mode = p.get("mode").and_then(Value::as_str).unwrap_or("replace").to_string();
+            let ellipse = p.get("ellipse").and_then(Value::as_bool).unwrap_or(false);
+            s.edit("Rectangular Marquee", |doc, _| {
+                let mut shape = Surface::new(photocraft_color::PixelFormat::GRAY8);
+                if ellipse {
+                    let (cx, cy) = ((r.x0 + r.x1) as f32 / 2.0, (r.y0 + r.y1) as f32 / 2.0);
+                    let (rx, ry) = (r.width() as f32 / 2.0, r.height() as f32 / 2.0);
+                    for y in r.y0..r.y1 {
+                        for x in r.x0..r.x1 {
+                            let dx = (x as f32 + 0.5 - cx) / rx;
+                            let dy = (y as f32 + 0.5 - cy) / ry;
+                            if dx * dx + dy * dy <= 1.0 {
+                                shape.write_pixel(x, y, &[1.0]);
+                            }
+                        }
+                    }
+                } else {
+                    shape.fill_rect(r, &[1.0]);
+                }
+                let area = doc.bounds();
+                let old = doc.selection.take();
+                let combined = match (mode.as_str(), old) {
+                    ("add", Some(o)) => combine(&o, &shape, area, |a, b| a.max(b)),
+                    ("subtract", Some(o)) => combine(&o, &shape, area, |a, b| a * (1.0 - b)),
+                    ("intersect", Some(o)) => combine(&o, &shape, area, |a, b| a.min(b)),
+                    _ => shape,
+                };
+                doc.selection = Some(combined);
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        // Layer
+        cmd!("layer.new.layer", "Layer…", ["Layer", "New"], Some("Cmd+Shift+N"), r##"{"name":str?}"##, has_doc, |s, p| {
+            let id = s.edit("New Layer", |doc, active| {
+                let name = p.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| doc.next_layer_name("Layer"));
+                let id = doc.insert_above(*active, Layer::raster(name, doc.pixel_format()));
+                *active = Some(id);
+                Ok(id)
+            })?;
+            Ok(json!({ "layer": id.0 }))
+        }),
+        cmd!("layer.new.group", "Group…", ["Layer", "New"], None, r##"{"name":str?}"##, has_doc, |s, p| {
+            let id = s.edit("New Group", |doc, active| {
+                let name = p.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| doc.next_layer_name("Group"));
+                let id = doc.insert_above(*active, Layer::group(name, vec![]));
+                *active = Some(id);
+                Ok(id)
+            })?;
+            Ok(json!({ "layer": id.0 }))
+        }),
+        cmd!("layer.groupLayers", "Group Layers", ["Layer"], Some("Cmd+G"), r##"{"layer":id?}"##, has_layer, |s, p| {
+            let id = layer_param(s, p)?;
+            let gid = s.edit("Group Layers", |doc, active| {
+                let l = doc.remove(id).ok_or(EngineError::NoLayer(id))?;
+                let path_hint = *active;
+                let g = Layer::group(doc.next_layer_name("Group"), vec![l]);
+                let gid = doc.insert_above(path_hint.filter(|a| *a != id), g);
+                *active = Some(gid);
+                Ok(gid)
+            })?;
+            Ok(json!({ "layer": gid.0 }))
+        }),
+        cmd!("layer.duplicate", "Duplicate Layer…", ["Layer"], Some("Cmd+J"), r##"{"layer":id?}"##, has_layer, |s, p| {
+            let id = layer_param(s, p)?;
+            let nid = s.edit("Duplicate Layer", |doc, active| {
+                let mut dup = doc.layer(id).ok_or(EngineError::NoLayer(id))?.duplicate();
+                dup.name = format!("{} copy", dup.name);
+                let nid = doc.insert_above(Some(id), dup);
+                *active = Some(nid);
+                Ok(nid)
+            })?;
+            Ok(json!({ "layer": nid.0 }))
+        }),
+        cmd!("layer.delete", "Delete Layer", ["Layer", "Delete"], None, r##"{"layer":id?}"##, has_layer, |s, p| {
+            let id = layer_param(s, p)?;
+            s.edit("Delete Layer", |doc, active| {
+                doc.remove(id).ok_or(EngineError::NoLayer(id))?;
+                if *active == Some(id) {
+                    *active = doc.top_layer();
+                }
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("layer.select", "Select Layer", [], None, r##"{"layer":id}"##, has_doc, |s, p| {
+            let id = p.get("layer").and_then(Value::as_u64).ok_or_else(|| bad("layer.select", "missing `layer`"))?;
+            s.select_layer(LayerId(id))?;
+            Ok(Value::Null)
+        }),
+        cmd!("layer.setProps", "Layer Properties", [], None, r##"{"layer":id?,"name":str?,"visible":bool?,"opacity":0..1?,"fill":0..1?,"blend":"Multiply|…"?,"clipped":bool?,"locked":bool?}"##, has_layer, |s, p| {
+            let id = layer_param(s, p)?;
+            let label = if p.get("visible").is_some() && p.as_object().is_some_and(|o| o.len() <= 2) { "Layer Visibility" } else { "Layer Properties" };
+            s.edit(label, |doc, _| {
+                let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+                if let Some(v) = p.get("name").and_then(Value::as_str) {
+                    l.name = v.to_string();
+                }
+                if let Some(v) = p.get("visible").and_then(Value::as_bool) {
+                    l.visible = v;
+                }
+                if let Some(v) = p.get("opacity").and_then(Value::as_f64) {
+                    l.opacity = (v as f32).clamp(0.0, 1.0);
+                }
+                if let Some(v) = p.get("fill").and_then(Value::as_f64) {
+                    l.fill_opacity = (v as f32).clamp(0.0, 1.0);
+                }
+                if let Some(v) = p.get("blend").and_then(Value::as_str) {
+                    l.blend = blend_from_str(v).ok_or_else(|| bad("layer.setProps", format!("unknown blend mode `{v}`")))?;
+                }
+                if let Some(v) = p.get("clipped").and_then(Value::as_bool) {
+                    l.clipped = v;
+                }
+                if let Some(v) = p.get("locked").and_then(Value::as_bool) {
+                    l.locks.all = v;
+                }
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("layer.arrange.bringForward", "Bring Forward", ["Layer", "Arrange"], Some("Cmd+]"), r##"{"layer":id?}"##, has_layer, |s, p| arrange(s, p, 1)),
+        cmd!("layer.arrange.sendBackward", "Send Backward", ["Layer", "Arrange"], Some("Cmd+["), r##"{"layer":id?}"##, has_layer, |s, p| arrange(s, p, -1)),
+        cmd!("layer.arrange.bringToFront", "Bring to Front", ["Layer", "Arrange"], Some("Cmd+Shift+]"), r##"{"layer":id?}"##, has_layer, |s, p| arrange(s, p, i32::MAX)),
+        cmd!("layer.arrange.sendToBack", "Send to Back", ["Layer", "Arrange"], Some("Cmd+Shift+["), r##"{"layer":id?}"##, has_layer, |s, p| arrange(s, p, i32::MIN)),
+        cmd!("layer.createClippingMask", "Create Clipping Mask", ["Layer"], Some("Cmd+Alt+G"), r##"{"layer":id?}"##, has_layer, |s, p| {
+            let id = layer_param(s, p)?;
+            s.edit("Create Clipping Mask", |doc, _| {
+                doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?.clipped = true;
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("layer.releaseClippingMask", "Release Clipping Mask", ["Layer"], None, r##"{"layer":id?}"##, has_layer, |s, p| {
+            let id = layer_param(s, p)?;
+            s.edit("Release Clipping Mask", |doc, _| {
+                doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?.clipped = false;
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("layer.layerMask.revealAll", "Reveal All", ["Layer", "Layer Mask"], None, r##"{"layer":id?}"##, has_layer, |s, p| set_mask(s, p, "Add Layer Mask", Some(LayerMask::reveal_all()))),
+        cmd!("layer.layerMask.hideAll", "Hide All", ["Layer", "Layer Mask"], None, r##"{"layer":id?}"##, has_layer, |s, p| set_mask(s, p, "Add Layer Mask", Some(LayerMask::hide_all()))),
+        cmd!("layer.layerMask.revealSelection", "Reveal Selection", ["Layer", "Layer Mask"], None, r##"{"layer":id?}"##, has_selection, |s, p| {
+            let sel = s.active().and_then(|d| d.doc.selection.clone()).ok_or(EngineError::Other("no selection".into()))?;
+            let mask = LayerMask { surface: sel, ..LayerMask::reveal_all() };
+            set_mask(s, p, "Add Layer Mask", Some(mask))
+        }),
+        cmd!("layer.layerMask.delete", "Delete", ["Layer", "Layer Mask"], None, r##"{"layer":id?}"##, has_layer, |s, p| set_mask(s, p, "Delete Layer Mask", None)),
+        cmd!("layer.mergeDown", "Merge Down", ["Layer"], Some("Cmd+E"), r##"{"layer":id?}"##, has_layer, |s, p| {
+            let id = layer_param(s, p)?;
+            s.edit("Merge Down", |doc, active| {
+                let path = doc.path_of(id).ok_or(EngineError::NoLayer(id))?;
+                let idx = *path.last().unwrap();
+                if idx == 0 {
+                    return Err(EngineError::Other("no layer below to merge into".into()));
+                }
+                let mut below = path.clone();
+                *below.last_mut().unwrap() = idx - 1;
+                let lower = doc.layer_at(&below).ok_or(EngineError::NoLayer(id))?.clone();
+                let upper = doc.layer(id).ok_or(EngineError::NoLayer(id))?.clone();
+                let merged = pixels::merge_down(doc.bounds(), &lower, &upper, doc.pixel_format());
+                doc.remove(id);
+                *doc.layer_at_mut(&below).unwrap() = merged;
+                *active = Some(lower.id);
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("layer.flattenImage", "Flatten Image", ["Layer"], None, "{}", has_doc, |s, _| {
+            s.edit("Flatten Image", |doc, active| {
+                let buf = photocraft_compose::flatten(doc).over_background([1.0, 1.0, 1.0]);
+                let fmt = doc.pixel_format();
+                let data: Vec<f32> = buf.px.iter().flat_map(|p| photocraft_raster::from_rgba(&fmt, *p)).collect();
+                let mut bg = Layer::raster("Background", fmt);
+                bg.locks.transparency = true;
+                bg.surface_mut().unwrap().write_region(doc.bounds(), &data);
+                *active = Some(bg.id);
+                doc.layers = vec![bg];
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("layer.newFillLayer.solidColor", "Solid Color…", ["Layer", "New Fill Layer"], None, r##"{"color":"#rrggbb"=foreground}"##, has_doc, |s, p| {
+            let c = color_param(p, "color", s.tools.foreground);
+            let id = s.edit("New Color Fill Layer", |doc, active| {
+                let l = Layer::new(doc.next_layer_name("Color Fill"), LayerContent::Fill(Fill::Solid(Color::rgba(c[0], c[1], c[2], c[3]))));
+                let id = doc.insert_above(*active, l);
+                *active = Some(id);
+                Ok(id)
+            })?;
+            Ok(json!({ "layer": id.0 }))
+        }),
+        cmd!("layer.newFillLayer.gradient", "Gradient…", ["Layer", "New Fill Layer"], None, r##"{"from":"#rrggbb","to":"#rrggbb","angle":deg=90,"style":"linear|radial|angle|reflected|diamond","reverse":bool}"##, has_doc, |s, p| {
+            let a = color_param(p, "from", s.tools.foreground);
+            let b = color_param(p, "to", s.tools.background);
+            let angle = f32_or(p, "angle", 90.0);
+            let style = crate::layer_style::gradient_style(p.get("style").and_then(Value::as_str).unwrap_or("linear"));
+            let reverse = p.get("reverse").and_then(Value::as_bool).unwrap_or(false);
+            let id = s.edit("New Gradient Fill Layer", |doc, active| {
+                let fill = Fill::Gradient { stops: vec![(0.0, Color::rgba(a[0], a[1], a[2], a[3])), (1.0, Color::rgba(b[0], b[1], b[2], b[3]))], angle, scale: 1.0, style, reverse };
+                let id = doc.insert_above(*active, Layer::new(doc.next_layer_name("Gradient Fill"), LayerContent::Fill(fill)));
+                *active = Some(id);
+                Ok(id)
+            })?;
+            Ok(json!({ "layer": id.0 }))
+        }),
+        cmd!("layer.setAdjustment", "Adjustment Properties", [], None, r##"{"layer":id?, …params of that adjustment kind}"##, has_layer, |s, p| {
+            let id = layer_param(s, p)?;
+            s.edit("Modify Adjustment", |doc, _| {
+                let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+                let LayerContent::Adjustment(adj) = &mut l.content else { return Err(EngineError::Other("not an adjustment layer".into())) };
+                let kind = adjustment_kind(adj);
+                *adj = adjustment_from_params(kind, p);
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("layer.moveTo", "Reorder Layer", [], None, r##"{"layer":id?,"target":id,"position":"above|below|into"="above"}"##, has_layer, |s, p| {
+            let id = layer_param(s, p)?;
+            let target = LayerId(p.get("target").and_then(Value::as_u64).ok_or_else(|| bad("layer.moveTo", "missing `target`"))?);
+            let pos = p.get("position").and_then(Value::as_str).unwrap_or("above").to_string();
+            if id == target {
+                return Ok(Value::Null);
+            }
+            s.edit("Reorder Layers", |doc, active| {
+                // Refuse to move a group into itself or its descendants.
+                if doc.layer(id).is_some_and(|l| contains_layer(l, target)) {
+                    return Err(EngineError::Other("can't move a group into itself".into()));
+                }
+                let layer = doc.remove(id).ok_or(EngineError::NoLayer(id))?;
+                let path = doc.path_of(target).ok_or(EngineError::NoLayer(target))?;
+                match pos.as_str() {
+                    "into" => {
+                        let g = doc.layer_at_mut(&path).and_then(|t| t.children_mut()).ok_or_else(|| EngineError::Other("target is not a group".into()))?;
+                        g.push(layer);
+                    }
+                    other => {
+                        let (&last, parent) = path.split_last().expect("non-empty path");
+                        let sib = if parent.is_empty() { &mut doc.layers } else { doc.layer_at_mut(parent).and_then(|t| t.children_mut()).expect("parent is a group") };
+                        let at = if other == "below" { last } else { last + 1 };
+                        sib.insert(at.min(sib.len()), layer);
+                    }
+                }
+                *active = Some(id);
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("layer.translate", "Move Layer", [], None, r##"{"layer":id?,"dx":i32,"dy":i32}"##, has_layer, |s, p| {
+            let id = layer_param(s, p)?;
+            let dx = int(p, "dx").unwrap_or(0) as i32;
+            let dy = int(p, "dy").unwrap_or(0) as i32;
+            if dx == 0 && dy == 0 {
+                return Ok(Value::Null);
+            }
+            s.edit("Move", |doc, _| {
+                let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+                if l.locks.position || l.locks.all {
+                    return Err(EngineError::Other(format!("layer \"{}\" is position-locked", l.name)));
+                }
+                translate_layer(l, dx, dy);
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        // Image
+        cmd!("image.imageRotation.flipCanvasHorizontal", "Flip Canvas Horizontal", ["Image", "Image Rotation"], None, "{}", has_doc, |s, _| {
+            s.edit("Flip Canvas Horizontal", |doc, _| {
+                let w = doc.size.width as i32;
+                pixels::remap_document(doc, &|x, y| (w - 1 - x, y));
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("image.imageRotation.flipCanvasVertical", "Flip Canvas Vertical", ["Image", "Image Rotation"], None, "{}", has_doc, |s, _| {
+            s.edit("Flip Canvas Vertical", |doc, _| {
+                let h = doc.size.height as i32;
+                pixels::remap_document(doc, &|x, y| (x, h - 1 - y));
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("image.imageRotation.180", "180°", ["Image", "Image Rotation"], None, "{}", has_doc, |s, _| {
+            s.edit("Rotate Canvas", |doc, _| {
+                let (w, h) = (doc.size.width as i32, doc.size.height as i32);
+                pixels::remap_document(doc, &|x, y| (w - 1 - x, h - 1 - y));
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("image.imageRotation.90cw", "90° Clockwise", ["Image", "Image Rotation"], None, "{}", has_doc, |s, _| {
+            s.edit("Rotate Canvas", |doc, _| {
+                let h = doc.size.height as i32;
+                pixels::remap_document(doc, &|x, y| (h - 1 - y, x));
+                doc.size = Size::new(doc.size.height, doc.size.width);
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("image.imageRotation.90ccw", "90° Counter Clockwise", ["Image", "Image Rotation"], None, "{}", has_doc, |s, _| {
+            s.edit("Rotate Canvas", |doc, _| {
+                let w = doc.size.width as i32;
+                pixels::remap_document(doc, &|x, y| (y, w - 1 - x));
+                doc.size = Size::new(doc.size.height, doc.size.width);
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("image.adjustments.desaturate", "Desaturate", ["Image", "Adjustments"], Some("Cmd+Shift+U"), "{}", has_pixel_layer, |s, _| {
+            destructive_adjust(s, "Desaturate", Adjustment::HueSaturation { hue: 0.0, saturation: -100.0, lightness: 0.0, colorize: false })
+        }),
+        // Paint
+        cmd!("paint.stroke", "Brush Stroke", [], None, r##"{"points":[[x,y,pressure?],…],"size":px?,"hardness":0..1?,"opacity":0..1?,"flow":0..1?,"color":"#rrggbb"?=foreground,"erase":bool?,"smoothing":0..1?}"##, has_pixel_layer, |s, p| {
+            let pts: Vec<StrokePoint> = p
+                .get("points")
+                .and_then(Value::as_array)
+                .ok_or_else(|| bad("paint.stroke", "missing `points`"))?
+                .iter()
+                .filter_map(|v| {
+                    let a = v.as_array()?;
+                    Some(StrokePoint { x: a.first()?.as_f64()?, y: a.get(1)?.as_f64()?, pressure: a.get(2).and_then(Value::as_f64).unwrap_or(1.0) as f32 })
+                })
+                .collect();
+            if pts.is_empty() {
+                return Err(bad("paint.stroke", "`points` is empty"));
+            }
+            let base = s.tools.brush.clone();
+            let brush = BrushSettings {
+                size: f32_or(p, "size", base.size),
+                hardness: f32_or(p, "hardness", base.hardness),
+                opacity: f32_or(p, "opacity", base.opacity),
+                flow: f32_or(p, "flow", base.flow),
+                spacing: f32_or(p, "spacing", base.spacing),
+                color: color_param(p, "color", s.tools.foreground),
+                erase: p.get("erase").and_then(Value::as_bool).unwrap_or(false),
+                ..base
+            };
+            let smoothing = f32_or(p, "smoothing", 0.0);
+            let stroke = Stroke { brush, points: if smoothing > 0.0 { photocraft_paint::smooth(&pts, smoothing) } else { pts } };
+            let id = layer_param(s, p)?;
+            let label = if stroke.brush.erase { "Eraser" } else { "Brush Tool" };
+            let dmg = s.edit(label, |doc, _| {
+                let sel = doc.selection.clone();
+                let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+                let lock = l.locks.transparency;
+                let surf = l.surface_mut().ok_or_else(|| EngineError::Other("not a pixel layer".into()))?;
+                Ok(photocraft_paint::apply_stroke(surf, &stroke, sel.as_ref(), lock))
+            })?;
+            if let Some(st) = s.active_mut() {
+                st.last_damage = Some(dmg);
+            }
+            Ok(json!({ "damage": [dmg.x0, dmg.y0, dmg.width(), dmg.height()] }))
+        }),
+        cmd!("tools.setColors", "Set Colors", [], None, r##"{"foreground":"#rrggbb"?,"background":"#rrggbb"?}"##, always, |s, p| {
+            s.tools.foreground = color_param(p, "foreground", s.tools.foreground);
+            s.tools.background = color_param(p, "background", s.tools.background);
+            Ok(Value::Null)
+        }),
+        cmd!("tools.swapColors", "Switch Foreground and Background Colors", [], Some("X"), "{}", always, |s, _| {
+            std::mem::swap(&mut s.tools.foreground, &mut s.tools.background);
+            Ok(Value::Null)
+        }),
+        cmd!("tools.defaultColors", "Default Foreground and Background Colors", [], Some("D"), "{}", always, |s, _| {
+            s.tools.foreground = [0.0, 0.0, 0.0, 1.0];
+            s.tools.background = [1.0, 1.0, 1.0, 1.0];
+            Ok(Value::Null)
+        }),
+        // Queries (not journaled)
+        CommandSpec { id: "session.inspect", label: "Inspect Session", menu: &[], shortcut: None, params: "{}", enabled: always, run: |s, _| Ok(inspect::session(s)), journal: false },
+        CommandSpec { id: "document.inspect", label: "Inspect Document", menu: &[], shortcut: None, params: r##"{"document":index?}"##, enabled: has_doc, run: |s, p| {
+            let i = p.get("document").and_then(Value::as_u64).map(|v| v as usize).or(s.active_index()).ok_or(EngineError::NoDocument)?;
+            let d = s.documents().get(i).ok_or(EngineError::NoDocument)?;
+            Ok(inspect::document(d))
+        }, journal: false },
+        CommandSpec { id: "document.activate", label: "Activate Document", menu: &[], shortcut: None, params: r##"{"document":index}"##, enabled: has_doc, run: |s, p| {
+            let i = p.get("document").and_then(Value::as_u64).ok_or_else(|| bad("document.activate", "missing `document`"))?;
+            if s.set_active(i as usize) { Ok(Value::Null) } else { Err(EngineError::NoDocument) }
+        }, journal: false },
+        CommandSpec { id: "command.list", label: "List Commands", menu: &[], shortcut: None, params: "{}", enabled: always, run: |s, _| {
+            Ok(Value::Array(command_specs().iter().map(|c| json!({
+                "id": c.id, "label": c.label, "menu": c.menu, "shortcut": c.shortcut, "params": c.params, "enabled": (c.enabled)(s).is_ok(),
+            })).collect()))
+        }, journal: false },
+        CommandSpec { id: "document.pixel", label: "Read Composite Pixel", menu: &[], shortcut: None, params: r##"{"x":i32,"y":i32}"##, enabled: has_doc, run: |s, p| {
+            let x = int(p, "x").unwrap_or(0) as i32;
+            let y = int(p, "y").unwrap_or(0) as i32;
+            let d = s.active().ok_or(EngineError::NoDocument)?;
+            let px = photocraft_compose::render(&d.doc, Rect::from_xywh(x, y, 1, 1)).px[0];
+            Ok(json!(px))
+        }, journal: false },
+    ];
+
+    // Adjustment layers + destructive adjustments, generated from one list.
+    const ADJ: &[(&str, &str, &str)] = &[
+        ("brightnessContrast", "Brightness/Contrast…", r##"{"brightness":-150..150,"contrast":-50..100}"##),
+        ("levels", "Levels…", r##"{"inBlack":0..255,"inWhite":0..255,"gamma":0.1..10}"##),
+        ("curves", "Curves…", r##"{"points":[[in,out],…] in 0..255}"##),
+        ("exposure", "Exposure…", r##"{"exposure":-20..20,"offset":-0.5..0.5,"gamma":0.01..9.99}"##),
+        ("vibrance", "Vibrance…", r##"{"vibrance":-100..100,"saturation":-100..100}"##),
+        ("hueSaturation", "Hue/Saturation…", r##"{"hue":-180..180,"saturation":-100..100,"lightness":-100..100,"colorize":bool}"##),
+        ("colorBalance", "Color Balance…", "{}"),
+        ("blackWhite", "Black & White…", "{}"),
+        ("photoFilter", "Photo Filter…", r##"{"density":0..100}"##),
+        ("channelMixer", "Channel Mixer…", "{}"),
+        ("invert", "Invert", "{}"),
+        ("posterize", "Posterize…", r##"{"levels":2..255}"##),
+        ("threshold", "Threshold…", r##"{"level":1..255}"##),
+        ("gradientMap", "Gradient Map…", "{}"),
+    ];
+    for &(kind, label, params) in ADJ {
+        let layer_id: &'static str = Box::leak(format!("layer.newAdjustmentLayer.{kind}").into_boxed_str());
+        let image_id: &'static str = Box::leak(format!("image.adjustments.{kind}").into_boxed_str());
+        v.push(CommandSpec {
+            id: layer_id,
+            label,
+            menu: &["Layer", "New Adjustment Layer"],
+            shortcut: None,
+            params,
+            enabled: has_doc,
+            run: |s, p| {
+                let kind = p.get("__kind").and_then(Value::as_str).unwrap_or("invert").to_string();
+                new_adjustment(s, adjustment_from_params(&kind, p))
+            },
+            journal: true,
+        });
+        v.push(CommandSpec {
+            id: image_id,
+            label,
+            menu: &["Image", "Adjustments"],
+            shortcut: match kind {
+                "levels" => Some("Cmd+L"),
+                "curves" => Some("Cmd+M"),
+                "hueSaturation" => Some("Cmd+U"),
+                "colorBalance" => Some("Cmd+B"),
+                "invert" => Some("Cmd+I"),
+                "blackWhite" => Some("Cmd+Alt+Shift+B"),
+                _ => None,
+            },
+            params,
+            enabled: has_pixel_layer,
+            run: |s, p| {
+                let kind = p.get("__kind").and_then(Value::as_str).unwrap_or("invert").to_string();
+                let adj = adjustment_from_params(&kind, p);
+                let label = adj.label().to_string();
+                destructive_adjust(s, &label, adj)
+            },
+            journal: true,
+        });
+    }
+    v.extend(crate::layer_style::specs());
+    v.extend(crate::filters::specs());
+    v
+}
+
+/// Commands generated from a table share one `run` fn; the kind is recovered from the id.
+pub(crate) fn inject_kind(id: &str, params: Value) -> Value {
+    let kind = id.strip_prefix("layer.newAdjustmentLayer.").or_else(|| id.strip_prefix("image.adjustments."));
+    match (kind, params) {
+        (Some(k), Value::Object(mut m)) => {
+            m.insert("__kind".into(), Value::String(k.into()));
+            Value::Object(m)
+        }
+        (Some(k), _) => json!({ "__kind": k }),
+        (None, p) => p,
+    }
+}
+
+pub fn adjustment_kind(a: &Adjustment) -> &'static str {
+    match a {
+        Adjustment::BrightnessContrast { .. } => "brightnessContrast",
+        Adjustment::Levels { .. } => "levels",
+        Adjustment::Curves { .. } => "curves",
+        Adjustment::Exposure { .. } => "exposure",
+        Adjustment::Vibrance { .. } => "vibrance",
+        Adjustment::HueSaturation { .. } => "hueSaturation",
+        Adjustment::ColorBalance { .. } => "colorBalance",
+        Adjustment::BlackWhite { .. } => "blackWhite",
+        Adjustment::PhotoFilter { .. } => "photoFilter",
+        Adjustment::ChannelMixer { .. } => "channelMixer",
+        Adjustment::Posterize { .. } => "posterize",
+        Adjustment::Threshold { .. } => "threshold",
+        Adjustment::GradientMap { .. } => "gradientMap",
+        _ => "invert",
+    }
+}
+
+fn arrange(s: &mut Session, p: &Value, delta: i32) -> Result<Value> {
+    let id = layer_param(s, p)?;
+    s.edit("Arrange", |doc, _| {
+        let steps = match delta {
+            i32::MAX => 10_000,
+            i32::MIN => -10_000,
+            d => d,
+        };
+        let dir = steps.signum();
+        let mut moved = false;
+        for _ in 0..steps.abs() {
+            if !doc.shift(id, dir) {
+                break;
+            }
+            moved = true;
+        }
+        if moved { Ok(()) } else { Err(EngineError::Other("layer can't move further".into())) }
+    })?;
+    Ok(Value::Null)
+}
+
+fn set_mask(s: &mut Session, p: &Value, label: &str, mask: Option<LayerMask>) -> Result<Value> {
+    let id = layer_param(s, p)?;
+    s.edit(label, |doc, _| {
+        doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?.mask = mask;
+        Ok(())
+    })?;
+    Ok(Value::Null)
+}
+
+fn combine(a: &Surface, b: &Surface, area: Rect, f: impl Fn(f32, f32) -> f32) -> Surface {
+    let ra = a.read_region(area);
+    let rb = b.read_region(area);
+    let data: Vec<f32> = ra.iter().zip(&rb).map(|(x, y)| f(*x, *y)).collect();
+    let mut out = Surface::new(photocraft_color::PixelFormat::GRAY8);
+    out.write_region(area, &data);
+    out.prune();
+    out
+}
+
+fn translate_layer(l: &mut Layer, dx: i32, dy: i32) {
+    if let Some(m) = &mut l.mask
+        && m.linked
+    {
+        m.surface = pixels::remap_surface(&m.surface, |x, y| (x + dx, y + dy));
+    }
+    match &mut l.content {
+        LayerContent::Raster(s) => *s = pixels::remap_surface(s, |x, y| (x + dx, y + dy)),
+        LayerContent::Group(g) => {
+            for c in &mut g.children {
+                translate_layer(c, dx, dy);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Does `l` (or any descendant) have id `target`?
+fn contains_layer(l: &Layer, target: LayerId) -> bool {
+    l.id == target || l.children().is_some_and(|c| c.iter().any(|c| contains_layer(c, target)))
+}

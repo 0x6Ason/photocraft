@@ -1,0 +1,739 @@
+//! CPU reference renderer for layer effects (layer styles).
+//!
+//! Render order, bottom to top (Photoshop's layer-style stack read upwards):
+//! drop shadows, outer glows, outer bevel, then the layer itself (content at
+//! fill opacity) with pattern/gradient/colour overlays, satin, inner glows,
+//! inner shadows, strokes and the inner bevel on top. Exterior effects blend
+//! straight into the backdrop with their own modes; the layer and its
+//! interior effects blend with the layer's mode. Layer opacity applies to
+//! the whole stack; fill opacity only to the layer's own pixels.
+//!
+//! Shapes come from the layer's alpha (after its mask). Distances use an
+//! exact Euclidean distance transform; soft falloffs use three box-blur
+//! passes (≈ Gaussian) whose total support equals the effect size.
+
+use photocraft_color::blend::BlendMode;
+use photocraft_doc::{
+    Bevel, BevelStyle, Contour, Effect, FxPaint, GlobalLight, Glow, GlowSource, GlowTechnique, Gradient, GradientStyle, Layer, Shadow,
+    StrokePosition,
+};
+use photocraft_geom::Rect;
+
+use crate::{Buffer, psblend};
+
+/// `true` if the layer has at least one enabled effect and the master switch is on.
+pub fn has_effects(layer: &Layer) -> bool {
+    layer.effects.enabled && layer.effects.items.iter().any(Effect::enabled)
+}
+
+/// Pixels an effect stack can reach beyond the layer's shape.
+pub fn margin(layer: &Layer) -> i32 {
+    let mut m = 0.0f32;
+    for e in layer.effects.items.iter().filter(|e| e.enabled()) {
+        let r = match e {
+            Effect::DropShadow(s) | Effect::InnerShadow(s) => s.distance + s.size,
+            Effect::OuterGlow(g) | Effect::InnerGlow(g) => g.size,
+            Effect::Stroke(s) => s.size,
+            Effect::Satin(s) => s.distance + s.size,
+            Effect::BevelEmboss(b) => b.size + b.soften,
+            _ => 0.0,
+        };
+        if r.is_finite() {
+            m = m.max(r);
+        }
+    }
+    // Bounded so malformed values can't request huge buffers; effects that
+    // reach further are clipped at this distance.
+    m.clamp(0.0, MAX_REACH).ceil() as i32 + 2
+}
+
+/// Maximum distance (px) an effect is rendered from the layer's shape.
+pub const MAX_REACH: f32 = 512.0;
+
+/// A single-channel map over a rectangle.
+#[derive(Clone)]
+struct Map {
+    w: usize,
+    h: usize,
+    v: Vec<f32>,
+}
+
+impl Map {
+    fn new(w: usize, h: usize, fill: f32) -> Self {
+        Map { w, h, v: vec![fill; w * h] }
+    }
+    fn get(&self, x: i64, y: i64) -> f32 {
+        if x < 0 || y < 0 || x >= self.w as i64 || y >= self.h as i64 { 0.0 } else { self.v[y as usize * self.w + x as usize] }
+    }
+    /// Shifted copy (bilinear), outside reads `outside`.
+    fn shifted(&self, dx: f32, dy: f32, outside: f32) -> Map {
+        let mut out = Map::new(self.w, self.h, 0.0);
+        let (fx, fy) = (dx.floor(), dy.floor());
+        let (ax, ay) = (dx - fx, dy - fy);
+        let s = |x: i64, y: i64| if x < 0 || y < 0 || x >= self.w as i64 || y >= self.h as i64 { outside } else { self.v[y as usize * self.w + x as usize] };
+        for y in 0..self.h as i64 {
+            for x in 0..self.w as i64 {
+                let (sx, sy) = (x - fx as i64, y - fy as i64);
+                let v00 = s(sx, sy);
+                let v10 = s(sx - 1, sy);
+                let v01 = s(sx, sy - 1);
+                let v11 = s(sx - 1, sy - 1);
+                let top = v00 * (1.0 - ax) + v10 * ax;
+                let bot = v01 * (1.0 - ax) + v11 * ax;
+                out.v[y as usize * self.w + x as usize] = top * (1.0 - ay) + bot * ay;
+            }
+        }
+        out
+    }
+    fn map(mut self, f: impl Fn(f32) -> f32) -> Self {
+        for v in &mut self.v {
+            *v = f(*v);
+        }
+        self
+    }
+}
+
+/// 1D squared distance transform (Felzenszwalb & Huttenlocher).
+fn dt1(f: &[f32], out: &mut [f32], v: &mut [usize], z: &mut [f32], near: &mut [usize]) {
+    let n = f.len();
+    let mut k = 0usize;
+    v[0] = 0;
+    z[0] = f32::NEG_INFINITY;
+    z[1] = f32::INFINITY;
+    for q in 1..n {
+        loop {
+            let p = v[k];
+            let s = ((f[q] + (q * q) as f32) - (f[p] + (p * p) as f32)) / (2.0 * q as f32 - 2.0 * p as f32);
+            if s <= z[k] && k > 0 {
+                k -= 1;
+                continue;
+            }
+            if s <= z[k] {
+                // k == 0 and parabola dominates: replace.
+                v[0] = q;
+                z[0] = f32::NEG_INFINITY;
+                z[1] = f32::INFINITY;
+                break;
+            }
+            k += 1;
+            v[k] = q;
+            z[k] = s;
+            z[k + 1] = f32::INFINITY;
+            break;
+        }
+    }
+    k = 0;
+    for (q, o) in out.iter_mut().enumerate() {
+        while z[k + 1] < q as f32 {
+            k += 1;
+        }
+        let p = v[k];
+        let d = q as f32 - p as f32;
+        *o = d * d + f[p];
+        near[q] = p;
+    }
+}
+
+/// Exact Euclidean distance from every pixel to the nearest pixel where
+/// `inside` is true (0 on those pixels).
+#[cfg(test)]
+fn edt(inside: &[bool], w: usize, h: usize) -> Vec<f32> {
+    edt_nearest(inside, w, h).0
+}
+
+/// [`edt`] plus the index of the nearest `inside` pixel.
+fn edt_nearest(inside: &[bool], w: usize, h: usize) -> (Vec<f32>, Vec<usize>) {
+    const INF: f32 = 1e20;
+    let mut g: Vec<f32> = inside.iter().map(|&b| if b { 0.0 } else { INF }).collect();
+    let mut near_row = vec![0usize; w * h];
+    let mut nearest = vec![0usize; w * h];
+    let n = w.max(h);
+    let (mut f, mut o, mut v, mut z, mut nr) = (vec![0.0; n], vec![0.0; n], vec![0usize; n], vec![0.0f32; n + 1], vec![0usize; n]);
+    for x in 0..w {
+        for y in 0..h {
+            f[y] = g[y * w + x];
+        }
+        dt1(&f[..h], &mut o[..h], &mut v, &mut z, &mut nr[..h]);
+        for y in 0..h {
+            g[y * w + x] = o[y];
+            near_row[y * w + x] = nr[y];
+        }
+    }
+    for y in 0..h {
+        f[..w].copy_from_slice(&g[y * w..(y + 1) * w]);
+        dt1(&f[..w], &mut o[..w], &mut v, &mut z, &mut nr[..w]);
+        for x in 0..w {
+            g[y * w + x] = o[x].sqrt();
+            let px = nr[x];
+            nearest[y * w + x] = near_row[y * w + px] * w + px;
+        }
+    }
+    (g, nearest)
+}
+
+/// Distance from each pixel centre outside the shape to the shape's edge.
+/// Pixels with non-zero alpha are inside; the edge inside the nearest such
+/// pixel is placed by its alpha (coverage), as Photoshop does. Inside pixels
+/// get ≤ 0.
+fn dist_outside(s: &Map) -> Vec<f32> {
+    let inside: Vec<bool> = s.v.iter().map(|&a| a > INSIDE_EPS).collect();
+    let (d, near) = edt_nearest(&inside, s.w, s.h);
+    (0..d.len()).map(|i| if inside[i] { -0.5 } else { d[i] - 0.5 + (1.0 - s.v[near[i]].min(1.0)) }).collect()
+}
+
+/// Distance from each pixel centre inside the shape to the shape's edge
+/// (≤ 0 outside).
+fn dist_inside(s: &Map) -> Vec<f32> {
+    let outside: Vec<bool> = s.v.iter().map(|&a| a <= INSIDE_EPS).collect();
+    let (d, _) = edt_nearest(&outside, s.w, s.h);
+    d.iter().zip(&outside).map(|(d, o)| if *o { -0.5 } else { d - 0.5 }).collect()
+}
+
+/// Alpha relative to the 3×3 neighbourhood maximum: separates edge coverage
+/// from the fill's own opacity on shape layers.
+fn local_coverage(s: &Map) -> Map {
+    let mut out = s.clone();
+    for y in 0..s.h as i64 {
+        for x in 0..s.w as i64 {
+            let a = s.get(x, y);
+            if a <= INSIDE_EPS {
+                continue;
+            }
+            let mut mx = a;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    mx = mx.max(s.get(x + dx, y + dy));
+                }
+            }
+            out.v[y as usize * s.w + x as usize] = (a / mx).min(1.0);
+        }
+    }
+    out
+}
+
+/// Alpha above which a pixel belongs to the layer's shape (half an 8-bit step).
+const INSIDE_EPS: f32 = 0.5 / 255.0;
+
+/// Photoshop's effect "size" → Gaussian sigma (fitted on the corpus).
+fn sigma_for(size: f32) -> f32 {
+    // Least-squares fit of a drop shadow against Photoshop's composite
+    // (ag-psd effects fixture): sigma = 0.4 × size, offsets rounded to pixels.
+    size * 0.4
+}
+
+/// Separable Gaussian blur for an effect of `size` pixels.
+fn blur(m: &mut Map, size: f32) {
+    let sigma = sigma_for(size);
+    if sigma < 0.2 {
+        return;
+    }
+    let r = (sigma * 3.0).ceil() as i64;
+    let kernel: Vec<f32> = (-r..=r).map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp()).collect();
+    let sum: f32 = kernel.iter().sum();
+    let kernel: Vec<f32> = kernel.iter().map(|k| k / sum).collect();
+    let (w, h) = (m.w as i64, m.h as i64);
+    let mut tmp = vec![0.0f32; m.v.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0;
+            for (k, kv) in kernel.iter().enumerate() {
+                let xx = x + k as i64 - r;
+                if xx >= 0 && xx < w {
+                    acc += m.v[(y * w + xx) as usize] * kv;
+                }
+            }
+            tmp[(y * w + x) as usize] = acc;
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0;
+            for (k, kv) in kernel.iter().enumerate() {
+                let yy = y + k as i64 - r;
+                if yy >= 0 && yy < h {
+                    acc += tmp[(yy * w + x) as usize] * kv;
+                }
+            }
+            m.v[(y * w + x) as usize] = acc;
+        }
+    }
+}
+
+/// Grows the shape by `r` pixels (anti-aliased), keeping the original soft edge.
+fn dilate(s: &Map, r: f32) -> Map {
+    if r <= 0.0 {
+        return s.clone();
+    }
+    let d = dist_outside(s);
+    let mut out = s.clone();
+    for (o, d) in out.v.iter_mut().zip(d) {
+        *o = o.max((r + 0.5 - d).clamp(0.0, 1.0));
+    }
+    out
+}
+
+fn contour_lut(c: &Contour) -> Option<Vec<f32>> {
+    match c {
+        Contour::Linear => None,
+        Contour::Custom { points, .. } => Some(crate::adjust::curve_lut(points)),
+    }
+}
+
+fn apply_contour(m: Map, c: &Contour) -> Map {
+    match contour_lut(c) {
+        None => m,
+        Some(l) => m.map(|v| {
+            let x = v.clamp(0.0, 1.0) * (l.len() - 1) as f32;
+            let i = x.floor() as usize;
+            let j = (i + 1).min(l.len() - 1);
+            l[i] + (l[j] - l[i]) * (x - i as f32)
+        }),
+    }
+}
+
+fn rgb(c: &photocraft_color::Color) -> [f32; 3] {
+    c.to_rgb()
+}
+
+/// Offset of an effect lit from `angle` at `distance` (shadow falls away from
+/// the light), rounded to whole pixels as Photoshop does.
+fn offset(angle: f32, distance: f32) -> (f32, f32) {
+    let a = angle.to_radians();
+    ((-a.cos() * distance).round(), (a.sin() * distance).round())
+}
+
+/// Gradient parameter `t` in `0..=1` for pixel centre `(x, y)` inside `bounds`.
+#[allow(clippy::too_many_arguments)]
+pub fn gradient_t(style: GradientStyle, angle: f32, scale: f32, reverse: bool, offset: (f32, f32), bounds: Rect, x: f32, y: f32) -> f32 {
+    let w = bounds.width().max(1) as f32;
+    let h = bounds.height().max(1) as f32;
+    let cx = bounds.x0 as f32 + w / 2.0 + offset.0 * w;
+    let cy = bounds.y0 as f32 + h / 2.0 + offset.1 * h;
+    let (s, c) = angle.to_radians().sin_cos();
+    let (dx, dy) = (x - cx, y - cy);
+    // Distance along the gradient direction (y axis points down).
+    let along = dx * c - dy * s;
+    let across = dx * s + dy * c;
+    // Gradient length: the bounds' extent along the angle as an ellipse
+    // norm (a unit gradient scaled to the bounds); fitted on psd-tools
+    // gradient-styles.psd (cached Photoshop renderings of every style).
+    let len = ((c * w).powi(2) + (s * h).powi(2)).sqrt().max(1.0) * scale.max(1e-3);
+    let mut t = match style {
+        GradientStyle::Linear => along / len + 0.5,
+        GradientStyle::Reflected => (along / (len / 2.0)).abs(),
+        GradientStyle::Radial => (dx * dx + dy * dy).sqrt() / (len / 2.0),
+        GradientStyle::Diamond => (along.abs() + across.abs()) / (len / 2.0),
+        // Clockwise sweep starting at the gradient angle.
+        GradientStyle::Angle => ((angle.to_radians() - (-dy).atan2(dx)) / std::f32::consts::TAU).rem_euclid(1.0),
+    };
+    t = t.clamp(0.0, 1.0);
+    if reverse { 1.0 - t } else { t }
+}
+
+/// Samples colour and opacity stops at `t`.
+pub fn sample_gradient(g: &Gradient, t: f32) -> [f32; 4] {
+    let color = sample_stops(&g.stops.iter().map(|(p, c)| (*p, rgb(c))).collect::<Vec<_>>(), t);
+    let alpha = if g.opacity_stops.is_empty() {
+        1.0
+    } else {
+        sample_stops(&g.opacity_stops.iter().map(|(p, a)| (*p, [*a; 3])).collect::<Vec<_>>(), t)[0]
+    };
+    [color[0], color[1], color[2], alpha]
+}
+
+fn sample_stops(stops: &[(f32, [f32; 3])], t: f32) -> [f32; 3] {
+    match stops {
+        [] => [t; 3],
+        [s] => s.1,
+        _ => {
+            if t <= stops[0].0 {
+                return stops[0].1;
+            }
+            for w in stops.windows(2) {
+                if t <= w[1].0 {
+                    let k = if w[1].0 > w[0].0 { (t - w[0].0) / (w[1].0 - w[0].0) } else { 0.0 };
+                    return std::array::from_fn(|i| w[0].1[i] + (w[1].1[i] - w[0].1[i]) * k);
+                }
+            }
+            stops[stops.len() - 1].1
+        }
+    }
+}
+
+/// Composite `color × coverage` into `dst` (both over the same rectangle).
+fn paint(dst: &mut Buffer, m: &Map, color: impl Fn(usize) -> [f32; 4], blend: BlendMode, opacity: f32) {
+    for (i, p) in dst.px.iter_mut().enumerate() {
+        let a = m.v[i] * opacity;
+        if a <= 0.0 {
+            continue;
+        }
+        let c = color(i);
+        *p = psblend::composite(blend, *p, [c[0], c[1], c[2], c[3] * a], 1.0);
+    }
+}
+
+fn paint_color(dst: &mut Buffer, m: &Map, c: [f32; 3], blend: BlendMode, opacity: f32) {
+    paint(dst, m, |_| [c[0], c[1], c[2], 1.0], blend, opacity);
+}
+
+fn shadow_map(shape: &Map, s: &Shadow, light: &GlobalLight, inner: bool) -> Map {
+    let angle = if s.use_global_light { light.angle } else { s.angle };
+    let (dx, dy) = offset(angle, s.distance);
+    let src = if inner { shape.clone().map(|a| 1.0 - a) } else { shape.clone() };
+    let mut m = src.shifted(dx, dy, if inner { 1.0 } else { 0.0 });
+    m = dilate(&m, s.size * s.spread);
+    blur(&mut m, s.size * (1.0 - s.spread));
+    let mut m = apply_contour(m, &s.contour);
+    if inner {
+        for (v, a) in m.v.iter_mut().zip(&shape.v) {
+            *v *= a;
+        }
+    }
+    m
+}
+
+fn glow_map(shape: &Map, g: &Glow, inner: bool) -> Map {
+    let src = if inner {
+        match g.source {
+            GlowSource::Edge => shape.clone().map(|a| 1.0 - a),
+            GlowSource::Center => shape.clone(),
+        }
+    } else {
+        shape.clone()
+    };
+    let mut m = match g.technique {
+        GlowTechnique::Precise => {
+            let d = if inner && g.source == GlowSource::Edge { dist_inside(shape) } else { dist_outside(&src) };
+            let solid = g.size * g.spread;
+            let soft = (g.size - solid).max(1e-3);
+            let mut m = Map::new(shape.w, shape.h, 0.0);
+            for (o, d) in m.v.iter_mut().zip(d) {
+                *o = if d <= solid { 1.0 } else { (1.0 - (d - solid) / soft).clamp(0.0, 1.0) };
+            }
+            if inner && g.source == GlowSource::Center {
+                m = m.map(|v| 1.0 - v);
+            }
+            m
+        }
+        GlowTechnique::Softer => {
+            let mut m = dilate(&src, g.size * g.spread);
+            blur(&mut m, g.size * (1.0 - g.spread));
+            if inner && g.source == GlowSource::Center {
+                // Brightest in the middle: coverage from the distance to the edge.
+                let mut e = dilate(&shape.clone().map(|a| 1.0 - a), g.size * g.spread);
+                blur(&mut e, g.size * (1.0 - g.spread));
+                m = e.map(|v| 1.0 - v);
+            }
+            m
+        }
+    };
+    m = apply_contour(m, &g.contour);
+    if inner {
+        for (v, a) in m.v.iter_mut().zip(&shape.v) {
+            *v *= a;
+        }
+    }
+    m
+}
+
+fn paint_fx(dst: &mut Buffer, m: &Map, p: &FxPaint, shape_bounds: Rect, big: Rect, blend: BlendMode, opacity: f32) {
+    match p {
+        FxPaint::Color(c) => paint_color(dst, m, rgb(c), blend, opacity),
+        FxPaint::Gradient(g) => {
+            let w = big.width() as usize;
+            paint(
+                dst,
+                m,
+                |i| {
+                    let (x, y) = ((big.x0 + (i % w) as i32) as f32 + 0.5, (big.y0 + (i / w) as i32) as f32 + 0.5);
+                    sample_gradient(g, gradient_t(g.style, g.angle, g.scale, g.reverse, g.offset, shape_bounds, x, y))
+                },
+                blend,
+                opacity,
+            )
+        }
+        FxPaint::Pattern { .. } => {}
+    }
+}
+
+/// Bevel highlight and shadow maps for the inner (or outer) bevel.
+fn bevel_maps(shape: &Map, b: &Bevel, light: &GlobalLight) -> (Map, Map, bool) {
+    let outer = b.style == BevelStyle::OuterBevel;
+    let size = b.size.max(1.0);
+    let (din, dout) = (dist_inside(shape), dist_outside(shape));
+    let mut hmap = Map::new(shape.w, shape.h, 0.0);
+    for i in 0..hmap.v.len() {
+        hmap.v[i] = match b.style {
+            BevelStyle::OuterBevel => 1.0 - (dout[i] / size).clamp(0.0, 1.0),
+            BevelStyle::Emboss | BevelStyle::PillowEmboss => {
+                if din[i] > 0.0 { 0.5 + 0.5 * (din[i] / (size / 2.0)).clamp(0.0, 1.0) } else { 0.5 - 0.5 * (dout[i] / (size / 2.0)).clamp(0.0, 1.0) }
+            }
+            _ => (din[i] / size).clamp(0.0, 1.0),
+        };
+    }
+    // Smooth technique: round the profile.
+    hmap = hmap.map(|v| (v * std::f32::consts::FRAC_PI_2).sin());
+    blur(&mut hmap, b.soften.max(1.0));
+    let (angle, altitude) = if b.use_global_light { (light.angle, light.altitude) } else { (b.angle, b.altitude) };
+    let (sa, ca) = angle.to_radians().sin_cos();
+    let (se, ce) = altitude.to_radians().sin_cos();
+    let light_v = [ca * ce, -sa * ce, se];
+    let depth = b.depth * size * if b.up { 1.0 } else { -1.0 };
+    let (mut hi, mut sh) = (Map::new(shape.w, shape.h, 0.0), Map::new(shape.w, shape.h, 0.0));
+    for y in 0..shape.h as i64 {
+        for x in 0..shape.w as i64 {
+            let i = y as usize * shape.w + x as usize;
+            let gx = (hmap.get(x + 1, y) - hmap.get(x - 1, y)) * 0.5 * depth;
+            let gy = (hmap.get(x, y + 1) - hmap.get(x, y - 1)) * 0.5 * depth;
+            let n = [-gx, -gy, 1.0];
+            let len = (n[0] * n[0] + n[1] * n[1] + 1.0).sqrt();
+            let shade = (n[0] * light_v[0] + n[1] * light_v[1] + n[2] * light_v[2]) / len;
+            let region = if outer { (1.0 - shape.v[i]) * f32::from(hmap.v[i] > 0.0) } else { shape.v[i] };
+            let k = shade - se;
+            if k > 0.0 {
+                hi.v[i] = (k / (1.0 - se).max(1e-3)).clamp(0.0, 1.0) * region;
+            } else {
+                sh.v[i] = (-k / se.max(1e-3)).clamp(0.0, 1.0) * region;
+            }
+        }
+    }
+    (apply_contour(hi, &b.gloss_contour), apply_contour(sh, &b.gloss_contour), outer)
+}
+
+/// Composites `content` (the layer's own pixels over `big`, alpha already
+/// masked, clipped layers applied) plus its effects into `backdrop`.
+pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Buffer, light: &GlobalLight, layer_bounds: Rect) {
+    let big = content.rect;
+    let (w, h) = (big.width() as usize, big.height() as usize);
+    let shape = Map { w, h, v: content.px.iter().map(|p| p[3]).collect() };
+    // Layer bounds (gradients aligned with the layer use the whole layer,
+    // independent of the render rect).
+    let sb = layer_bounds;
+    let rect = backdrop.rect;
+    let before = backdrop.clone();
+    // Exterior effects are painted on a backdrop copy extended to `big`.
+    let mut work = Buffer::transparent(big);
+    for y in rect.y0.max(big.y0)..rect.y1.min(big.y1) {
+        for x in rect.x0.max(big.x0)..rect.x1.min(big.x1) {
+            work.px[((y - big.y0) as usize) * w + (x - big.x0) as usize] = before.get(x, y);
+        }
+    }
+    let items: Vec<&Effect> = layer.effects.items.iter().filter(|e| e.enabled()).collect();
+    let vector_shape = matches!(layer.content, photocraft_doc::LayerContent::Shape(_));
+    // Multiple instances: the first listed is on top, so paint in reverse.
+    let rev = || items.iter().rev().copied();
+
+    for e in rev() {
+        if let Effect::DropShadow(s) = e {
+            let mut m = shadow_map(&shape, s, light, false);
+            if s.knocks_out {
+                for (v, a) in m.v.iter_mut().zip(&shape.v) {
+                    *v *= 1.0 - a;
+                }
+            }
+            paint_color(&mut work, &m, rgb(&s.color), s.common.blend, s.common.opacity);
+        }
+    }
+    for e in rev() {
+        if let Effect::OuterGlow(g) = e {
+            let m = glow_map(&shape, g, false);
+            paint_fx(&mut work, &m, &g.paint, sb, big, g.common.blend, g.common.opacity);
+        }
+    }
+
+    // The layer: content at fill opacity, then interior effects.
+    let fill = layer.fill_opacity;
+    let mut lay = Buffer { rect: big, px: content.px.iter().map(|p| [p[0], p[1], p[2], p[3] * fill]).collect() };
+    let full = shape.clone();
+    for e in rev() {
+        if let Effect::GradientOverlay { common, gradient, .. } = e {
+            paint_fx(&mut lay, &full, &FxPaint::Gradient(gradient.clone()), sb, big, common.blend, common.opacity)
+        }
+    }
+    for e in rev() {
+        if let Effect::ColorOverlay { common, color } = e {
+            paint_color(&mut lay, &full, rgb(color), common.blend, common.opacity);
+        }
+    }
+    for e in rev() {
+        if let Effect::Satin(s) = e {
+            let (dx, dy) = offset(s.angle, s.distance);
+            let mut a = shape.shifted(dx, dy, 0.0);
+            let mut b = shape.shifted(-dx, -dy, 0.0);
+            blur(&mut a, s.size);
+            blur(&mut b, s.size);
+            let mut m = Map { w, h, v: a.v.iter().zip(&b.v).map(|(x, y)| (x - y).abs()).collect() };
+            if s.invert {
+                m = m.map(|v| 1.0 - v);
+            }
+            let mut m = apply_contour(m, &s.contour);
+            for (v, a) in m.v.iter_mut().zip(&shape.v) {
+                *v *= a;
+            }
+            paint_color(&mut lay, &m, rgb(&s.color), s.common.blend, s.common.opacity);
+        }
+    }
+    for e in rev() {
+        if let Effect::InnerGlow(g) = e {
+            let m = glow_map(&shape, g, true);
+            paint_fx(&mut lay, &m, &g.paint, sb, big, g.common.blend, g.common.opacity);
+        }
+    }
+    for e in rev() {
+        if let Effect::InnerShadow(s) = e {
+            let m = shadow_map(&shape, s, light, true);
+            paint_color(&mut lay, &m, rgb(&s.color), s.common.blend, s.common.opacity);
+        }
+    }
+    // Strokes. Outside parts are slid beneath the layer, so the first listed
+    // (top) instance is processed first; inside parts are painted over it,
+    // bottom instance first.
+    let strokes: Vec<&photocraft_doc::StrokeFx> = items.iter().filter_map(|e| if let Effect::Stroke(s) = e { Some(s) } else { None }).collect();
+    let (din, dout) = if strokes.is_empty() { (Vec::new(), Vec::new()) } else { (dist_inside(&shape), dist_outside(&shape)) };
+    let widths = |st: &photocraft_doc::StrokeFx| match st.position {
+        StrokePosition::Outside => (0.0, st.size),
+        StrokePosition::Inside => (st.size, 0.0),
+        StrokePosition::Center => (st.size / 2.0, st.size / 2.0),
+    };
+    let vcov = if vector_shape && !strokes.is_empty() { Some(local_coverage(&shape)) } else { None };
+    let vdout = vcov.as_ref().map(dist_outside);
+    for st in strokes.iter().copied() {
+        let (_, out_w) = widths(st);
+        if out_w <= 0.0 {
+            continue;
+        }
+        // Shape layers: Photoshop strokes the vector outline, estimated from
+        // local coverage; the stroke never shows through the shape's pixels.
+        let d = vdout.as_ref().unwrap_or(&dout);
+        let mut m = Map::new(w, h, 0.0);
+        for ((mv, a), dv) in m.v.iter_mut().zip(&shape.v).zip(d) {
+            *mv = if *a > INSIDE_EPS {
+                if vector_shape { 0.0 } else { 1.0 }
+            } else {
+                (out_w + 0.5 - dv).clamp(0.0, 1.0)
+            };
+        }
+        let mut under = Buffer::transparent(big);
+        paint_fx(&mut under, &m, &st.paint, sb, big, BlendMode::Normal, st.common.opacity);
+        for (u, l) in under.px.iter_mut().zip(&lay.px) {
+            *u = psblend::composite(BlendMode::Normal, *u, *l, 1.0);
+        }
+        lay = under;
+    }
+    for st in strokes.iter().rev().copied() {
+        let (in_w, _) = widths(st);
+        if in_w <= 0.0 {
+            continue;
+        }
+        let mut m = Map::new(w, h, 0.0);
+        for ((mv, a), dv) in m.v.iter_mut().zip(&shape.v).zip(&din) {
+            *mv = (in_w + 0.5 - dv).clamp(0.0, 1.0) * a;
+        }
+        paint_fx(&mut lay, &m, &st.paint, sb, big, st.common.blend, st.common.opacity);
+    }
+    for e in rev() {
+        if let Effect::BevelEmboss(b) = e {
+            let (hi, sh, outer) = bevel_maps(&shape, b, light);
+            let dst = if outer { &mut work } else { &mut lay };
+            paint_color(dst, &hi, rgb(&b.highlight_color), b.highlight.blend, b.highlight.opacity);
+            paint_color(dst, &sh, rgb(&b.shadow_color), b.shadow.blend, b.shadow.opacity);
+        }
+    }
+
+    // Layer (with interior effects) onto the exterior result, in the layer's mode.
+    let mode = if layer.blend == BlendMode::PassThrough { BlendMode::Normal } else { layer.blend };
+    for (wp, lp) in work.px.iter_mut().zip(&lay.px) {
+        if lp[3] > 0.0 {
+            *wp = psblend::composite(mode, *wp, *lp, 1.0);
+        }
+    }
+    // Layer opacity applies to the whole stack.
+    let op = layer.opacity;
+    for y in rect.y0..rect.y1 {
+        for x in rect.x0..rect.x1 {
+            let i = ((y - rect.y0) as usize) * rect.width() as usize + (x - rect.x0) as usize;
+            let a = before.px[i];
+            let b = if x >= big.x0 && x < big.x1 && y >= big.y0 && y < big.y1 {
+                work.px[((y - big.y0) as usize) * w + (x - big.x0) as usize]
+            } else {
+                a
+            };
+            backdrop.px[i] = mix_premul(a, b, op);
+        }
+    }
+}
+
+/// Premultiplied linear interpolation between two straight-alpha pixels.
+fn mix_premul(a: [f32; 4], b: [f32; 4], k: f32) -> [f32; 4] {
+    let alpha = a[3] + (b[3] - a[3]) * k;
+    if alpha <= 0.0 {
+        return [0.0; 4];
+    }
+    let mut out = [0.0; 4];
+    for c in 0..3 {
+        out[c] = (a[c] * a[3] + (b[c] * b[3] - a[c] * a[3]) * k) / alpha;
+    }
+    out[3] = alpha;
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edt_is_exact() {
+        let (w, h) = (7, 5);
+        let mut inside = vec![false; w * h];
+        inside[2 * w + 3] = true;
+        let d = edt(&inside, w, h);
+        assert_eq!(d[2 * w + 3], 0.0);
+        assert!((d[2 * w + 6] - 3.0).abs() < 1e-6);
+        assert!((d[0] - (9.0f32 + 4.0).sqrt()).abs() < 1e-5);
+        assert!((d[4 * w + 5] - (4.0f32 + 4.0).sqrt()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn edt_two_seeds() {
+        let (w, h) = (10, 1);
+        let mut inside = vec![false; w];
+        inside[0] = true;
+        inside[9] = true;
+        let d = edt(&inside, w, h);
+        assert_eq!(d, vec![0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn blur_preserves_mass() {
+        let mut m = Map::new(21, 21, 0.0);
+        m.v[10 * 21 + 10] = 1.0;
+        blur(&mut m, 6.0);
+        let sum: f32 = m.v.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4, "{sum}");
+        assert!(m.v[10 * 21 + 10] < 1.0);
+    }
+
+    #[test]
+    fn gradient_geometry() {
+        let b = Rect::new(0, 0, 100, 100);
+        let t = |s, x, y| gradient_t(s, 0.0, 1.0, false, (0.0, 0.0), b, x, y);
+        assert!(t(GradientStyle::Linear, 0.0, 50.0) < 0.01);
+        assert!((t(GradientStyle::Linear, 50.0, 50.0) - 0.5).abs() < 1e-6);
+        assert!(t(GradientStyle::Linear, 100.0, 50.0) > 0.99);
+        assert!(t(GradientStyle::Reflected, 50.0, 50.0) < 1e-6);
+        assert!((t(GradientStyle::Reflected, 0.0, 50.0) - 1.0).abs() < 1e-6);
+        assert!(t(GradientStyle::Radial, 50.0, 50.0) < 1e-6);
+        assert!((t(GradientStyle::Radial, 50.0, 0.0) - 1.0).abs() < 1e-6);
+        assert!((t(GradientStyle::Diamond, 75.0, 75.0) - 1.0).abs() < 1e-6);
+        let ang = t(GradientStyle::Angle, 50.0, 0.0);
+        assert!((ang - 0.75).abs() < 1e-3, "{ang}");
+        let rev = gradient_t(GradientStyle::Linear, 0.0, 1.0, true, (0.0, 0.0), b, 0.0, 50.0);
+        assert!(rev > 0.99);
+    }
+
+    #[test]
+    fn offsets_follow_light() {
+        let (dx, dy) = offset(120.0, 10.0);
+        assert_eq!((dx, dy), (5.0, 9.0));
+    }
+}

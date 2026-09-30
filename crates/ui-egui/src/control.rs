@@ -1,0 +1,279 @@
+//! Programmatic control of the running app, for agents, tests and (soon) MCP.
+//!
+//! Transport-agnostic: a transport thread (TCP in the desktop app, a channel in tests) sends
+//! [`ControlRequest`]s; the UI thread handles them between frames and replies with JSON.
+//!
+//! Methods:
+//! - `engine.execute {command, params}`: run any engine or UI command by id
+//! - `engine.commands`: list commands with enablement
+//! - `ui.inspect`: full UI state (tool, panels, views, dialogs, windows, menu tree, window size)
+//! - `ui.set {tool?, panels?, zoom?, center?, dark?}`: change UI state
+//! - `ui.menu.invoke {id}` / `ui.menu.list`: activate a menu item by id; list the menu tree
+//! - `ui.dialog.open {kind, fields?}` / `ui.dialog.set {dialog, field, value}` / `ui.dialog.confirm {dialog}` / `ui.dialog.cancel {dialog}`
+//! - `ui.window.open {document?}` / `ui.window.close {window}`: extra document windows
+//! - `ui.pointer {events: [{kind: down|move|up, x, y, pressure?}], modifiers?}`: drive the active tool in document coordinates
+//! - `ui.resize {width, height}`: resize the main window
+//! - `ui.screenshot {path?, focus?}`: capture the main window (PNG). Raises the window first (default)
+//!   because occluded macOS windows stop rendering
+//! - `ui.focus`: bring the main window to the front
+//! - `app.open {path}` / `app.save {path}`: file I/O through the configured services
+//! - `app.quit`
+
+use std::sync::mpsc::Sender;
+
+use serde_json::{Value, json};
+
+use crate::PhotocraftApp;
+use crate::canvas::{ToolEvent, tool_event};
+use crate::state::{DialogKind, Tool, UiState};
+
+pub type ControlResponse = Value;
+
+pub struct ControlRequest {
+    pub method: String,
+    pub params: Value,
+    pub reply: Sender<ControlResponse>,
+}
+
+impl ControlRequest {
+    pub fn new(method: impl Into<String>, params: Value) -> (Self, std::sync::mpsc::Receiver<ControlResponse>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (Self { method: method.into(), params, reply: tx }, rx)
+    }
+}
+
+pub enum Outcome {
+    Done(Value),
+    Screenshot { token: u64, path: Option<String> },
+}
+
+fn ok(v: Value) -> Outcome {
+    Outcome::Done(json!({"ok": true, "result": v}))
+}
+fn err(e: impl std::fmt::Display) -> Outcome {
+    Outcome::Done(json!({"ok": false, "error": e.to_string()}))
+}
+fn wrap(r: Result<Value, String>) -> Outcome {
+    match r {
+        Ok(v) => ok(v),
+        Err(e) => err(e),
+    }
+}
+
+pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
+    let p = &req.params;
+    let s = |k: &str| p.get(k).and_then(Value::as_str);
+    let u = |k: &str| p.get(k).and_then(Value::as_u64);
+    match req.method.as_str() {
+        "engine.execute" | "ui.menu.invoke" => {
+            let Some(id) = s("command").or(s("id")) else { return err("missing `command`") };
+            let params = p.get("params").cloned().unwrap_or(json!({}));
+            wrap(crate::menus::invoke(app, ctx, id, params))
+        }
+        "engine.commands" => wrap(app.run("command.list", json!({}))),
+        "ui.menu.list" => ok(serde_json::to_value(crate::menus::menu_items(app)).unwrap_or_default()),
+        "ui.inspect" => ok(inspect(app, ctx)),
+        "ui.set" => {
+            if let Some(t) = s("tool") {
+                match Tool::from_name(t) {
+                    Some(t) => app.ui.tool = t,
+                    None => return err(format!("unknown tool `{t}`")),
+                }
+            }
+            if let Some(panels) = p.get("panels") {
+                let mut cur = serde_json::to_value(&app.ui.panels).unwrap_or_default();
+                if let (Some(c), Some(n)) = (cur.as_object_mut(), panels.as_object()) {
+                    for (k, v) in n {
+                        c.insert(k.clone(), v.clone());
+                    }
+                }
+                match serde_json::from_value(cur) {
+                    Ok(v) => app.ui.panels = v,
+                    Err(e) => return err(e),
+                }
+            }
+            if let Some(i) = app.session.active_index() {
+                if let Some(z) = p.get("zoom").and_then(Value::as_f64) {
+                    app.ui.views[i].zoom = (z as f32).clamp(0.01, 64.0);
+                    app.ui.views[i].fit_pending = false;
+                }
+                if let Some(c) = p.get("center").and_then(Value::as_array)
+                    && c.len() == 2
+                {
+                    app.ui.views[i].center = [c[0].as_f64().unwrap_or(0.0) as f32, c[1].as_f64().unwrap_or(0.0) as f32];
+                    app.ui.views[i].fit_pending = false;
+                }
+                if p.get("fit").and_then(Value::as_bool) == Some(true) {
+                    app.ui.views[i].fit_pending = true;
+                }
+            }
+            if let Some(name) = s("theme") {
+                match crate::theme::ThemeKind::from_name(name) {
+                    Some(k) => app.set_theme(ctx, k),
+                    None => return err(format!("unknown theme `{name}` (studio, studioLight, classic)")),
+                }
+            }
+            if let Some(size) = p.get("brushSize").and_then(Value::as_f64) {
+                app.session.tools.brush.size = size as f32;
+            }
+            ok(Value::Null)
+        }
+        "ui.dialog.open" => {
+            let kind = match s("kind").unwrap_or("") {
+                "newDocument" | "NewDocument" => DialogKind::NewDocument,
+                "about" | "About" => DialogKind::About,
+                "layerStyle" | "LayerStyle" => {
+                    return match crate::layer_style::open(app, s("effect")) {
+                        Some(id) => ok(json!({"dialog": id})),
+                        None => err("no active layer"),
+                    };
+                }
+                "command" | "Command" => {
+                    let Some(cmd) = s("command") else { return err("command dialogs need `command`") };
+                    let label = photocraft_engine::commands::find(cmd).map(|c| c.label).unwrap_or(cmd);
+                    return ok(json!({"dialog": crate::dialogs::open_command_dialog(app, cmd, label)}));
+                }
+                other => return err(format!("unknown dialog kind `{other}`")),
+            };
+            let mut fields = if kind == DialogKind::NewDocument { UiState::new_document_fields() } else { Default::default() };
+            if let Some(f) = p.get("fields").and_then(Value::as_object) {
+                fields.extend(f.clone());
+            }
+            ok(json!({"dialog": app.ui.open_dialog(kind, fields)}))
+        }
+        "ui.dialog.set" => {
+            let (Some(id), Some(field)) = (u("dialog"), s("field")) else { return err("need `dialog` and `field`") };
+            let value = p.get("value").cloned().unwrap_or(Value::Null);
+            match app.ui.dialog_mut(id) {
+                Some(d) => {
+                    d.fields.insert(field.to_string(), value);
+                    ok(Value::Null)
+                }
+                None => err(format!("no dialog {id}")),
+            }
+        }
+        "ui.dialog.confirm" => match u("dialog") {
+            Some(id) => wrap(crate::dialogs::confirm(app, id)),
+            None => err("missing `dialog`"),
+        },
+        "ui.dialog.cancel" => match u("dialog").and_then(|id| app.ui.close_dialog(id)) {
+            Some(_) => ok(Value::Null),
+            None => err("no such dialog"),
+        },
+        "ui.window.open" => {
+            if let Some(d) = u("document") {
+                app.session.set_active(d as usize);
+            }
+            wrap(crate::menus::invoke(app, ctx, "window.newWindowForDocument", json!({})))
+        }
+        "ui.window.close" => {
+            let Some(id) = u("window") else { return err("missing `window`") };
+            let before = app.ui.windows.len();
+            app.ui.windows.retain(|w| w.id != id);
+            if app.ui.windows.len() < before { ok(Value::Null) } else { err(format!("no window {id}")) }
+        }
+        "ui.pointer" => {
+            let Some(events) = p.get("events").and_then(Value::as_array) else { return err("missing `events`") };
+            let mods = egui::Modifiers {
+                shift: p.get("shift").and_then(Value::as_bool).unwrap_or(false),
+                alt: p.get("alt").and_then(Value::as_bool).unwrap_or(false),
+                ..Default::default()
+            };
+            if let Some(t) = s("tool") {
+                if let Some(t) = Tool::from_name(t) {
+                    app.ui.tool = t;
+                }
+            }
+            for e in events {
+                let x = e.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+                let y = e.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+                let pr = e.get("pressure").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+                let ev = match e.get("kind").and_then(Value::as_str).unwrap_or("move") {
+                    "down" => ToolEvent::Down { x, y, pressure: pr },
+                    "up" => ToolEvent::Up { x, y },
+                    _ => ToolEvent::Move { x, y, pressure: pr },
+                };
+                tool_event(app, ev, mods);
+            }
+            ok(json!({"status": app.ui.status}))
+        }
+        "ui.resize" => {
+            let (w, h) = (p.get("width").and_then(Value::as_f64).unwrap_or(1280.0), p.get("height").and_then(Value::as_f64).unwrap_or(800.0));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w as f32, h as f32)));
+            ok(Value::Null)
+        }
+        "ui.focus" => {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
+            ok(Value::Null)
+        }
+        "ui.screenshot" => {
+            // Occluded windows don't render on macOS, so the screenshot would never arrive: raise first.
+            if p.get("focus").and_then(Value::as_bool).unwrap_or(true) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            let token = app.ui.alloc_id();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(token)));
+            ctx.request_repaint();
+            Outcome::Screenshot { token, path: s("path").map(str::to_string) }
+        }
+        "app.open" => match s("path") {
+            Some(path) => wrap(crate::menus::invoke(app, ctx, "file.open", json!({"path": path}))),
+            None => err("missing `path`"),
+        },
+        "app.save" => wrap(app.save_as(s("path").map(str::to_string)).map(|p| json!({"path": p}))),
+        "app.quit" => {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ok(Value::Null)
+        }
+        other => err(format!("unknown method `{other}`")),
+    }
+}
+
+/// Snapshot of everything on screen, addressable by id.
+pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
+    let screen = ctx.content_rect();
+    let dialogs: Vec<Value> = app
+        .ui
+        .dialogs
+        .iter()
+        .map(|d| json!({"id": d.id, "kind": d.kind, "title": crate::dialogs::title(d), "fields": d.fields}))
+        .collect();
+    json!({
+        "window": {"width": screen.width(), "height": screen.height(), "pixelsPerPoint": ctx.pixels_per_point()},
+        "tool": app.ui.tool,
+        "panels": app.ui.panels,
+        "views": app.ui.views,
+        "dialogs": dialogs,
+        "windows": app.ui.windows,
+        "theme": app.ui.theme,
+        "status": app.ui.status,
+        "frame": app.frame,
+        "session": photocraft_engine::inspect::session(&app.session),
+        "document": app.session.active().map(photocraft_engine::inspect::document),
+        "perf": {"fps": app.fps, "timings": app.perf},
+        "brush": {"size": app.session.tools.brush.size, "hardness": app.session.tools.brush.hardness, "opacity": app.session.tools.brush.opacity},
+    })
+}
+
+pub fn save_screenshot(app: &mut PhotocraftApp, image: &egui::ColorImage, path: Option<&str>) -> Value {
+    let [w, h] = image.size;
+    let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
+    let Some(path) = path else {
+        return json!({"ok": true, "result": {"width": w, "height": h}});
+    };
+    let png = match app.services.encode_png.as_ref() {
+        Some(enc) => enc(w as u32, h as u32, &rgba),
+        None => Err("no PNG encoder configured".into()),
+    };
+    let r = png.and_then(|bytes| match app.services.write.as_mut() {
+        Some(wr) => wr(path, &bytes),
+        None => Err("no writer configured".into()),
+    });
+    match r {
+        Ok(()) => json!({"ok": true, "result": {"path": path, "width": w, "height": h}}),
+        Err(e) => json!({"ok": false, "error": e}),
+    }
+}

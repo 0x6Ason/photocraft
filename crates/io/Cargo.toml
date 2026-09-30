@@ -1,0 +1,24 @@
+[package]
+name = "photocraft-io"
+description = "Import/export between photocraft documents and PSD/PSB and flat raster formats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+photocraft-geom = { workspace = true }
+photocraft-color = { workspace = true }
+photocraft-raster = { workspace = true }
+photocraft-doc = { workspace = true }
+photocraft-compose = { workspace = true }
+photocraft-psd = { workspace = true }
+photocraft-codecs = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+photocraft-psd = { workspace = true, features = ["testgen"] }
+proptest = { workspace = true }

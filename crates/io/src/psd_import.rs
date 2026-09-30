@@ -1,0 +1,476 @@
+//! PSD/PSB → [`Document`].
+
+use std::sync::Arc;
+
+use photocraft_color::{BlendMode, ColorMode, PixelFormat, SampleType};
+use photocraft_doc::{
+    AlphaChannel, Document, Effects, FillCache, Group, Layer, LayerContent, LayerMask, ShapeLayer, SmartObject, SmartSource, TextLayer,
+};
+use photocraft_geom::{Rect, Size};
+use photocraft_psd::layer::{CHANNEL_REAL_USER_MASK, CHANNEL_TRANSPARENCY, CHANNEL_USER_MASK};
+use photocraft_psd::resources::ids;
+use photocraft_psd::tagged::BlockData;
+use photocraft_psd::{ColorMode as PsdMode, LayerNode, LayerRecord, PsdFile, TaggedBlock};
+use photocraft_raster::Surface;
+
+use crate::adjust_map::{self, ADJUSTMENT_KEYS};
+use crate::blocks;
+use crate::pixels::{interleave, max_sample, sample_for_depth, zero_sample};
+
+/// Resources that are mapped to document fields or regenerated on export.
+pub(crate) const MAPPED_RESOURCES: [u16; 16] = [
+    ids::GLOBAL_ANGLE,
+    ids::GLOBAL_ALTITUDE,
+    ids::RESOLUTION_INFO,
+    ids::ICC_PROFILE,
+    ids::XMP,
+    ids::EXIF,
+    ids::VERSION_INFO,
+    ids::THUMBNAIL,
+    ids::THUMBNAIL_PS4,
+    ids::LAYER_STATE,
+    ids::LAYER_GROUP_INFO,
+    1032, // grid and guides
+    1045, // unicode alpha names
+    1006, // pascal alpha names
+    1069, // layer selection ids
+    1072, // layer group(s) enabled id
+];
+
+/// Blocks regenerated from document fields on export; not kept in
+/// `Layer::psd_blocks`.
+pub(crate) const REGENERATED: [&[u8; 4]; 9] = [b"luni", b"lyid", b"lsct", b"lsdk", b"iOpa", b"lspf", b"lclr", b"lfx2", b"lfxs"];
+
+pub(crate) struct Ctx<'a> {
+    pub file: &'a PsdFile,
+    pub fmt: PixelFormat,
+    pub mask_fmt: PixelFormat,
+    pub cc: usize,
+    pub cmyk: bool,
+    pub warnings: Vec<String>,
+}
+
+fn doc_mode(m: PsdMode) -> Option<ColorMode> {
+    Some(match m {
+        PsdMode::Bitmap => ColorMode::Bitmap,
+        PsdMode::Grayscale => ColorMode::Grayscale,
+        PsdMode::Indexed => ColorMode::Indexed,
+        PsdMode::Rgb => ColorMode::Rgb,
+        PsdMode::Cmyk => ColorMode::Cmyk,
+        PsdMode::Multichannel => ColorMode::Multichannel,
+        PsdMode::Duotone => ColorMode::Duotone,
+        PsdMode::Lab => ColorMode::Lab,
+        PsdMode::Unknown(_) => return None,
+    })
+}
+
+impl Ctx<'_> {
+    fn warn(&mut self, s: impl Into<String>) {
+        self.warnings.push(s.into());
+    }
+
+    fn channel_plane(&mut self, rec: &LayerRecord, id: i16, name: &str) -> Option<Vec<u8>> {
+        rec.channel(id)?;
+        match rec.decode_channel(id, self.file.header.depth, self.file.header.version) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                self.warn(format!("layer \"{name}\": channel {id} could not be decoded ({e}); treated as empty"));
+                None
+            }
+        }
+    }
+
+    fn record_surface(&mut self, rec: &LayerRecord, name: &str) -> Surface {
+        let r = rec.rect;
+        if r.is_empty() || r.size().is_err() {
+            return Surface::new(self.fmt);
+        }
+        let (w, h) = r.size().unwrap_or((0, 0));
+        let s = self.fmt.sample;
+        let mut planes = Vec::with_capacity(self.cc + 1);
+        for c in 0..self.cc {
+            planes.push(self.channel_plane(rec, c as i16, name));
+        }
+        planes.push(self.channel_plane(rec, CHANNEL_TRANSPARENCY, name));
+        let refs: Vec<Option<&[u8]>> = planes.iter().map(|p| p.as_deref()).collect();
+        let mut fill: Vec<Vec<u8>> = vec![zero_sample(s); self.cc];
+        fill.push(max_sample(s));
+        let mut invert = vec![self.cmyk; self.cc];
+        invert.push(false);
+        let bytes = interleave(&refs, &fill, w * h, s, &invert);
+        let mut surf = Surface::from_interleaved(self.fmt, Rect::new(r.left, r.top, r.right, r.bottom), &bytes);
+        surf.prune();
+        surf
+    }
+
+    fn record_mask(&mut self, rec: &LayerRecord, name: &str) -> Option<LayerMask> {
+        let m = rec.layer_mask()?;
+        let (id, rect, default, flags) = match (rec.channel(CHANNEL_REAL_USER_MASK), m.real) {
+            (Some(_), Some(real)) => (CHANNEL_REAL_USER_MASK, real.rect, real.background, real.flags),
+            _ => {
+                rec.channel(CHANNEL_USER_MASK)?;
+                (CHANNEL_USER_MASK, m.rect, m.default_color, m.flags)
+            }
+        };
+        let mut surface = Surface::with_default(self.mask_fmt, &[f32::from(default) / 255.0]);
+        if !rect.is_empty()
+            && let Ok((w, h)) = rect.size()
+            && let Some(plane) = self.channel_plane(rec, id, name)
+        {
+            let s = self.mask_fmt.sample;
+            let bytes = interleave(&[Some(&plane)], &[zero_sample(s)], w * h, s, &[false]);
+            surface.write_interleaved(Rect::new(rect.left, rect.top, rect.right, rect.bottom), &bytes);
+            surface.prune();
+        }
+        let params = m.parameters;
+        Some(LayerMask {
+            surface,
+            enabled: flags & 2 == 0,
+            linked: flags & 1 == 0,
+            density: params.and_then(|p| p.user_density).map_or(1.0, |d| f32::from(d) / 255.0),
+            feather: params.and_then(|p| p.user_feather).map_or(0.0, |f| f as f32),
+        })
+    }
+
+    fn apply_common(&mut self, l: &mut Layer, rec: &LayerRecord, blend_override: Option<photocraft_psd::BlendMode>) {
+        l.visible = rec.is_visible();
+        l.opacity = f32::from(rec.opacity) / 255.0;
+        l.fill_opacity = f32::from(rec.fill_opacity()) / 255.0;
+        l.clipped = rec.clipping != 0;
+        let key = blend_override.unwrap_or(rec.blend_mode).key();
+        l.blend = match BlendMode::from_psd_key(key) {
+            Some(b) => b,
+            None => {
+                self.warn(format!(
+                    "layer \"{}\": unknown blend mode {:?}; using Normal",
+                    l.name,
+                    String::from_utf8_lossy(&key)
+                ));
+                BlendMode::Normal
+            }
+        };
+        if let Some(Ok(BlockData::Protection(v))) = rec.block(b"lspf").and_then(TaggedBlock::parsed) {
+            l.locks = blocks::locks_from_lspf(v);
+        }
+        if rec.flags.transparency_protected() {
+            l.locks.transparency = true;
+        }
+        if let Some(Ok(BlockData::SheetColor(v))) = rec.block(b"lclr").and_then(TaggedBlock::parsed) {
+            l.label = blocks::label_from_index(v);
+        }
+        // `lmfx` (multiple instances per kind) supersedes `lfx2` when present;
+        // it stays in `psd_blocks`, `lfx2` in `Effects::psd_raw`.
+        // Groups store their effects under `lfxs` (same layout as `lfx2`).
+        let single = rec.block(b"lfx2").or_else(|| rec.block(b"lfxs"));
+        if let Some(fx) = rec.block(b"lmfx").or(single) {
+            let (enabled, items) = crate::effects_map::parse_lfx2(&fx.data).unwrap_or_else(|| (blocks::effects_enabled(&fx.data), Vec::new()));
+            l.effects = Effects { enabled, items, psd_raw: single.map(|b| Arc::new(b.data.clone())) };
+        } else if let Some(fx) = rec.block(b"lrFX")
+            && !rec.section_type().is_folder()
+            && let Some((enabled, items)) = crate::effects_map::parse_lrfx(&fx.data)
+        {
+            // Legacy effects only on non-group layers (Photoshop ignores
+            // them on groups, see psd-tools effects/shape-fx.psd).
+            l.effects = Effects { enabled, items, psd_raw: None };
+        }
+        l.psd_id = rec.layer_id();
+        let name = l.name.clone();
+        l.mask = self.record_mask(rec, &name);
+    }
+
+    fn layer_from_record(&mut self, rec: &LayerRecord) -> Layer {
+        let name = rec.name();
+        let fill_key = [b"SoCo", b"GdFl", b"PtFl"].into_iter().find(|k| rec.block(k).is_some());
+        let vector_key = [b"vsms", b"vmsk"].into_iter().find(|k| rec.block(k).is_some());
+        let adj_key = ADJUSTMENT_KEYS.into_iter().find(|k| rec.block(k).is_some());
+        let smart_key = [b"SoLd", b"PlLd", b"SoLE"].into_iter().find(|k| rec.block(k).is_some());
+        let blocks = preserved_blocks(rec);
+        // `psd_raw` shares the Arc of the matching `psd_blocks` entry.
+        let principal = |k: &[u8; 4]| blocks.iter().find(|(bk, _)| bk == k).map(|(_, d)| d.clone());
+        let mut fill_cache = None;
+
+        let content = if let Some(k) = adj_key {
+            let data = rec.block(k).map(|b| b.data.clone()).unwrap_or_default();
+            let cged = rec.block(b"CgEd").map(|b| &b.data[..]);
+            LayerContent::Adjustment(adjust_map::parse(k, &data, cged, match self.fmt.mode {
+                ColorMode::Rgb => adjust_map::Channels::Rgb,
+                ColorMode::Grayscale => adjust_map::Channels::Gray,
+                _ => adjust_map::Channels::Other,
+            }))
+        } else if rec.block(b"TySh").is_some() {
+            let (text, transform) = rec.block(b"TySh").and_then(|b| blocks::parse_tysh(&b.data)).unwrap_or_default();
+            LayerContent::Text(TextLayer {
+                text,
+                font_family: String::new(),
+                size_pt: 0.0,
+                color: photocraft_color::Color::BLACK,
+                transform,
+                cache: Some(self.record_surface(rec, &name)),
+                psd_raw: principal(b"TySh"),
+            })
+        } else if let Some(k) = smart_key {
+            let (id, transform) = rec.block(k).map(|b| blocks::parse_smart(k, &b.data)).unwrap_or_default();
+            LayerContent::Smart(SmartObject {
+                source: SmartSource::Linked { path: id },
+                transform,
+                smart_filters: Vec::new(),
+                cache: Some(self.record_surface(rec, &name)),
+                psd_raw: principal(k),
+            })
+        } else if (vector_key.is_some() && fill_key.is_some()) || rec.block(b"vscg").is_some() {
+            let fill = fill_key.and_then(|k| rec.block(k).and_then(|b| blocks::parse_fill(k, &b.data)));
+            LayerContent::Shape(ShapeLayer {
+                fill,
+                cache: Some(self.record_surface(rec, &name)),
+                psd_raw: vector_key.and_then(principal),
+            })
+        } else if let Some(k) = fill_key {
+            match rec.block(k).and_then(|b| blocks::parse_fill(k, &b.data)) {
+                Some(f) => {
+                    // Keep Photoshop's rendering of the fill so it composites exactly.
+                    if !rec.rect.is_empty() {
+                        fill_cache = Some(FillCache { fill: f.clone(), surface: self.record_surface(rec, &name) });
+                    }
+                    LayerContent::Fill(f)
+                }
+                None => {
+                    self.warn(format!("layer \"{name}\": unreadable {} fill; imported as pixels", String::from_utf8_lossy(k)));
+                    LayerContent::Raster(self.record_surface(rec, &name))
+                }
+            }
+        } else {
+            LayerContent::Raster(self.record_surface(rec, &name))
+        };
+        let rendered = matches!(content, LayerContent::Shape(_) | LayerContent::Text(_) | LayerContent::Smart(_));
+        let mut l = Layer::new(name, content);
+        l.psd_blocks = blocks;
+        l.fill_cache = fill_cache;
+        self.apply_common(&mut l, rec, None);
+        // Mask flag bit 3: the user mask was rendered from vector data. For
+        // shape/text/smart layers the cached pixels already include that
+        // coverage, so applying it again would double-mask.
+        if rendered && rec.layer_mask().is_some_and(|m| m.flags & 8 != 0) {
+            l.mask = None;
+        }
+        l
+    }
+
+    fn build(&mut self, nodes: &[LayerNode]) -> Vec<Layer> {
+        let layers = self.file.layers();
+        nodes
+            .iter()
+            .map(|n| match n {
+                LayerNode::Layer { index } => self.layer_from_record(&layers[*index]),
+                LayerNode::Group { index, children, .. } => {
+                    let rec = &layers[*index];
+                    let children = self.build(children);
+                    let sd = rec.section_divider();
+                    let expanded = sd.is_none_or(|s| s.kind != photocraft_psd::SectionType::ClosedFolder);
+                    let mut l = Layer::new(rec.name(), LayerContent::Group(Group { children, expanded }));
+                    l.psd_blocks = preserved_blocks(rec);
+                    self.apply_common(&mut l, rec, sd.and_then(|s| s.blend_mode));
+                    l
+                }
+            })
+            .collect()
+    }
+}
+
+fn preserved_blocks(rec: &LayerRecord) -> Vec<([u8; 4], Arc<Vec<u8>>)> {
+    rec.blocks.iter().filter(|b| !REGENERATED.contains(&&b.key)).map(|b| (b.key, Arc::new(b.data.clone()))).collect()
+}
+
+fn be_to_ne_plane(plane: &[u8], s: SampleType, n: usize) -> Vec<u8> {
+    interleave(&[Some(plane)], &[zero_sample(s)], n, s, &[false])
+}
+
+fn unicode_names(data: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 4 <= data.len() {
+        let n = u32::from_be_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]) as usize;
+        at += 4;
+        let Some(b) = data.get(at..at + n * 2) else { break };
+        let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        out.push(String::from_utf16_lossy(&units).trim_end_matches('\0').to_string());
+        at += n * 2;
+    }
+    out
+}
+
+fn parse_guides(data: &[u8], doc: &mut Document) {
+    let rd = |at: usize| data.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let Some(count) = rd(12) else { return };
+    for i in 0..count as usize {
+        let at = 16 + i * 5;
+        let (Some(loc), Some(&dir)) = (rd(at), data.get(at + 4)) else { break };
+        let pos = loc as i32 as f32 / 32.0;
+        if dir == 1 {
+            doc.guides.horizontal.push(pos);
+        } else {
+            doc.guides.vertical.push(pos);
+        }
+    }
+}
+
+/// Converts a parsed PSD into a document. Never fails: problems become warnings.
+pub fn psd_to_document(file: &PsdFile) -> (Document, Vec<String>) {
+    let h = &file.header;
+    let mut warnings = Vec::new();
+    let mode = doc_mode(h.color_mode).unwrap_or_else(|| {
+        warnings.push(format!("unknown color mode {}; importing as RGB", h.color_mode.as_u16()));
+        ColorMode::Rgb
+    });
+    let layered = matches!(mode, ColorMode::Grayscale | ColorMode::Rgb | ColorMode::Cmyk | ColorMode::Lab) && h.depth != 1;
+    let depth = if layered { sample_for_depth(h.depth) } else { SampleType::U8 };
+    let mut doc = Document::new("Untitled", Size::new(h.width, h.height), mode, depth);
+
+    // Resources.
+    for r in &file.resources {
+        match r.id {
+            ids::RESOLUTION_INFO => {
+                if let Ok(ri) = photocraft_psd::ResolutionInfo::from_bytes(&r.data) {
+                    let f = if ri.h_res_unit == 2 { 2.54 } else { 1.0 };
+                    doc.resolution_dpi = (ri.h_res() * f) as f32;
+                }
+            }
+            ids::ICC_PROFILE => doc.icc_profile = Some(Arc::new(r.data.clone())),
+            ids::XMP => doc.metadata.xmp = Some(String::from_utf8_lossy(&r.data).into_owned()),
+            ids::EXIF => doc.metadata.exif = Some(Arc::new(r.data.clone())),
+            1032 => parse_guides(&r.data, &mut doc),
+            ids::GLOBAL_ANGLE | ids::GLOBAL_ALTITUDE => {
+                if let Some(b) = r.data.get(..4) {
+                    let v = i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f32;
+                    if r.id == ids::GLOBAL_ANGLE {
+                        doc.global_light.angle = v;
+                    } else {
+                        doc.global_light.altitude = v;
+                    }
+                }
+            }
+            id if MAPPED_RESOURCES.contains(&id) => {}
+            id => doc.metadata.psd_resources.push((id, String::from_utf8_lossy(&r.name).into_owned(), Arc::new(r.data.clone()))),
+        }
+    }
+    for b in &file.global_blocks {
+        doc.metadata.psd_global_blocks.push((b.signature, b.key, Arc::new(b.data.clone())));
+    }
+
+    let fmt = doc.pixel_format();
+    let cc = fmt.mode.color_channels();
+    let mut cx = Ctx {
+        file,
+        fmt,
+        mask_fmt: PixelFormat::new(ColorMode::Grayscale, depth, false),
+        cc,
+        cmyk: fmt.mode == ColorMode::Cmyk,
+        warnings,
+    };
+
+    let (w, hh) = (h.width as usize, h.height as usize);
+    let n = w * hh;
+    let canvas = Rect::new(0, 0, h.width as i32, h.height as i32);
+    let merged = file.decode_merged();
+    if let Err(e) = &merged {
+        cx.warn(format!("merged image could not be decoded: {e}"));
+    }
+
+    if layered {
+        let tree = file.layer_tree();
+        doc.layers = cx.build(&tree);
+        if doc.layers.is_empty()
+            && let Ok(all) = &merged
+        {
+            // Flattened file: the merged image becomes the background layer.
+            let plane = h.row_bytes() * hh;
+            let alpha_idx = if file.merged_has_alpha() { Some(cc) } else { None };
+            let mut planes: Vec<Option<&[u8]>> = (0..cc).map(|c| all.get(c * plane..(c + 1) * plane)).collect();
+            planes.push(alpha_idx.and_then(|a| all.get(a * plane..(a + 1) * plane)));
+            let mut fill = vec![zero_sample(depth); cc];
+            fill.push(max_sample(depth));
+            let mut inv = vec![cx.cmyk; cc];
+            inv.push(false);
+            let bytes = interleave(&planes, &fill, n, depth, &inv);
+            let mut s = Surface::from_interleaved(fmt, canvas, &bytes);
+            if alpha_idx.is_some() {
+                // Undo Photoshop's white matting of the merged image.
+                let white = photocraft_raster::from_rgba(&fmt, [1.0, 1.0, 1.0, 1.0]);
+                let mut vals = s.read_region(canvas);
+                for px in vals.chunks_exact_mut(cc + 1) {
+                    let a = px[cc];
+                    for c in 0..cc {
+                        px[c] = if a <= 0.0 { 0.0 } else { crate::pixels::unmatte(px[c], a, white[c]) };
+                    }
+                }
+                s.write_region(canvas, &vals);
+            }
+            s.prune();
+            let mut bg = Layer::new("Background", LayerContent::Raster(s));
+            if alpha_idx.is_none() {
+                bg.locks.transparency = true;
+                bg.locks.position = true;
+            }
+            doc.layers.push(bg);
+        }
+    } else {
+        if !file.layers().is_empty() {
+            cx.warn(format!(
+                "{:?} documents are imported flattened: {} layer records were not imported",
+                h.color_mode,
+                file.layers().len()
+            ));
+        } else {
+            cx.warn(format!("{:?} {}-bit document converted to {:?} 8-bit for editing", h.color_mode, h.depth, fmt.mode));
+        }
+        if !file.color_mode_data.is_empty() {
+            cx.warn("color mode data (palette / duotone curves) is not preserved");
+        }
+        let rgba = file.composite_rgba8().or_else(|_| {
+            // Multichannel: show the first channels as RGB.
+            let all = merged.clone()?;
+            let plane = h.row_bytes() * hh;
+            let mut data = vec![255u8; n * 4];
+            for c in 0..3.min(usize::from(h.channels)) {
+                let p = photocraft_psd::pixels::plane_to_u8(&all[c * plane..(c + 1) * plane], h.depth, w, hh)?;
+                for i in 0..n {
+                    data[i * 4 + c] = p[i];
+                }
+            }
+            Ok::<_, photocraft_psd::PsdError>(photocraft_psd::RgbaImage { left: 0, top: 0, width: h.width, height: h.height, data })
+        });
+        if let Ok(img) = rgba {
+            let mut s = Surface::new(fmt);
+            let vals: Vec<f32> = img
+                .data
+                .chunks_exact(4)
+                .flat_map(|p| {
+                    let v = photocraft_raster::from_rgba(&fmt, [p[0], p[1], p[2], p[3]].map(|x| f32::from(x) / 255.0));
+                    v.into_iter()
+                })
+                .collect();
+            s.write_region(canvas, &vals);
+            s.prune();
+            doc.layers.push(Layer::new("Background", LayerContent::Raster(s)));
+        }
+    }
+
+    // Extra (alpha / spot) channels of the merged image.
+    if layered && let Ok(all) = &merged {
+        let first = cc + usize::from(file.merged_has_alpha());
+        let plane = h.row_bytes() * hh;
+        let names = file
+            .resource(1045)
+            .map(|r| unicode_names(&r.data))
+            .unwrap_or_default();
+        for (k, idx) in (first..usize::from(h.channels)).enumerate() {
+            let Some(p) = all.get(idx * plane..(idx + 1) * plane) else { break };
+            let mut s = Surface::new(cx.mask_fmt);
+            s.write_interleaved(canvas, &be_to_ne_plane(p, depth, n));
+            s.prune();
+            let name = names.get(k).cloned().unwrap_or_else(|| format!("Alpha {}", k + 1));
+            doc.channels.push(AlphaChannel { name, surface: s, spot: None });
+        }
+    }
+
+    (doc, cx.warnings)
+}
