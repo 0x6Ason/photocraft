@@ -22,7 +22,7 @@ cargo test --workspace
 
 Start with [`AGENTS.md`](AGENTS.md), then [`docs/`](docs/).
 
-## The artcraft suite
+## Crafting Apps
 
 Open-source, clean-room, pure-Rust creative apps that share the same conventions: native on macOS, Windows and Linux, in the browser via WebAssembly, and fully drivable by agents.
 
