@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adjust_cmds;
+pub mod build_info;
 pub mod layer_menu_cmds;
 pub mod mode_cmds;
 pub mod channel_cmds;

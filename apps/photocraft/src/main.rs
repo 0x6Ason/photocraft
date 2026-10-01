@@ -6,6 +6,10 @@
 //! Each line `{"id":1,"method":"ui.inspect","params":{}}` gets a reply line
 //! `{"id":1,"ok":true,"result":…}`. See `photocraft_ui_egui::control` for the methods.
 
+// Release builds on Windows are GUI-subsystem apps, so launching from the Start Menu or Explorer
+// doesn't open a console window. (`--version` output then only shows when redirected.)
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod control_server;
 mod services;
 
@@ -20,15 +24,17 @@ fn main() -> eframe::Result {
         match a.as_str() {
             "--control" => control_port = args.next().and_then(|p| p.parse().ok()),
             "--version" => {
-                println!("photocraft {}", env!("CARGO_PKG_VERSION"));
+                println!("photocraft {}", photocraft_engine::build_info::long_version());
                 return Ok(());
             }
+            // Old macOS passes a process serial number when launched from Finder.
+            _ if a.starts_with("-psn_") => {}
             _ => files.push(a),
         }
     }
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Photocraft").with_inner_size([1440.0, 900.0]).with_min_inner_size([760.0, 480.0]).with_drag_and_drop(true).with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false),
+        viewport: egui::ViewportBuilder::default().with_title("PhotoCraft").with_inner_size([1440.0, 900.0]).with_min_inner_size([760.0, 480.0]).with_drag_and_drop(true).with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false),
         ..Default::default()
     };
     eframe::run_native(

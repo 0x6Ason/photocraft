@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Photocraft app icon. Original design by the Photocraft authors. MIT OR Apache-2.0. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3A3A3D"/>
+      <stop offset="1" stop-color="#1C1C1E"/>
+    </linearGradient>
+    <radialGradient id="lens" cx="0.42" cy="0.38" r="0.7">
+      <stop offset="0" stop-color="#9FD0FF"/>
+      <stop offset="1" stop-color="#2A78D6"/>
+    </radialGradient>
+    <clipPath id="disc"><circle cx="512" cy="512" r="300"/></clipPath>
+  </defs>
+  <!-- Body: Apple's 824/1024 grid, so the icon sits correctly in the macOS Dock. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <rect x="100.5" y="100.5" width="823" height="823" rx="184.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.08"/>
+  <!-- Aperture: six blades around a hexagonal opening. -->
+  <circle cx="512" cy="512" r="318" fill="#141416"/>
+  <g clip-path="url(#disc)" stroke="#141416" stroke-width="12" stroke-linejoin="round">
+    <path d="M409.8,453.0 L216.6,564.5 A300,300 0 0 0 409.8,794.1 L409.8,571.0 Z" fill="#5AA6FF"/>
+    <path d="M409.8,571.0 L409.8,794.1 A300,300 0 0 0 705.2,741.5 L512.0,630.0 Z" fill="#378EF0"/>
+    <path d="M512.0,630.0 L705.2,741.5 A300,300 0 0 0 807.4,459.5 L614.2,571.0 Z" fill="#2A78D6"/>
+    <path d="M614.2,571.0 L807.4,459.5 A300,300 0 0 0 614.2,229.9 L614.2,453.0 Z" fill="#1F64BA"/>
+    <path d="M614.2,453.0 L614.2,229.9 A300,300 0 0 0 318.8,282.5 L512.0,394.0 Z" fill="#2A78D6"/>
+    <path d="M512.0,394.0 L318.8,282.5 A300,300 0 0 0 216.6,564.5 L409.8,453.0 Z" fill="#378EF0"/>
+    <path d="M512.0,394.0 L614.2,453.0 L614.2,571.0 L512.0,630.0 L409.8,571.0 L409.8,453.0 Z" fill="url(#lens)" stroke="none"/>
+  </g>
+  <!-- A highlight glint in the opening. -->
+  <ellipse cx="478" cy="468" rx="34" ry="20" transform="rotate(-30 478 468)" fill="#FFFFFF" fill-opacity="0.55"/>
+</svg>

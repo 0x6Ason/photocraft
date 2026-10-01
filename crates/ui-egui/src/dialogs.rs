@@ -27,8 +27,8 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
             match d.kind {
                 DialogKind::NewDocument => new_document(ui, &mut fields),
                 DialogKind::About => {
-                    ui.label("Photocraft — an open-source, native image editor written in Rust.");
-                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                    ui.label("PhotoCraft — an open-source, native image editor written in Rust.");
+                    ui.label(format!("Version {}", photocraft_engine::build_info::long_version()));
                     ui.weak("egui · wgpu · photocraft-engine");
                 }
                 DialogKind::Command if crate::prefs_ui::owns(&fields) => crate::prefs_ui::body(app, ui, &mut fields),
@@ -88,7 +88,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
 pub fn title(d: &Dialog) -> String {
     match d.kind {
         DialogKind::NewDocument => "New Document".into(),
-        DialogKind::About => "About Photocraft".into(),
+        DialogKind::About => "About PhotoCraft".into(),
         DialogKind::LayerStyle => "Layer Style".into(),
         DialogKind::Command => d.fields.get("__label").and_then(Value::as_str).unwrap_or("Command").trim_end_matches('…').to_string(),
         DialogKind::Error => "Error".into(),

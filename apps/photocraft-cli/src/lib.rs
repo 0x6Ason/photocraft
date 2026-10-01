@@ -111,7 +111,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return 0;
         }
         "--version" | "version" => {
-            let _ = writeln!(out, "photocraft-cli {}", env!("CARGO_PKG_VERSION"));
+            let _ = writeln!(out, "photocraft-cli {}", photocraft_engine::build_info::long_version());
             return 0;
         }
         other => {

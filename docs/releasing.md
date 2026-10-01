@@ -1,0 +1,190 @@
+# Releasing Photocraft
+
+Every push to the `release` branch runs `.github/workflows/release.yml`. The workflow builds
+signed installers for macOS, Windows, Linux and the web, then creates or updates a **draft**
+GitHub Release named `Photocraft v<version>`. Nobody sees a draft until a maintainer publishes it.
+
+## Cutting a release
+
+1. **Bump the version** on `main`. The only place it lives is `[workspace.package] version`
+   in the root `Cargo.toml`:
+
+   ```sh
+   cargo xtask version                 # prints the current version, e.g. 0.1.0
+   cargo xtask version set 0.2.0       # or 0.2.0-rc.1; updates Cargo.toml and Cargo.lock
+   ```
+
+   Commit the change (`Cargo.toml` + `Cargo.lock`) through the normal review flow.
+2. **Merge `main` into `release`** (or fast-forward it) and push. The workflow starts by itself.
+3. **Wait for the draft.** After about 30 to 45 minutes (notarization is the slow part), the
+   Releases page has a draft `Photocraft v0.2.0`, tagged `v0.2.0` on the pushed commit, with
+   every artifact and `SHA256SUMS.txt`. The notes are generated from the merged PRs.
+4. **Check it.** Download an installer or two and look at the job summaries. Any
+   `::warning::` there means a signing secret was missing and that artifact is unsigned.
+5. **Publish** the draft in the GitHub UI. Publishing creates the `v0.2.0` tag. Versions with a
+   pre-release suffix (`-rc.1`) are marked as pre-releases.
+
+Pushing to `release` again before you publish rebuilds the same draft and replaces its assets.
+After the draft is published, the workflow refuses to touch that version again, so bump it first.
+
+**Test runs:** *Actions → Release → Run workflow* runs the whole pipeline by hand. The optional
+`version` input (such as `0.2.0-rc.1`) overrides `Cargo.toml` for that run only. The jobs apply
+it with `cargo xtask version set` before building, so the binaries report it too. The run still
+needs the `release` environment, which only the `release` branch can use, so pick that branch
+in the dialog.
+
+## What gets built
+
+| Platform | Artifacts | Built on |
+|---|---|---|
+| macOS 11+ (universal: Apple silicon + Intel) | `Photocraft-<v>-macos-universal.dmg`, `photocraft-cli-<v>-macos-universal.zip` | `macos-15` |
+| Windows 10+ x64 | `Photocraft-<v>-windows-x64.msi`, `…-windows-x64-portable.zip` | `windows-latest` |
+| Windows 10+ x86 (32-bit) | `Photocraft-<v>-windows-x86.msi`, `…-windows-x86-portable.zip` | `windows-latest` |
+| Linux x86_64 | `Photocraft-<v>-x86_64.AppImage`, `photocraft_<v>-1_amd64.deb`, `photocraft-<v>-1.x86_64.rpm`, `photocraft-<v>-linux-x86_64.tar.gz` | `ubuntu-22.04` |
+| Linux aarch64 | the same four, for `aarch64` / `arm64` | `ubuntu-22.04-arm` |
+| Web | `photocraft-web-<v>.zip` (static site; see [`packaging/web/README.md`](../packaging/web/README.md)) | `ubuntu-latest` |
+
+Every binary reports its version, the commit and the build date: `photocraft --version`,
+`photocraft-cli --version`, and *Help › About Photocraft*. CI sets `PHOTOCRAFT_BUILD_SHA` and
+`PHOTOCRAFT_BUILD_DATE`, and `crates/engine/src/build_info.rs` reads them at compile time. A plain
+`cargo build` doesn't set them and reports `0.2.0 (dev build)`.
+
+### macOS
+
+`packaging/macos/package.sh` builds `aarch64-apple-darwin` and `x86_64-apple-darwin` with
+`MACOSX_DEPLOYMENT_TARGET=11.0`, joins them with `lipo`, and assembles `Photocraft.app`:
+
+- `Info.plist` is generated from `Info.plist.in`. The bundle id is `ai.storyteller.photocraft`.
+  The plist sets `LSMinimumSystemVersion` 11.0, `NSHighResolutionCapable`, and document types:
+  `.pcraft` (Owner), plus PSD/PSB and the image formats Photocraft reads (Alternate, so it never
+  takes over Preview's defaults). The icon is `assets/app-icon/photocraft.icns`.
+- **Signing** goes inside-out with the hardened runtime and a secure timestamp. The executable
+  is signed first, then the bundle. There's no `--deep` on the final signature. The
+  entitlements (`entitlements.plist`) are deliberately empty.
+- **Notarization:** the app is zipped and sent with `xcrun notarytool submit --wait`, then the
+  ticket is stapled to the app. The app goes on a DMG (`hdiutil`, with an `Applications` link
+  to drag onto). The DMG is signed, notarized and stapled too. The script checks the results
+  with `codesign --verify --strict`, `stapler validate` and `spctl -a -vvv`.
+- **CLI:** the universal `photocraft-cli` is signed with the hardened runtime, zipped and
+  notarized. A bare binary can't hold a stapled ticket, so Gatekeeper looks it up online.
+
+Locally, without certificates, the script signs ad-hoc (`codesign -s -`) and skips notarization.
+That's enough to check the bundle and the DMG on your own Mac:
+
+```sh
+packaging/macos/package.sh                    # universal; needs both rustup targets
+packaging/macos/package.sh --arch aarch64     # quicker, host-only
+open dist/release/Photocraft-*-macos-*.dmg
+```
+
+### Windows
+
+`packaging/windows/package.ps1 -Arch x64|x86` builds with `-C target-feature=+crt-static`.
+The static C runtime means neither the MSI nor the portable zip needs the Visual C++
+redistributable, which matters for a standalone installer and costs only about 100 KB. The flag
+goes in `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, so host build scripts aren't affected.
+
+- `apps/photocraft/build.rs` embeds the icon (`assets/app-icon/photocraft.ico`) and
+  VERSIONINFO with the `winresource` crate. It only does this when targeting Windows. Elsewhere
+  it's a no-op, and the web build doesn't touch that crate.
+- Release builds use the GUI subsystem, so Start Menu launches don't open a console window.
+- `Photocraft.wxs` (WiX v5) is a per-machine install into Program Files with an advertised
+  Start Menu shortcut. Photocraft becomes the default app for `.pcraft` and is listed under
+  "Open with" for PSD/PSB and image files. It also registers App Paths (Win+R `photocraft`).
+  The MSI version is the numeric `X.Y.Z`, because MSI has no pre-release field. Same-version
+  upgrades are allowed so that release candidates replace each other.
+- **Signing:** `packaging/windows/sign.ps1` signs both `.exe` files and then the `.msi` with
+  `signtool`, using SHA-256 and an RFC 3161 timestamp. It uses whichever material is present:
+  1. a `.pfx` file (`WINDOWS_CERTIFICATE`, `WINDOWS_CERTIFICATE_PASSWORD`), timestamped by
+     DigiCert, or
+  2. Azure Trusted Signing (`AZURE_*`): the script downloads the
+     `Microsoft.Trusted.Signing.Client` dlib and timestamps with Microsoft's server.
+
+  The script is the single place to change when the Windows signing setup changes.
+
+Locally on Windows: `dotnet tool install -g wix --version 5.0.2`, then
+`pwsh packaging/windows/package.ps1 -Arch x64`.
+
+### Linux
+
+`packaging/linux/package.sh` stages one FHS tree and makes every format from it. The tree
+holds both binaries, `ai.storyteller.Photocraft.desktop`, hicolor icons from 16 px to 512 px
+plus a scalable SVG, AppStream metainfo, and a shared-mime-info file for `.pcraft`, `.psb` and
+`.qoi`.
+
+Why these formats:
+
+- **AppImage** runs on any distribution without installing anything. It's the
+  download-and-go option and the fallback for distros the packages don't cover. It's built
+  with the maintained `AppImage/appimagetool`, whose static runtime doesn't need libfuse2.
+- **.deb** covers Debian, Ubuntu, Mint, Pop!_OS and elementary. **.rpm** covers Fedora, RHEL
+  and its clones, and openSUSE. Both integrate with the menu, MIME and icon caches (the
+  `postinst.sh` hook) and uninstall cleanly. Both are built by
+  [nfpm](https://nfpm.goreleaser.com/): one maintained, dependency-free tool and one config
+  (`nfpm.yaml`). It doesn't need cargo-deb and cargo-generate-rpm metadata in our crates, and
+  it can build both formats on Ubuntu.
+- **.tar.gz** is for people who manage their own `/opt` or `~/.local`.
+- **Flatpak** is the route into Flathub, GNOME Software and KDE Discover.
+  `packaging/linux/flatpak/ai.storyteller.Photocraft.yml` is ready for a Flathub submission.
+  CI only validates it. A real build needs vendored crate sources (`cargo-sources.json` from
+  `flatpak-cargo-generator.py`) and adds 20+ minutes per architecture. Build it by hand with
+  the commands in the manifest's header.
+
+All Linux binaries are built on Ubuntu 22.04 and need **glibc ≥ 2.35**: Ubuntu 22.04+,
+Debian 12+, Fedora 36+, RHEL 10, openSUSE Tumbleweed. They link only glibc and libgcc_s. X11,
+Wayland, xkbcommon, Vulkan and EGL are loaded at runtime from the system, which is also where
+the GPU driver has to come from. That's why the packages declare them as dependencies and the
+AppImage doesn't bundle them.
+
+Locally (on Linux): install [nfpm](https://nfpm.goreleaser.com/install/), then
+`packaging/linux/package.sh` (or `--formats "deb tar"`).
+
+### Web
+
+`packaging/web/package.sh` runs `trunk build --release` (see `apps/photocraft-web/Trunk.toml`)
+and zips `dist/web` together with sample `_headers` and `.htaccess` files and the hosting guide.
+The site only uses relative URLs, so it works under any path and in an iframe.
+[`packaging/web/README.md`](../packaging/web/README.md) covers MIME types, compression,
+caching, the iframe snippet and the `?webgl` / `?cpu` flags.
+
+## Secrets
+
+All secrets live in the repository's **`release` environment** (*Settings → Environments →
+release*). Restrict its deployment branches to `release`. Every job in `release.yml` declares
+`environment: release`, so only pushes to that branch, or manual runs on it, can read the
+secrets. Each secret is optional. If one is missing, that platform's artifacts are unsigned and
+the run shows a `::warning::`.
+
+| Secret | Used for |
+|---|---|
+| `APPLE_CERTIFICATE` | base64 `.p12` with "Developer ID Application: Learning Machines LLC (DJ6XS33FX8)" |
+| `APPLE_CERTIFICATE_PASSWORD` | password for that `.p12` |
+| `KEYCHAIN_PASSWORD` | password for the temporary CI keychain (random if unset) |
+| `APPLE_ID` | Apple ID used by `notarytool` |
+| `APPLE_PASSWORD` | app-specific password for that Apple ID |
+| `APPLE_TEAM_ID` | `DJ6XS33FX8` |
+| `WINDOWS_CERTIFICATE` | base64 `.pfx` code-signing certificate |
+| `WINDOWS_CERTIFICATE_PASSWORD` | password for that `.pfx` |
+| `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | service principal for Azure Trusted Signing (an alternative to the `.pfx`) |
+| `AZURE_SIGNING_ENDPOINT` | e.g. `https://eus.codesigning.azure.net` |
+| `AZURE_SIGNING_ACCOUNT`, `AZURE_CERT_PROFILE` | Trusted Signing account and certificate profile names |
+
+`GITHUB_TOKEN` creates the release. Only the final job gets `contents: write`.
+
+On macOS, `packaging/macos/import-cert.sh` decodes the `.p12` into a temporary keychain
+(`security create-keychain`, then `security import`, then `set-key-partition-list` so codesign
+can use the key without a prompt). It exports the identity's SHA-1 as `MACOS_SIGN_IDENTITY`.
+The keychain is deleted at the end of the job.
+
+## Icons
+
+`assets/app-icon/photocraft.svg` is our own artwork (MIT OR Apache-2.0, see `LICENSE.txt`
+there). `packaging/icons.sh` regenerates the 1024 px PNG, the `.icns`, the `.ico` (packed by
+`cargo xtask ico`) and the hicolor PNGs from it. It needs `resvg`, plus `iconutil` on macOS.
+The outputs are committed, so packaging never needs those tools.
+
+## Checks
+
+`.github/workflows/packaging-lint.yml` runs in seconds on any change to `packaging/`, the
+workflows or the icons. It runs actionlint, shellcheck, a PowerShell parse, xmllint,
+`desktop-file-validate`, `appstreamcli validate`, and a YAML check of the Flatpak manifest.

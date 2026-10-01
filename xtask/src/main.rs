@@ -3,8 +3,10 @@
 //! Pure Rust (std + serde_json). External tools (`cargo`, `curl`, `tar`) are
 //! invoked through `std::process::Command`.
 
+mod ico;
 mod layers;
 mod stats;
+mod version;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -20,6 +22,10 @@ commands:
                   show where test corpora live; --download fetches PngSuite into corpus/pngsuite
   stats [--exact] count tests and lines per crate (--exact: ask the test harness via `-- --list`)
   parity          Photoshop menu parity; rewrites docs/parity.md
+  version [set X.Y.Z[-pre]]
+                  print the workspace version, or set it (Cargo.toml + Cargo.lock)
+  ico <out.ico> <in.png>...
+                  pack square PNGs (<= 256 px) into a Windows .ico (see packaging/icons.sh)
 ";
 
 fn main() -> ExitCode {
@@ -32,6 +38,8 @@ fn main() -> ExitCode {
         Some("corpus") => cmd_corpus(rest.contains(&"--download")),
         Some("stats") => stats::run(&root(), rest.contains(&"--exact")),
         Some("parity") => cmd_parity(),
+        Some("version") => version::run(&root(), &rest),
+        Some("ico") => ico::run(&rest),
         Some("-h" | "--help" | "help") | None => {
             print!("{USAGE}");
             Ok(())

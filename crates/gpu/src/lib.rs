@@ -10,20 +10,21 @@
 //! - **Planner** ([`plan`]). The layer tree becomes a linear list of passes over abstract
 //!   chunk-sized buffers (blend with every Photoshop mode, opacity × fill, masks, clipping groups,
 //!   pass-through vs isolated groups, adjustments, solid / gradient fills, layer effects).
-//! - **Layer effects** ([`fx`]). Each effect layer's maps (shadow, glow, satin, bevel, stroke
+//! - **Layer effects** (`fx.rs`). Each effect layer's maps (shadow, glow, satin, bevel, stroke
 //!   bands) are built by fragment passes over its effect region and cached on the GPU per layer
 //!   state; a brush stroke rebuilds only the damaged tiles grown by the effect reach.
 //! - **Execution.** The canvas is processed in chunks (1024² RGBA32F accumulators, reused), and
 //!   each finished chunk is handed to a caller-supplied sink, e.g. to encode it straight into a
 //!   display texture — no readback.
 //!
-//! Anything the planner can't express (vector masks, layers clipped to pass-through groups,
-//! uncached pattern fills, artboards, documents or effect regions larger than the device's
-//! texture limit) returns [`Unsupported`]; callers fall back to the CPU compositor.
+//! Anything the planner can't express (vector masks, layers clipped to pass-through groups, stroked
+//! shapes with clipped layers, uncached pattern fills, artboards, documents or effect regions
+//! larger than the device's texture limit) returns [`Unsupported`]; callers fall back to the CPU
+//! compositor.
 #![forbid(unsafe_code)]
 
 pub mod bounds;
-pub mod fx;
+mod fx;
 pub mod plan;
 
 use std::collections::HashMap;

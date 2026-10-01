@@ -70,9 +70,10 @@ pub(crate) struct MapProgram {
 }
 
 /// How far a field value depends on the shape, for a field exact up to `reach`.
-pub(crate) fn field_radius(kind: FieldKind, reach: i32) -> i32 {
-    // The nearest seed lies within the reach; local coverage reads one more pixel.
-    reach + 2 + i32::from(kind == FieldKind::StrokeOutsideVector)
+pub(crate) fn field_radius(_kind: FieldKind, reach: i32) -> i32 {
+    // The nearest seed lies within the reach (seeds may start up to 1 px in, at their sub-pixel
+    // edge); stroke fields classify seeds by their 3×3 local coverage, one more pixel.
+    reach + 3
 }
 
 impl MapProgram {

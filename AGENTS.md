@@ -1,6 +1,6 @@
 # AGENTS.md: guide for AI agents and contributors
 
-Photocraft is an open-source, native, Photoshop-comparable image editor written in **Rust only** (no JavaScript or TypeScript). The goal is 1:1 Photoshop parity (same menus, shortcuts, behaviour and file fidelity) with better performance, and every feature drivable by agents. Read this file first, then `docs/`.
+PhotoCraft is an open-source, native, Photoshop-comparable image editor written in **Rust only** (no JavaScript or TypeScript). The product name is always written **PhotoCraft** (PascalCase, like its siblings DrawCraft, FilmCraft, LightCraft, PrintCraft, DesignCraft, EffectsCraft, ArtCraft) in user-facing text: UI, window titles, About, installers, release names, docs prose. Machine names stay lowercase: crates (`photocraft-*`), binaries, file names, ids (`ai.storyteller.photocraft`). The goal is 1:1 Photoshop parity (same menus, shortcuts, behaviour and file fidelity) with better performance, and every feature drivable by agents. Read this file first, then `docs/`.
 
 ## 1. Orientation (5 minutes)
 
@@ -82,6 +82,8 @@ Then append a terse entry to `log/devlog.md` (what landed, numbers, what's still
 
 - `docs/roadmap.md`: milestones M0–M12, status and the current focus.
 - `docs/parity.md`: generated Photoshop menu coverage.
+- `docs/releasing.md`: cutting a release (`cargo xtask version`, the `release` branch), signing secrets, packaging scripts in `packaging/`.
+- `docs/release-playbook.md`: how every storytold app builds signed release binaries (shared across photocraft, drawcraft, filmcraft, lightcraft, printcraft, designcraft, effectscraft); `docs/releasing.md` is Photocraft's specifics.
 - `plan/` (local, gitignored): research, parity plan, execution plan, estimates.
 - `log/` (local, gitignored): the dev log.
 
