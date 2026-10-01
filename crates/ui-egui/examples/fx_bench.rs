@@ -135,18 +135,53 @@ fn cpu_time(doc: &Document, region: Rect) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
 }
 
-fn report(what: &str, region: Rect, cpu: Option<f64>, gpu: Result<f64, String>) {
-    let mp = region.width() as f64 * region.height() as f64 / 1e6;
-    let c = cpu.map_or("-".to_string(), |v| format!("{v:9.1} ms"));
-    let g = match gpu {
-        Ok(v) => format!("{v:9.1} ms"),
-        Err(e) => format!("unsupported ({e})"),
-    };
-    println!("{what:<40} {mp:7.2} MP   cpu {c:>12}   gpu {g}");
+/// `--compare a.psd b.psd …`: GPU vs CPU max difference (premultiplied, /255) per file.
+fn compare(files: &[String]) {
+    let Some(mut g) = gpu() else { return };
+    let mut worst_all = 0.0f32;
+    for p in files {
+        let Ok(bytes) = std::fs::read(p) else { continue };
+        let Ok(r) = photocraft_io::import(p, &bytes) else {
+            println!("{p}: import failed");
+            continue;
+        };
+        let doc = r.document;
+        let fx = doc.walk().iter().filter(|(_, _, l)| photocraft_compose::effects::has_effects(l)).count();
+        let cpu = photocraft_compose::flatten(&doc);
+        match photocraft_gpu::render_to_vec(&mut g.comp, &g.device, &g.queue, &doc, doc.bounds()) {
+            Ok(out) => {
+                let mut worst = (0.0f32, 0usize);
+                for (i, (c, o)) in cpu.px.iter().zip(&out).enumerate() {
+                    for k in 0..4 {
+                        let (a, b) = if k == 3 { (c[3], o[3]) } else { (c[k] * c[3], o[k] * o[3]) };
+                        let d = (a - b).abs();
+                        if d > worst.0 || d.is_nan() {
+                            worst = (if d.is_nan() { 9.0 } else { d }, i);
+                        }
+                    }
+                }
+                let w = doc.size.width as usize;
+                worst_all = worst_all.max(worst.0);
+                println!("{:<70} {fx:>2} fx layers  max diff {:6.2}/255 at ({},{})", p, worst.0 * 255.0, worst.1 % w, worst.1 / w);
+                if std::env::var_os("FX_DUMP").is_some() && worst.0 > 1.0 / 255.0 {
+                    println!("    cpu {:?} gpu {:?}", cpu.px[worst.1], out[worst.1]);
+                    for (_, depth, l) in doc.walk() {
+                        println!("    {}{} {:?} op {} fill {} clipped {} visible {} fx {:?}", "  ".repeat(depth), l.name, l.blend, l.opacity, l.fill_opacity, l.clipped, l.visible, l.effects.items.iter().map(|e| e.label()).collect::<Vec<_>>());
+                    }
+                }
+            }
+            Err(e) => println!("{p:<70} {fx:>2} fx layers  CPU fallback: {e}"),
+        }
+    }
+    println!("worst over all files: {:.2}/255", worst_all * 255.0);
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--compare") {
+        compare(&args[i + 1..]);
+        return;
+    }
     let no_cpu = args.iter().any(|a| a == "--no-cpu");
     let mut doc = if let Some(p) = arg(&args, "--psd") {
         let bytes = std::fs::read(&p).expect("read --psd");
@@ -162,38 +197,88 @@ fn main() {
         Some(g) => gpu_time(g, doc, r),
         None => Err("no adapter".into()),
     };
-    let cpu = |doc: &Document, r: Rect| if no_cpu { None } else { Some(cpu_time(doc, r)) };
+
+    let reps: usize = arg(&args, "--reps").and_then(|v| v.parse().ok()).unwrap_or(5);
+    let stats = |v: &mut Vec<f64>| -> Option<(f64, f64)> {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        (!v.is_empty()).then(|| (v[0], v[v.len() / 2]))
+    };
+    let show = |what: &str, r: Rect, c: Option<(f64, f64)>, g: Result<(f64, f64), String>| {
+        let mp = r.width() as f64 * r.height() as f64 / 1e6;
+        let c = c.map_or("-".to_string(), |(m, med)| format!("{m:8.1} / {med:8.1} ms"));
+        let g = match g {
+            Ok((m, med)) => format!("{m:7.1} / {med:7.1} ms"),
+            Err(e) => format!("unsupported ({e})"),
+        };
+        println!("{what:<42} {mp:6.2} MP   cpu {c:>22}   gpu {g}   (min / median)");
+    };
+    // Each case: `edit` mutates the document, then both compositors refresh `region`.
+    let mut case = |doc: &mut Document, what: &str, n: usize, edit: &mut dyn FnMut(&mut Document, usize) -> Rect, cpu_too: bool| {
+        let (mut cs, mut gs, mut gerr) = (Vec::new(), Vec::new(), None);
+        let mut region = full;
+        for i in 0..n {
+            region = edit(doc, i).intersect(&full);
+            if cpu_too && !no_cpu {
+                cs.push(cpu_time(doc, region));
+            }
+            match gt(doc, region) {
+                Ok(v) => gs.push(v),
+                Err(e) => gerr = Some(e),
+            }
+        }
+        show(what, region, stats(&mut cs), match gerr {
+            Some(e) => Err(e),
+            None => Ok(stats(&mut gs).unwrap_or((0.0, 0.0))),
+        });
+    };
 
     if args.iter().any(|a| a == "--baseline") {
         let mut plain = doc.clone();
         for l in &mut plain.layers {
             l.effects.items.clear();
         }
-        let _ = gt(&plain, full);
-        report("baseline: no effects, full refresh", full, None, gt(&plain, full));
+        case(&mut plain, "baseline: no effects, full refresh", reps, &mut |_, _| full, false);
     }
-    photocraft_compose::purge_effect_cache();
-    report("full refresh, cold effect caches", full, cpu(&doc, full), gt(&doc, full));
-    report("full refresh, warm caches", full, cpu(&doc, full), gt(&doc, full));
-
+    case(&mut doc, "full refresh, cold effect caches", 1, &mut |_, _| {
+        photocraft_compose::purge_effect_cache();
+        full
+    }, true);
+    case(&mut doc, "full refresh, warm caches", reps.min(3), &mut |_, _| full, true);
     // Adjustment tweak (maps unaffected).
-    if let Some(LayerContent::Adjustment(Adjustment::HueSaturation { hue, .. })) = doc.layers.last_mut().map(|l| &mut l.content) {
-        *hue += 5.0;
-    }
-    report("adjustment tweak (full refresh)", full, cpu(&doc, full), gt(&doc, full));
-
-    // Brush dab on a plain layer.
+    case(&mut doc, "adjustment tweak (full refresh)", reps.min(3), &mut |d, _| {
+        if let Some(LayerContent::Adjustment(Adjustment::HueSaturation { hue, .. })) = d.layers.last_mut().map(|l| &mut l.content) {
+            *hue += 5.0;
+        }
+        full
+    }, true);
+    // Brush dabs on a plain layer and on the effect layer: the canvas refreshes the damage rect
+    // grown by the effect reach (`canvas::effect_reach`).
     let margin = doc.walk().iter().map(|(_, _, l)| photocraft_compose::effects::margin(l)).max().unwrap_or(0);
-    let dab = Rect::new(full.width() as i32 / 3, full.height() as i32 / 3, full.width() as i32 / 3 + 64, full.height() as i32 / 3 + 64);
-    if let Some(l) = doc.layers.iter_mut().find(|l| l.name == "paint") {
-        l.surface_mut().unwrap().fill_rect(dab, &[0.1, 0.9, 0.1, 1.0]);
-        report("dab on a plain layer (damage rect)", dab, cpu(&doc, dab), gt(&doc, dab));
-    }
-    // Brush dab on the effect layer: its effects reach `margin` px beyond the dab.
-    let blob_dab = Rect::new(full.width() as i32 / 2 - 32, full.height() as i32 / 2 - 32, full.width() as i32 / 2 + 32, full.height() as i32 / 2 + 32);
-    if let Some(l) = doc.layers.iter_mut().find(|l| l.name == "blob") {
-        l.surface_mut().unwrap().fill_rect(blob_dab, &[0.9, 0.1, 0.1, 1.0]);
-        let r = blob_dab.inflate(margin).intersect(&full);
-        report("dab on the effect layer (damage + reach)", r, cpu(&doc, r), gt(&doc, r));
-    }
+    let (w, h) = (full.width() as i32, full.height() as i32);
+    case(&mut doc, "dab on a plain layer (damage + reach)", reps, &mut |d, i| {
+        let r = Rect::new(w / 3 + i as i32 * 70, h / 3, w / 3 + i as i32 * 70 + 64, h / 3 + 64);
+        if let Some(l) = d.layers.iter_mut().find(|l| l.name == "paint") {
+            l.surface_mut().unwrap().fill_rect(r, &[0.1, 0.9, 0.1, 1.0]);
+        }
+        r.inflate(margin)
+    }, true);
+    // Moving a text layer by whole pixels: its effect maps move with it.
+    case(&mut doc, "move a text layer 7 px (old + new bounds)", reps, &mut |d, _| {
+        let Some(l) = d.layers.iter_mut().find(|l| matches!(l.content, LayerContent::Text(_))) else { return Rect::EMPTY };
+        let LayerContent::Text(t) = &mut l.content else { return Rect::EMPTY };
+        let Some(src) = t.cache.as_ref() else { return Rect::EMPTY };
+        let b = src.content_bounds();
+        let to = Rect::new(b.x0 + 7, b.y0, b.x1 + 7, b.y1);
+        let mut moved = photocraft_raster::Surface::new(src.format());
+        moved.write_region(to, &src.read_region(b));
+        t.cache = Some(moved);
+        b.union(&to).inflate(margin)
+    }, true);
+    case(&mut doc, "dab on the effect layer (damage + reach)", reps, &mut |d, i| {
+        let r = Rect::new(w / 2 - 32 + i as i32 * 300, h / 2 - 32, w / 2 + 32 + i as i32 * 300, h / 2 + 32);
+        if let Some(l) = d.layers.iter_mut().find(|l| l.name == "blob") {
+            l.surface_mut().unwrap().fill_rect(r, &[0.9, 0.1, 0.1, 1.0]);
+        }
+        r.inflate(margin)
+    }, true);
 }

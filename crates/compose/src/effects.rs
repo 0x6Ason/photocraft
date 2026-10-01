@@ -8,9 +8,14 @@
 //! interior effects blend with the layer's mode. Layer opacity applies to
 //! the whole stack; fill opacity only to the layer's own pixels.
 //!
-//! Shapes come from the layer's alpha (after its mask). Distances use an
-//! exact Euclidean distance transform; soft falloffs use three box-blur
-//! passes (≈ Gaussian) whose total support equals the effect size.
+//! Interior effects are painted relative to the layer's shape and then take the shape's alpha
+//! (an overlay recolours a half-transparent edge without adding coverage). The outside parts
+//! of strokes blend onto the backdrop with their own modes, an upper stroke covering the
+//! lower ones. Drop shadows are knocked out only through see-through fill.
+//!
+//! Shapes come from the layer's alpha (after its mask). Strokes measure distances with a
+//! 5 × 5 chamfer metric seeded at sub-pixel edge offsets (as Photoshop does); other effects
+//! use an exact Euclidean distance transform. Soft falloffs are Gaussian blurs.
 
 use photocraft_color::blend::BlendMode;
 use photocraft_doc::{
@@ -177,6 +182,7 @@ fn edt_nearest(inside: &[bool], w: usize, h: usize) -> (Vec<f32>, Vec<usize>) {
 /// plus the index of the nearest `inside` pixel (0 on inside pixels). Photoshop's effect
 /// distances follow this metric: its stroke corners measure 3.236 = √5 + 1 at offset (1, 3)
 /// and 3.650 = √5 + √2 at (2, 3), where the exact distances are 3.162 and 3.606.
+#[cfg(test)]
 fn chamfer_nearest(inside: &[bool], w: usize, h: usize) -> (Vec<f32>, Vec<usize>) {
     chamfer_from(inside.iter().map(|&b| if b { 0.0 } else { CHAMFER_INF }).collect(), w, h)
 }
@@ -193,7 +199,7 @@ fn chamfer_from(mut d: Vec<f32>, w: usize, h: usize) -> (Vec<f32>, Vec<usize>) {
     const FWD: [(i64, i64, f32); 8] = [(-1, 0, 1.0), (-1, -1, S2), (0, -1, 1.0), (1, -1, S2), (-1, -2, S5), (1, -2, S5), (-2, -1, S5), (2, -1, S5)];
     let mut near: Vec<usize> = (0..w * h).collect();
     let (wi, hi) = (w as i64, h as i64);
-    let mut relax = |x: i64, y: i64, sign: i64, d: &mut Vec<f32>, near: &mut Vec<usize>| {
+    let relax = |x: i64, y: i64, sign: i64, d: &mut Vec<f32>, near: &mut Vec<usize>| {
         let i = (y * wi + x) as usize;
         let mut best = d[i];
         let mut bn = near[i];
@@ -242,13 +248,6 @@ enum Metric {
     Chamfer,
 }
 
-fn nearest(inside: &[bool], w: usize, h: usize, m: Metric) -> (Vec<f32>, Vec<usize>) {
-    match m {
-        Metric::Euclidean => edt_nearest(inside, w, h),
-        Metric::Chamfer => chamfer_nearest(inside, w, h),
-    }
-}
-
 fn dist_outside_by(s: &Map, m: Metric) -> Vec<f32> {
     if m == Metric::Chamfer {
         // Seeds start at their sub-pixel edge offset (1 − coverage).
@@ -257,7 +256,7 @@ fn dist_outside_by(s: &Map, m: Metric) -> Vec<f32> {
         return d.iter().zip(&s.v).map(|(d, &a)| if a > INSIDE_EPS { -0.5 } else { d - 0.5 }).collect();
     }
     let inside: Vec<bool> = s.v.iter().map(|&a| a > INSIDE_EPS).collect();
-    let (d, near) = nearest(&inside, s.w, s.h, m);
+    let (d, near) = edt_nearest(&inside, s.w, s.h);
     (0..d.len()).map(|i| if inside[i] { -0.5 } else { d[i] - 0.5 + (1.0 - s.v[near[i]].min(1.0)) }).collect()
 }
 
@@ -290,7 +289,7 @@ fn dist_inside_by(s: &Map, m: Metric) -> Vec<f32> {
         return d.iter().zip(&s.v).map(|(d, &a)| if a <= INSIDE_EPS { -0.5 } else { d - 0.5 }).collect();
     }
     let outside: Vec<bool> = s.v.iter().map(|&a| a <= INSIDE_EPS).collect();
-    let (d, _) = nearest(&outside, s.w, s.h, m);
+    let (d, _) = edt_nearest(&outside, s.w, s.h);
     d.iter().zip(&outside).map(|(d, o)| if *o { -0.5 } else { d - 0.5 }).collect()
 }
 
@@ -752,8 +751,12 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
         if let Effect::DropShadow(s) = e {
             let mut m = fx(i, 0);
             if s.knocks_out {
+                // The layer hides the shadow beneath it only where its fill is see-through: at
+                // 100 % fill the layer covers it anyway (and anti-aliased edges are not
+                // attenuated twice), at 0 % the shape shows the bare backdrop.
+                let see_through = 1.0 - layer.fill_opacity.clamp(0.0, 1.0);
                 for (v, a) in m.v.iter_mut().zip(&shape.v) {
-                    *v *= 1.0 - a;
+                    *v *= 1.0 - a * see_through;
                 }
             }
             paint_color(&mut work, &m, rgb(&s.color), s.common.blend, s.common.opacity);
@@ -849,28 +852,55 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
     }
     let vdout = maps.vdout.as_ref().filter(|_| vector_shape && !strokes.is_empty()).map(|v| maps.crop_vec(v, big, FAR));
     // Outside parts lie beneath the layer and blend onto the backdrop with their own mode. A
-    // higher stroke knocks out the ones below it (Photoshop: a Multiply stroke listed above a
-    // wider Normal stroke multiplies the backdrop, not the lower stroke).
-    let mut cover = vec![0.0f32; w * h];
-    for st in strokes.iter().copied() {
-        let (_, out_w) = widths(st);
-        if out_w <= 0.0 {
-            continue;
+    // higher stroke covers the ones below it (Photoshop: a Multiply stroke listed above a wider
+    // Normal stroke multiplies the backdrop, not the lower stroke). Each stroke's share is its
+    // coverage × opacity not yet taken by strokes above; for Normal strokes this equals stacking
+    // them top over bottom.
+    if strokes.iter().any(|st| widths(st).1 > 0.0) {
+        let base = work.clone();
+        let mut acc = vec![[0.0f32; 4]; w * h]; // premultiplied Σ share·blended
+        let mut cover = vec![0.0f32; w * h];
+        for st in strokes.iter().copied() {
+            let (_, out_w) = widths(st);
+            if out_w <= 0.0 {
+                continue;
+            }
+            // Shape layers: Photoshop strokes the vector outline, estimated from
+            // local coverage; the stroke never shows through the shape's pixels.
+            let d = vdout.as_ref().unwrap_or(&dout);
+            let mut share = vec![0.0f32; w * h];
+            for (i, sh) in share.iter_mut().enumerate() {
+                let k = if inside(shape.v[i]) {
+                    if vector_shape { 0.0 } else { 1.0 }
+                } else {
+                    (out_w + 0.5 - d[i]).clamp(0.0, 1.0)
+                };
+                *sh = k * st.common.opacity * (1.0 - cover[i]);
+                cover[i] += *sh;
+            }
+            // The stroke blended over the backdrop at full coverage.
+            let mut blended = base.clone();
+            let ones = Map { w, h, v: share.iter().map(|&s| if s > 0.0 { 1.0 } else { 0.0 }).collect() };
+            paint_fx(&mut blended, &ones, &st.paint, sb, anchor, big, st.common.blend, 1.0, patterns);
+            for ((a, b), s) in acc.iter_mut().zip(&blended.px).zip(&share) {
+                if *s > 0.0 {
+                    for c in 0..3 {
+                        a[c] += s * b[c] * b[3];
+                    }
+                    a[3] += s * b[3];
+                }
+            }
         }
-        // Shape layers: Photoshop strokes the vector outline, estimated from
-        // local coverage; the stroke never shows through the shape's pixels.
-        let d = vdout.as_ref().unwrap_or(&dout);
-        let mut m = Map::new(w, h, 0.0);
-        for (((mv, a), dv), c) in m.v.iter_mut().zip(&shape.v).zip(d).zip(cover.iter_mut()) {
-            let k = if inside(*a) {
-                if vector_shape { 0.0 } else { 1.0 }
-            } else {
-                (out_w + 0.5 - dv).clamp(0.0, 1.0)
-            };
-            *mv = k * (1.0 - *c);
-            *c += *mv;
+        for ((p, a), c) in work.px.iter_mut().zip(&acc).zip(&cover) {
+            if *c <= 0.0 {
+                continue;
+            }
+            let k = 1.0 - c.min(1.0);
+            let alpha = p[3] * k + a[3];
+            if alpha > 0.0 {
+                *p = [(p[0] * p[3] * k + a[0]) / alpha, (p[1] * p[3] * k + a[1]) / alpha, (p[2] * p[3] * k + a[2]) / alpha, alpha.min(1.0)];
+            }
         }
-        paint_fx(&mut work, &m, &st.paint, sb, anchor, big, st.common.blend, st.common.opacity, patterns);
     }
     for (i, e) in rev() {
         if let Effect::BevelEmboss(b) = e
@@ -1004,6 +1034,21 @@ mod tests {
         assert!((ang - 0.75).abs() < 1e-3, "{ang}");
         let rev = gradient_t(GradientStyle::Linear, 0.0, 1.0, true, (0.0, 0.0), b, 0.0, 50.0);
         assert!(rev > 0.99);
+    }
+
+    #[test]
+    fn chamfer_uses_euclidean_step_lengths() {
+        let (w, h) = (9, 9);
+        let mut inside = vec![false; w * h];
+        inside[0] = true;
+        let (d, near) = chamfer_nearest(&inside, w, h);
+        let at = |x: usize, y: usize| d[y * w + x];
+        assert!((at(3, 0) - 3.0).abs() < 1e-5);
+        assert!((at(2, 2) - 2.0 * std::f32::consts::SQRT_2).abs() < 1e-5);
+        assert!((at(1, 2) - 5f32.sqrt()).abs() < 1e-5);
+        assert!((at(1, 3) - (5f32.sqrt() + 1.0)).abs() < 1e-5, "knight + straight, not √10");
+        assert!((at(2, 3) - (5f32.sqrt() + std::f32::consts::SQRT_2)).abs() < 1e-5);
+        assert!(near.iter().all(|&n| n == 0));
     }
 
     #[test]

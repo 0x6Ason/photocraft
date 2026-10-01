@@ -3418,6 +3418,7 @@ dependencies = [
  "photocraft-doc",
  "photocraft-geom",
  "photocraft-raster",
+ "photocraft-vector",
  "pollster 1.0.1",
  "rayon",
  "wgpu",

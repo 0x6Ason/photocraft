@@ -42,6 +42,11 @@ pub enum Kernel {
     FxPaint,
     /// Layer + interior effects over the exterior result, then layer opacity against the backdrop.
     FxMerge,
+    /// Outside strokes: accumulate one stroke's share (`kind` 0, premultiplied colour) or its
+    /// coverage (`kind` 1).
+    FxStroke,
+    /// Outside strokes: resolve the accumulated strokes over the exterior result.
+    FxStrokeEnd,
     /// Copy slot A into `dst` (an existing slot) over the pass clip (no draw).
     CopyRect,
     /// Copy all of slot A into the fresh slot `dst` (no draw).
@@ -72,6 +77,8 @@ impl Kernel {
             Kernel::FxInit => "fs_fxinit",
             Kernel::FxPaint => "fs_fxpaint",
             Kernel::FxMerge => "fs_fxmerge",
+            Kernel::FxStroke => "fs_fxstroke",
+            Kernel::FxStrokeEnd => "fs_fxstrokeend",
             Kernel::MShift => "fs_mshift",
             Kernel::MDilate => "fs_mdilate",
             Kernel::MBlur => "fs_mblur",
@@ -99,7 +106,7 @@ impl Kernel {
     }
 
     /// Every kernel with a pipeline.
-    pub const DRAWN: [Kernel; 18] = [
+    pub const DRAWN: [Kernel; 20] = [
         Kernel::Content,
         Kernel::Mask,
         Kernel::Blend,
@@ -110,6 +117,8 @@ impl Kernel {
         Kernel::FxInit,
         Kernel::FxPaint,
         Kernel::FxMerge,
+        Kernel::FxStroke,
+        Kernel::FxStrokeEnd,
         Kernel::MShift,
         Kernel::MDilate,
         Kernel::MBlur,
@@ -151,6 +160,8 @@ pub struct Pass<'a> {
     pub a: Option<Slot>,
     pub b: Option<Slot>,
     pub c: Option<Slot>,
+    /// A fourth slot, bound in place of `tex` (passes without layer pixels).
+    pub d: Option<Slot>,
     pub mode: BlendMode,
     pub opacity: f32,
     /// Layer pixels (raster / text / shape / smart cache / fill cache).
@@ -194,6 +205,7 @@ impl<'a> Pass<'a> {
             a: None,
             b: None,
             c: None,
+            d: None,
             mode: BlendMode::Normal,
             opacity: 1.0,
             tex: None,
@@ -285,11 +297,9 @@ enum Cov {
 
 /// Shader flags for effect passes (keep in sync with compose.wgsl). Coverage `m` of a paint, with
 /// `a` the layer's alpha and `inside` = `a > 0.5/255`:
-/// knockout `m × (1 − a)`; gate `inside ? m : 0`; rel `inside ? min(m / a, 1) : 0`;
+/// knockout `m × (1 − a × k)` (k in `p4.w`); gate `inside ? m : 0`; rel `inside ? min(m / a, 1) : 0`;
 /// stroke-out `inside ? (vector ? 0 : 1) : m`.
 pub const F_KNOCKOUT: u32 = 16;
-/// Paint beneath A instead of over it (outside strokes).
-pub const F_UNDER: u32 = 32;
 /// Shape layer (outside strokes never show inside it).
 pub const F_VECTOR: u32 = 64;
 /// Merge onto an opaque clipping base, keeping its alpha.
@@ -297,6 +307,8 @@ pub const F_ATOP: u32 = 128;
 pub const F_GATE: u32 = 256;
 pub const F_REL: u32 = 512;
 pub const F_STROKE_OUT: u32 = 1024;
+/// First outside stroke (no accumulated share yet).
+pub const F_FIRST: u32 = 2048;
 
 /// `FxInit` kinds: A at `opacity` × alpha; an opaque copy of A; A's colour with alpha `opacity`
 /// inside B's shape; A with alpha × B's alpha.
@@ -337,9 +349,9 @@ impl<'a> Planner<'a> {
     fn emit(&mut self, mut pass: Pass<'a>) -> Slot {
         let dst = self.alloc();
         pass.dst = dst;
-        let (a, b, c) = (pass.a, pass.b, pass.c);
+        let (a, b, c, d) = (pass.a, pass.b, pass.c, pass.d);
         self.passes.push(pass);
-        for s in [a, b, c].into_iter().flatten() {
+        for s in [a, b, c, d].into_iter().flatten() {
             self.release(s);
         }
         dst
@@ -618,8 +630,10 @@ impl<'a> Planner<'a> {
         };
         for &(i, e) in &rev {
             if let Effect::DropShadow(s) = e {
+                // The layer hides the shadow beneath it where its fill is see-through.
                 let flags = if s.knocks_out { F_KNOCKOUT } else { 0 };
-                w = self.paint(w, content, Cov::Map(map(i, 0), 0.0), &Paint::Color(s.color.to_rgb()), s.common.blend, s.common.opacity, flags, clip, sb);
+                let see_through = 1.0 - layer.fill_opacity.clamp(0.0, 1.0);
+                w = self.paint_k(w, content, Cov::Map(map(i, 0), 0.0), &Paint::Color(s.color.to_rgb()), s.common.blend, s.common.opacity, flags, clip, sb, see_through);
             }
         }
         for &(i, e) in &rev {
@@ -688,15 +702,39 @@ impl<'a> Planner<'a> {
         // The shape's own alpha.
         let c = self.retain(content);
         l = init(self, l, Some(c), INIT_ALPHA, 1.0);
-        // Outside stroke parts slide beneath the layer (top instance first).
-        for (i, e) in items.iter().copied().enumerate() {
-            if let Effect::Stroke(st) = e
-                && stroke_widths(st).1 > 0.0
-            {
+        // Outside stroke parts lie beneath the layer and blend onto the exterior result with their
+        // own mode; a higher stroke covers the ones below it (each takes its coverage × opacity
+        // not yet taken above it, blended over the result as it was before the strokes).
+        let outs: Vec<(usize, &photocraft_doc::StrokeFx)> = items.iter().copied().enumerate().filter_map(|(i, e)| if let Effect::Stroke(st) = e { Some((i, st)) } else { None }).filter(|(_, st)| stroke_widths(st).1 > 0.0).collect();
+        if !outs.is_empty() {
+            let (mut acc, mut cover): (Option<Slot>, Option<Slot>) = (None, None);
+            for (n, &(i, st)) in outs.iter().enumerate() {
                 let paint = self.fx_paint(&st.paint, anchor);
-                let flags = F_UNDER | F_STROKE_OUT | if vector_shape { F_VECTOR } else { 0 };
-                l = self.paint(l, content, Cov::Map(map(i, 0), 0.0), &paint, BlendMode::Normal, st.common.opacity, flags, clip, sb);
+                let flags = F_STROKE_OUT | if vector_shape { F_VECTOR } else { 0 } | if n == 0 { F_FIRST } else { 0 };
+                // Share × blended colour, then coverage (both read the coverage so far).
+                let mut p = self.fx_pass_kernel(Kernel::FxStroke, w, content, &paint, st.common.blend, st.common.opacity, flags, clip, sb);
+                if matches!(paint, Paint::None) {
+                    // A missing pattern paints nothing: the stroke's share keeps the result as is.
+                    p.params[2][2] = 3.0;
+                }
+                p.adjust_kind = 0;
+                p.map = Some(map(i, 0));
+                p.c = cover.map(|c| self.retain(c));
+                p.d = acc;
+                let a = self.emit(p);
+                let mut p = self.fx_pass_kernel(Kernel::FxStroke, w, content, &Paint::Color([0.0; 3]), BlendMode::Normal, st.common.opacity, flags, clip, sb);
+                p.adjust_kind = 1;
+                p.map = Some(map(i, 0));
+                p.c = cover;
+                cover = Some(self.emit(p));
+                acc = Some(a);
             }
+            let mut p = Pass::new(Kernel::FxStrokeEnd, 0);
+            p.a = Some(w);
+            p.b = acc;
+            p.c = cover;
+            p.clip = Some(clip);
+            w = self.emit(p);
         }
         for &(i, e) in &rev {
             if let Effect::BevelEmboss(b) = e
@@ -748,28 +786,22 @@ impl<'a> Planner<'a> {
         }
     }
 
-    /// One effect paint into `dst` (consumed); reads the layer's alpha from `content` (kept).
+    /// An effect pass reading `dst` (A, retained) and the layer `content` (B, retained) with its
+    /// paint set up.
     #[allow(clippy::too_many_arguments)]
-    fn paint(&mut self, dst: Slot, content: Slot, cov: Cov, paint: &Paint<'a>, blend: BlendMode, opacity: f32, flags: u32, clip: Rect, sb: Rect) -> Slot {
-        if matches!(paint, Paint::None) {
-            // Missing pattern: compose paints nothing.
-            return dst;
-        }
-        let mut p = Pass::new(Kernel::FxPaint, 0);
-        p.a = Some(dst);
+    fn fx_pass(&mut self, dst: Slot, content: Slot, paint: &Paint<'a>, blend: BlendMode, opacity: f32, flags: u32, clip: Rect, sb: Rect) -> Pass<'a> {
+        self.fx_pass_kernel(Kernel::FxPaint, dst, content, paint, blend, opacity, flags, clip, sb)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fx_pass_kernel(&mut self, kernel: Kernel, dst: Slot, content: Slot, paint: &Paint<'a>, blend: BlendMode, opacity: f32, flags: u32, clip: Rect, sb: Rect) -> Pass<'a> {
+        let mut p = Pass::new(kernel, 0);
+        p.a = Some(self.retain(dst));
         p.b = Some(self.retain(content));
         p.mode = blend;
         p.opacity = opacity;
         p.flags = flags;
         p.clip = Some(clip);
-        match cov {
-            Cov::Map(m, outside) => {
-                p.adjust_kind = 0;
-                p.map = Some(m);
-                p.params[2][3] = outside;
-            }
-            Cov::One => p.adjust_kind = 1,
-        }
         match paint {
             Paint::None => {}
             Paint::Color(c) => p.color = [c[0], c[1], c[2], 1.0],
@@ -795,6 +827,33 @@ impl<'a> Planner<'a> {
                 p.pattern = Some(pat);
             }
         }
+        p
+    }
+
+    /// One effect paint into `dst` (consumed); reads the layer's alpha from `content` (kept).
+    #[allow(clippy::too_many_arguments)]
+    fn paint(&mut self, dst: Slot, content: Slot, cov: Cov, paint: &Paint<'a>, blend: BlendMode, opacity: f32, flags: u32, clip: Rect, sb: Rect) -> Slot {
+        self.paint_k(dst, content, cov, paint, blend, opacity, flags, clip, sb, 1.0)
+    }
+
+    /// [`Self::paint`] with the knockout strength (`F_KNOCKOUT`: coverage × (1 − alpha × k)).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_k(&mut self, dst: Slot, content: Slot, cov: Cov, paint: &Paint<'a>, blend: BlendMode, opacity: f32, flags: u32, clip: Rect, sb: Rect, knockout: f32) -> Slot {
+        if matches!(paint, Paint::None) {
+            // Missing pattern: compose paints nothing.
+            return dst;
+        }
+        let mut p = self.fx_pass(dst, content, paint, blend, opacity, flags, clip, sb);
+        self.release(dst);
+        match cov {
+            Cov::Map(m, outside) => {
+                p.adjust_kind = 0;
+                p.map = Some(m);
+                p.params[2][3] = outside;
+            }
+            Cov::One => p.adjust_kind = 1,
+        }
+        p.extra[3] = knockout;
         self.emit(p)
     }
 }

@@ -13,11 +13,11 @@ composite oracle and the test count.
 | M2 PSD v1 | ✅ | photocraft-psd: 134/135 real files byte-exact round trip |
 | M3 Viewer app | ✅ | egui shell (Pro / Studio / Classic themes), 13+ codecs, native and web (trunk) builds |
 | M4 Native format + engine | ✅ | 500+ commands, `.pcraft` (incremental, autosave, crash recovery), CLI, persistent preferences |
-| M5 GPU compositor | 🟡 | wgpu compositor drives the canvas; layer effects, pattern fills and a few clip cases fall back to the CPU |
+| M5 GPU compositor | 🟡 | wgpu compositor drives the canvas, layer effects included (≤1/255 vs CPU); vector masks, uncached pattern fills, artboards and a few clip cases fall back to the CPU |
 | M6 Paint + select | 🟡 | brush engine, all selection tools, multi-layer selection, snapping + smart guides, free transform + warp; native tablet backends pending |
 | M7 Adjust + filters | 🟡 | 16 adjustment layers + destructive-only adjustments, 70+ filters incl. Blur Gallery, Actions record/replay, Fade |
-| M8 PSD v2 | 🟡 | adjustments (incl. Selective Color, Color Lookup), fills, effects, patterns, text, shapes, smart objects, alpha channels; oracle 102/170 |
-| M9 Text, vector, styles | 🟡 | type engine + Warp Text, shapes / pen / paths, all 10 effects on CPU; GPU effects pending |
+| M8 PSD v2 | 🟡 | adjustments (incl. Selective Color, Color Lookup), fills, effects, patterns, text, shapes, smart objects, alpha channels; oracle 111/170 |
+| M9 Text, vector, styles | 🟡 | type engine + Warp Text, shapes / pen / paths, all 10 effects on CPU and GPU (parity ≤1/255, 30/31 corpus effect files on the GPU) |
 | M10 Smart features | 🟡 | classical Select Subject / Object, content-aware fill and scale, healing, auto-align / auto-blend; ML backend not started |
 | M11 Automation + formats | 🟡 | MCP (headless + live bridge), batch, Image Processor, prefs over MCP; DoD test passes (10 agent tasks over MCP, `automation/tests/agent_tasks.rs`); JP2 / DICOM / DPX / C2PA pending |
 | M12 Pro parity | 🟡 | CMYK / Lab / Indexed / Bitmap / Duotone, ICC + soft proofing, channels + Quick Mask, smart-object stack modes; print, HDR, photomerge, timeline, artboards, layer comps pending |
@@ -30,8 +30,9 @@ Landed on 2026-10-01: multi-layer selection, live smart objects + smart filters,
 Quick Mask, patterns, Warp, preferences, snapping, ~33 filters, the remaining core adjustments.
 
 Next:
-1. **Fidelity**: the PSD oracle (102/170). Linked-pattern phase origin, layer effects (bevel,
-   satin, multi-stroke), grayscale adjustments; PSD link groups; Photoshop smart filters in `SoLd`.
+1. **Fidelity**: the PSD oracle (111/170). Bevel/emboss, satin, inner glow; modern
+   Brightness/Contrast and grayscale Levels curves; channel restrictions (`brst`); Lab-space
+   blending; Photoshop smart filters in `SoLd`.
 2. **Layer Comps and Artboards** (File/Layer/View items and export depend on them).
 3. **GPU layer effects** (the last big CPU fallback on the canvas).
 4. **Puppet Warp, Perspective Warp, Liquify, Vanishing Point, Camera Raw / Lens Correction**.

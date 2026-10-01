@@ -25,7 +25,9 @@ Image code is slow at `opt-level 0`, so the workspace profile builds dependencie
 | `PHOTOCRAFT_CONTROL_PORT` | Same as `--control <port>` |
 | `PHOTOCRAFT_CPU_CANVAS=1` | Force the CPU canvas path instead of the wgpu shader canvas |
 | `PHOTOCRAFT_GPU_TILE=2048` | Force GPU canvas tiling (tests tile seams) |
-| `PHOTOCRAFT_FX_NOCACHE=1` | Bypass the layer-effect map cache (`compose::effect_maps`) |
+| `PHOTOCRAFT_FX_NOCACHE=1` | Bypass the CPU layer-effect map cache (`compose::effect_maps`) |
+| `PHOTOCRAFT_CPU_COMPOSE=1` | Keep the wgpu canvas but composite on the CPU (compare GPU vs CPU renders, e.g. with the snapshot example) |
+| `PHOTOCRAFT_FX_TRACE=1` | Print the CPU time spent on GPU effect shapes and distance fields per rebuild |
 | `PHOTOCRAFT_THEME_FILE=tokens.json` | **Debug builds only:** live design-token overrides, re-read on change |
 
 ### Live design tokens
@@ -164,8 +166,11 @@ the live command registry (`menus::is_live`) and rewrites [`docs/parity.md`](par
 ## Performance notes
 
 - The canvas is presented by a custom WGSL shader (`ui-egui/src/gpu_canvas.rs`): mip-mapped/nearest sampling, procedural checkerboard, pixel grid, tiling. Brush strokes upload only their damage rect.
-- **The canvas composites on the GPU** (`photocraft-gpu`, driven from `gpu_canvas.rs`). Anything the GPU planner can't express (layer effects, layers clipped to pass-through groups, documents over the texture limit) returns `Unsupported` and falls back to the CPU compositor (`photocraft-compose`), which is also the reference for export and tests.
-- **Layer effects** are expensive. `compose::effect_maps` caches shadow, glow, bevel and satin maps per layer state (LRU, 768 MB budget).
+- **The canvas composites on the GPU** (`photocraft-gpu`, driven from `gpu_canvas.rs`), layer effects included. What the planner can't express returns `Unsupported` and the canvas falls back to the CPU compositor (`photocraft-compose`, also the reference for export and tests): vector masks, layers clipped to pass-through groups, stroked shapes with clipped layers, pattern fills without Photoshop's cached pixels, artboards, and documents or effect regions over the texture limit. `ui.inspect` → `perf.timings.gpuFallback` names the reason (`null` on the GPU path).
+- **Layer effects on the GPU** (`gpu/src/fx.rs`, kernels in `gpu/src/compose.wgsl`). Every enabled effect becomes a *map program* over the layer's effect region (shift, dilate, Gaussian blur, glow ramp, bevel height and shading, contour, stroke band), mirroring `compose::effects` step by step; the chunked composite then paints through the maps, clipped to that region, and copies the result back into the backdrop in place, so a small text layer costs only its own pixels. The layer's shape (`compose::layer_shape`) and its distance fields (`compose::effects::distance_field`: a sequential transform whose tie-breaking a parallel GPU pass can't reproduce bit for bit) come from compose on the CPU, computed in parallel bands. Everything is cached per layer state: an unrelated edit, or an effect's colour or opacity, rebuilds nothing; a brush dab recomputes the touched 256² tiles grown by the effect reach; changing one effect's geometry rebuilds that effect only. Cache budget `gpu::FX_BUDGET` (1.5 GB, least recently drawn layers evicted first). `PHOTOCRAFT_FX_TRACE=1` prints the CPU time of each rebuild.
+- The canvas grows a stroke's damage rect by the effect reach of the layers around it (`canvas::effect_reach`), so effects beyond the dab refresh too (on both paths).
+- **Numbers** (7360 × 4912, 8 text layers + one painted layer with drop shadow + stroke + bevel, Hue/Saturation on top; M4 Pro; `cargo run --release -p photocraft-ui-egui --example fx_bench`): FX_NUMBERS. `fx_bench --compare corpus/psd/…/*.psd` reports the GPU vs CPU difference on real files.
+- On the CPU path `compose::effect_maps` caches shadow, glow, bevel and satin maps per layer state (LRU, 768 MB budget).
 - Live adjustment previews on large documents use a downsampled proxy (`ui-egui/src/proxy.rs`).
 - `ui.inspect` returns `perf` timings (UI ms per frame, composite ms, upload ms).
 - Never scan full surfaces per frame. Cache per document revision (`PhotocraftApp::cached_bounds`). An uncached `content_bounds()` on a 36 MP layer once cost 77 ms per frame.
@@ -220,8 +225,12 @@ corpus PSD with Photoshop's own merged image (PASS ≤ 2/255). To dig into one f
 cargo run --release -p photocraft-io --example oracle_diff -- corpus/psd/<file>.psd 0 png /tmp/diff.png
 ```
 
-writes ours | Photoshop | a diff heatmap side by side; `col`, `row` and `DUMP_FX=1` print samples and raw
+writes ours | Photoshop | a diff heatmap side by side; `col`, `row`, `worst [n]`, `grid x0 y0 x1 y1 [ch]`,
+`layerpx x y` and `DUMP_FX=1` print samples, the worst pixels, value grids, per-layer pixels and raw
 effect descriptors. Findings so far: fill-layer gradients are framed by the layer's mask bounds;
 Photoshop's gradient Smoothness is a Catmull-Rom blend and "Perceptual" interpolation is Oklab
 (baked into dense stops on import, `crates/io/src/gradient_bake.rs`); a shape layer's vector
-stroke is drawn above its clipped layers.
+stroke is drawn above its clipped layers; linked effect patterns tile from the layer's `fxrp`
+reference point; stroke distances follow a 5 × 5 chamfer metric (1, √2, √5) seeded at sub-pixel
+edge offsets; interior effects keep the layer's alpha; outside strokes blend onto the backdrop with
+their own modes, an upper stroke covering lower ones.

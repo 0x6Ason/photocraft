@@ -179,7 +179,7 @@ fn display_doc(app: &PhotocraftApp, idx: usize) -> (std::sync::Arc<Document>, u6
 pub fn ensure_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) -> Option<(egui::TextureId, f32)> {
     let (revision, last_damage, id) = {
         let st = app.session.documents().get(idx)?;
-        (st.revision, st.last_damage, st.doc.id)
+        (st.revision, st.last_damage.map(|r| if r.is_empty() { r } else { r.inflate(effect_reach(&st.doc.layers)) }), st.doc.id)
     };
     let (doc, preview_key) = display_doc(app, idx);
     let cache = app.canvases.entry(id).or_insert(CanvasCache { revision: 0, texture: None, scale: 1.0, preview_key: 0, on_gpu: false, tex_revision: 0, tex_preview_key: 0 });
@@ -215,12 +215,30 @@ pub fn ensure_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) 
     Some((cache.texture.as_ref()?.id(), cache.scale))
 }
 
+/// How far beyond an edit's damage rect the composite can change: layer effects (shadows, glows,
+/// strokes, …) on the edited layer and on the groups around it reach that far.
+fn effect_reach(layers: &[photocraft_doc::Layer]) -> i32 {
+    layers
+        .iter()
+        .filter(|l| l.visible)
+        .map(|l| {
+            let own = if photocraft_compose::effects::has_effects(l) { photocraft_compose::effects::margin(l) } else { 0 };
+            let inner = match &l.content {
+                LayerContent::Group(g) => effect_reach(&g.children),
+                _ => 0,
+            };
+            own + inner
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// GPU path: make sure document `idx` is current in the GPU canvas. Brush strokes re-composite
 /// and upload only their damage rect; everything else re-composites the whole document.
 /// Returns false if there is no GPU canvas.
 fn ensure_gpu(app: &mut PhotocraftApp, idx: usize) -> bool {
     let Some(gpu) = app.gpu.clone() else { return false };
-    let Some((revision, last_damage, id)) = app.session.documents().get(idx).map(|st| (st.revision, st.last_damage, st.doc.id)) else { return false };
+    let Some((revision, last_damage, id)) = app.session.documents().get(idx).map(|st| (st.revision, st.last_damage.map(|r| if r.is_empty() { r } else { r.inflate(effect_reach(&st.doc.layers)) }), st.doc.id)) else { return false };
     let (doc, preview_key) = display_doc(app, idx);
     let size = [doc.size.width, doc.size.height];
     let cache = app.canvases.entry(id).or_insert(CanvasCache { revision: 0, texture: None, scale: 1.0, preview_key: 0, on_gpu: false, tex_revision: 0, tex_preview_key: 0 });
@@ -1435,5 +1453,22 @@ mod tests {
         assert_eq!(d.px.len(), 1);
         let p = d.px[0];
         assert!((p[0] - 1.0).abs() < 1e-6 && (p[3] - 0.25).abs() < 1e-6, "{p:?}");
+    }
+
+    #[test]
+    fn damage_grows_by_nested_effect_reach() {
+        use photocraft_doc::{Effect, Layer};
+        let fmt = photocraft_color::PixelFormat::RGBA8;
+        assert_eq!(effect_reach(&[Layer::raster("plain", fmt)]), 0);
+        let mut inner = Layer::raster("inner", fmt);
+        inner.effects.items.push(Effect::default_drop_shadow());
+        let m = photocraft_compose::effects::margin(&inner);
+        let mut group = Layer::group("g", vec![inner.clone()]);
+        group.effects.items.push(Effect::default_drop_shadow());
+        assert_eq!(effect_reach(std::slice::from_ref(&inner)), m);
+        // A child's edit moves the group's shape, whose effects reach further.
+        assert_eq!(effect_reach(&[group.clone()]), 2 * m);
+        group.visible = false;
+        assert_eq!(effect_reach(&[group]), 0);
     }
 }

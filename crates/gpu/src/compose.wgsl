@@ -38,12 +38,12 @@ const F_MASK_TEX: u32 = 2u;      // mask pixels live in `mask_tex`
 const F_TEX: u32 = 4u;           // layer pixels live in `layer_tex`
 const F_GRADIENT: u32 = 8u;      // gradient fill (stops in `lut_tex`)
 const F_KNOCKOUT: u32 = 16u;     // effect paint: the layer knocks out the coverage (drop shadow)
-const F_UNDER: u32 = 32u;        // effect paint: slide beneath A (outside stroke)
 const F_VECTOR: u32 = 64u;       // effect paint: shape layer (outside stroke never inside)
 const F_ATOP: u32 = 128u;        // effect merge: clipped layer over an opaque base
 const F_GATE: u32 = 256u;        // effect paint: coverage only inside the layer's shape
 const F_REL: u32 = 512u;         // effect paint: coverage relative to the layer's alpha
 const F_STROKE_OUT: u32 = 1024u; // effect paint: outside stroke band
+const F_FIRST: u32 = 2048u;      // outside strokes: nothing accumulated yet
 
 @group(0) @binding(0) var<uniform> chunk: Chunk;
 @group(0) @binding(1) var<uniform> op: Op;
@@ -675,9 +675,10 @@ fn fs_fxinit(in: VOut) -> @location(0) vec4<f32> {
 }
 
 // effects::paint: composite `colour × coverage × opacity` into A. B is the layer (its alpha `a`
-// is the effect shape). Coverage `kind`: 0 the effect map, 1 full; then F_KNOCKOUT m × (1 − a),
+// is the effect shape). Coverage `kind`: 0 the effect map, 1 full; then F_KNOCKOUT m × (1 − a k)
+// (k = `p4.w`),
 // F_GATE inside ? m : 0, F_REL inside ? min(m / a, 1) : 0, F_STROKE_OUT inside ? (vector ? 0 : 1)
-// : m. F_UNDER paints beneath A (outside strokes).
+// : m.
 @fragment
 fn fs_fxpaint(in: VOut) -> @location(0) vec4<f32> {
     let p = local(in.pos);
@@ -687,7 +688,7 @@ fn fs_fxpaint(in: VOut) -> @location(0) vec4<f32> {
     let inside_shape = a > INSIDE_EPS;
     var m = 1.0;
     if (op.kind == 0) { m = map_value(d, op.p2.w); }
-    if ((op.flags & F_KNOCKOUT) != 0u) { m = m * (1.0 - a); }
+    if ((op.flags & F_KNOCKOUT) != 0u) { m = m * (1.0 - a * op.p4.w); }
     if ((op.flags & F_GATE) != 0u && !inside_shape) { m = 0.0; }
     if ((op.flags & F_REL) != 0u) {
         if (inside_shape) { m = min(m / a, 1.0); } else { m = 0.0; }
@@ -696,18 +697,53 @@ fn fs_fxpaint(in: VOut) -> @location(0) vec4<f32> {
         m = select(1.0, 0.0, (op.flags & F_VECTOR) != 0u);
     }
     let k = m * op.opacity;
-    if ((op.flags & F_UNDER) != 0u) {
-        // Painted into a transparent buffer, then A goes over it.
-        var under = vec4(0.0);
-        if (k > 0.0) {
-            let c = fx_color(d);
-            under = composite(M_NORMAL, vec4(0.0), vec4(c.rgb, c.a * k), 1.0);
-        }
-        return composite(M_NORMAL, under, dst, 1.0);
-    }
     if (k <= 0.0) { return dst; }
     let c = fx_color(d);
     return composite(op.mode, dst, vec4(c.rgb, c.a * k), 1.0);
+}
+
+// Outside strokes (A = the exterior result before them, B = the layer, C = coverage so far in
+// `.r`, D (`layer_tex`) = accumulated premultiplied colour). Each stroke takes its band × opacity
+// not yet covered above it; `kind` 0 accumulates that share of the stroke blended over A at full
+// coverage, `kind` 1 the coverage.
+@fragment
+fn fs_fxstroke(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let d = doc_px(p);
+    let a = textureLoad(tex_b, p, 0).a;
+    var k = map_value(d, 0.0);
+    if (a > INSIDE_EPS) { k = select(1.0, 0.0, (op.flags & F_VECTOR) != 0u); }
+    let first = (op.flags & F_FIRST) != 0u;
+    var cover = 0.0;
+    if (!first) { cover = textureLoad(tex_c, p, 0).r; }
+    let share = k * op.opacity * (1.0 - cover);
+    if (op.kind == 1) { return vec4(cover + share, 0.0, 0.0, 0.0); }
+    var acc = vec4(0.0);
+    if (!first) { acc = textureLoad(layer_tex, p, 0); }
+    if (share > 0.0) {
+        let base = textureLoad(tex_a, p, 0);
+        var bl = base;
+        if (i32(op.p2.z) != 3) {
+            let c = fx_color(d);
+            bl = composite(op.mode, base, vec4(c.rgb, c.a), 1.0);
+        }
+        acc += share * vec4(bl.rgb * bl.a, bl.a);
+    }
+    return acc;
+}
+
+// Resolve outside strokes: A = exterior result, B = accumulated colour, C = coverage.
+@fragment
+fn fs_fxstrokeend(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let w = textureLoad(tex_a, p, 0);
+    let cover = textureLoad(tex_c, p, 0).r;
+    if (cover <= 0.0) { return w; }
+    let acc = textureLoad(tex_b, p, 0);
+    let k = 1.0 - min(cover, 1.0);
+    let alpha = w.a * k + acc.a;
+    if (alpha <= 0.0) { return w; }
+    return vec4((w.rgb * w.a * k + acc.rgb) / alpha, min(alpha, 1.0));
 }
 
 fn mix_premul(a: vec4<f32>, b: vec4<f32>, k: f32) -> vec4<f32> {

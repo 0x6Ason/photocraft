@@ -452,6 +452,14 @@ fn effect_cases() -> Vec<(&'static str, Vec<Effect>)> {
         ("pattern overlay", vec![Effect::PatternOverlay { common: FxCommon::new(BlendMode::Normal, 0.9), name: pat.name.clone(), id: pat.id.clone(), scale: 1.0, angle: 0.0, link: true, phase: (2.0, 1.0) }]),
         ("pattern overlay scaled rotated", vec![Effect::PatternOverlay { common: FxCommon::new(BlendMode::Screen, 0.8), name: pat.name.clone(), id: pat.id.clone(), scale: 1.7, angle: 30.0, link: false, phase: (0.0, 0.0) }]),
         (
+            "missing pattern",
+            vec![
+                Effect::PatternOverlay { common: FxCommon::new(BlendMode::Normal, 1.0), name: "nope".into(), id: "nope".into(), scale: 1.0, angle: 0.0, link: true, phase: (0.0, 0.0) },
+                Effect::Stroke(stroke(3.0, StrokePosition::Outside, FxPaint::Pattern { name: "nope".into(), id: "nope".into(), scale: 1.0 })),
+                Effect::Stroke(stroke(6.0, StrokePosition::Outside, FxPaint::Color(Color::rgb(0.0, 0.0, 0.0)))),
+            ],
+        ),
+        (
             "multiple instances",
             vec![
                 Effect::Stroke(stroke(2.0, StrokePosition::Outside, FxPaint::Color(Color::rgb(1.0, 1.0, 1.0)))),
@@ -637,7 +645,7 @@ fn layer_effects_update_incrementally() {
     }
     let s = fx_check(&mut g, &d, "drop shadow spread");
     assert_eq!(s.fx_programs, 1, "{s:?}");
-    // Moving the layer (new region) rebuilds everything.
+    // Moving the layer by whole pixels moves its maps with it: nothing is rebuilt.
     let moved = {
         let src = d.layers[1].surface().unwrap();
         let b = src.content_bounds();
@@ -646,5 +654,32 @@ fn layer_effects_update_incrementally() {
         dst
     };
     *d.layers[1].surface_mut().unwrap() = moved;
-    fx_check(&mut g, &d, "moved");
+    let s = fx_check(&mut g, &d, "moved");
+    assert_eq!(s.fx_programs, 0, "{s:?}");
+    // A change of shape with the move rebuilds.
+    d.layers[1].surface_mut().unwrap().fill_rect(Rect::new(300, 300, 310, 310), &[1.0, 1.0, 1.0, 0.5]);
+    fx_check(&mut g, &d, "moved and painted");
+}
+
+#[test]
+fn layer_effects_on_shape_layers() {
+    let Some(mut g) = gpu() else { return };
+    use photocraft_doc::vector::{Path, ShapeLayer, Subpath};
+    for alpha in [1.0, 0.55] {
+        let mut d = fx_doc(90, 70, SampleType::U8);
+        let path = Path::new(vec![Subpath::polygon(&[(14.3, 12.6), (70.2, 18.1), (60.7, 58.4), (24.9, 50.2)])]);
+        let mut fill = Color::rgb(0.3, 0.6, 0.9);
+        fill.alpha = alpha;
+        let mut sh = ShapeLayer { path, fill: Some(Fill::Solid(fill)), stroke: None, live: None, cache: None, psd_raw: None };
+        sh.cache = Some(photocraft_vector::render_shape(&sh, d.pixel_format(), d.bounds()));
+        let mut l = Layer::new("shape", LayerContent::Shape(sh));
+        l.effects.items = vec![
+            Effect::Stroke(stroke(3.0, StrokePosition::Outside, FxPaint::Color(Color::rgb(1.0, 1.0, 1.0)))),
+            Effect::Stroke(stroke(4.0, StrokePosition::Center, FxPaint::Gradient(gradient()))),
+            Effect::DropShadow(shadow(BlendMode::Multiply, 0.7, 120.0, 4.0, 5.0, 0.0)),
+            Effect::BevelEmboss(bevel(BevelStyle::InnerBevel, true, 4.0, 1.0)),
+        ];
+        d.layers.push(l);
+        fx_check(&mut g, &d, &format!("shape layer alpha {alpha}"));
+    }
 }

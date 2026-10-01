@@ -623,7 +623,7 @@ fn draw_mesh(d: &LiquifyDialog, painter: &egui::Painter, area: ERect) {
     }
     let stroke = Stroke::new(0.75, Color32::from_rgba_unmultiplied(90, 90, 90, 210));
     let pos = |i: usize, j: usize| [x0 + i as f64 * h, y0 + j as f64 * h];
-    for axis in 0..2 {
+    for axis in [0usize, 1] {
         let origin = if axis == 0 { x0 } else { y0 };
         for jj in 0..ny - 1 {
             for ii in 0..nx - 1 {

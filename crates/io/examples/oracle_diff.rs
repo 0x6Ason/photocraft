@@ -5,6 +5,9 @@
 //! cargo run --release -p photocraft-io --example oracle_diff -- file.psd 0 png out.png # ours | Photoshop | diff heatmap
 //! cargo run --release -p photocraft-io --example oracle_diff -- file.psd 0 col [x]     # column samples
 //! cargo run --release -p photocraft-io --example oracle_diff -- file.psd 0 row y x0 x1 # row samples
+//! cargo run --release -p photocraft-io --example oracle_diff -- file.psd 0 worst [n]   # n worst pixels
+//! cargo run --release -p photocraft-io --example oracle_diff -- file.psd 0 grid x0 y0 x1 y1 [ch] # value grids
+//! cargo run --release -p photocraft-io --example oracle_diff -- file.psd 0 layerpx x y  # each layer's pixel
 //! DUMP_FX=1 …                                                                          # raw effects descriptors
 //! ```
 fn main() {

@@ -352,3 +352,51 @@ fn clearing_effects_drops_stale_blocks() {
     let rec = f.layers().iter().find(|r| r.name() == back.layers[1].name).unwrap();
     assert!(rec.block(b"lfx2").is_none());
 }
+
+#[test]
+fn link_groups_and_effects_reference_round_trip() {
+    use photocraft_doc::{Document, Layer, LayerContent, Size};
+    let mut d = Document::new("l", Size::new(8, 8), ColorMode::Rgb, SampleType::U8);
+    let fmt = d.pixel_format();
+    let mut a = Layer::raster("a", fmt);
+    a.surface_mut().unwrap().fill_rect(photocraft_geom::Rect::new(0, 0, 4, 4), &[1.0, 0.0, 0.0, 1.0]);
+    a.link_group = Some(7);
+    a.effects.reference = Some((-201.0, 47.5));
+    let mut b = Layer::raster("b", fmt);
+    b.link_group = Some(7);
+    let mut inner = Layer::raster("inner", fmt);
+    inner.link_group = Some(3);
+    let g = Layer::group("g", vec![inner]);
+    d.layers = vec![a, b, g];
+    let back = roundtrip(&d);
+    assert_eq!(back.layers[0].link_group, Some(7));
+    assert_eq!(back.layers[1].link_group, Some(7));
+    assert_eq!(back.layers[2].link_group, None);
+    let LayerContent::Group(gb) = &back.layers[2].content else { panic!() };
+    assert_eq!(gb.children[0].link_group, Some(3));
+    assert_eq!(back.layers[0].effects.reference, Some((-201.0, 47.5)));
+    assert_eq!(back.layers[1].effects.reference, None);
+    // Unchanged documents write the same resource bytes again.
+    let r1 = export(&back, "x.psd", &ExportOptions::default()).unwrap().bytes;
+    let f1 = PsdFile::from_bytes(&r1).unwrap();
+    let res = |f: &PsdFile| f.resources.iter().find(|r| r.id == 1026).map(|r| r.data.clone());
+    let f0 = PsdFile::from_bytes(&export(&d, "x.psd", &ExportOptions::default()).unwrap().bytes).unwrap();
+    assert_eq!(res(&f1), res(&f0));
+    // One u16 per record: a, b, divider, inner, group (bottom first).
+    assert_eq!(res(&f0).unwrap(), vec![0, 7, 0, 7, 0, 0, 0, 3, 0, 0]);
+    // Large engine ids are renumbered by first appearance.
+    let mut big = d.clone();
+    big.layers[0].link_group = Some(1 << 40);
+    big.layers[1].link_group = Some(1 << 40);
+    let fb = PsdFile::from_bytes(&export(&big, "x.psd", &ExportOptions::default()).unwrap().bytes).unwrap();
+    assert_eq!(res(&fb).unwrap(), vec![0, 1, 0, 1, 0, 0, 0, 2, 0, 0]);
+    // Unlinked documents write no 1026.
+    let mut none = d.clone();
+    none.layers[0].link_group = None;
+    none.layers[1].link_group = None;
+    if let LayerContent::Group(g) = &mut none.layers[2].content {
+        g.children[0].link_group = None;
+    }
+    let fnone = PsdFile::from_bytes(&export(&none, "x.psd", &ExportOptions::default()).unwrap().bytes).unwrap();
+    assert!(res(&fnone).is_none());
+}

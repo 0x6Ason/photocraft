@@ -660,3 +660,99 @@ fn effect_maps_are_cached_and_invalidated_by_pixel_changes() {
     }
     assert_ne!(first.px, again.px);
 }
+
+// ---------- PSD-fidelity effect semantics (fitted on Photoshop composites) ----------
+
+#[test]
+fn stroke_corners_follow_the_5x5_chamfer_metric() {
+    // Square 10..30, outside stroke 3: pixel (9, 7) is offset (1, 3) from the corner pixel.
+    // Photoshop measures √5 + 1 = 3.236 there (exact distance 3.162): coverage 3 + 1 − 3.236.
+    let d = fx_doc(vec![stroke(3.0, StrokePosition::Outside)]);
+    let a = 1.0 - px(&d, 9, 7)[0]; // blue stroke over white: red channel drops by coverage
+    assert!((a - 0.764).abs() < 0.01, "{a}");
+    // (2, 2) stays Euclidean (two diagonal steps).
+    let a = 1.0 - px(&d, 8, 8)[0];
+    assert!((a - 1.0).abs() < 0.01, "{a}");
+}
+
+#[test]
+fn inside_stroke_respects_partial_edge_coverage() {
+    // A 25 %-alpha edge column puts the edge 0.75 px further out: a 3 px inside stroke then
+    // reaches 75 % into the fourth column, and the edge column takes the stroke colour at 25 %.
+    let mut d = doc_white(40, 40);
+    let mut l = solid_layer("sq", Rect::new(10, 10, 30, 30), [1.0, 0.0, 0.0, 1.0]);
+    l.surface_mut().unwrap().fill_rect(Rect::new(10, 10, 11, 30), &[1.0, 0.0, 0.0, 0.25]);
+    l.effects.items = vec![stroke(3.0, StrokePosition::Inside)];
+    d.layers.push(l);
+    let edge = px(&d, 10, 20);
+    assert!(close4(edge, [0.75, 0.75, 1.0, 1.0]), "edge = blue stroke at 25 % over white: {edge:?}");
+    let p = px(&d, 13, 20);
+    assert!((p[2] - 0.75).abs() < 0.02 && (p[0] - 0.25).abs() < 0.02, "{p:?}");
+}
+
+#[test]
+fn interior_effects_keep_the_layer_alpha() {
+    // A colour overlay replaces a half-transparent pixel's colour without adding coverage.
+    let mut d = Document::new("t", Size::new(40, 40), ColorMode::Rgb, SampleType::U8);
+    let mut l = solid_layer("sq", Rect::new(10, 10, 30, 30), [1.0, 0.0, 0.0, 0.5]);
+    l.effects.items = vec![Effect::ColorOverlay { common: FxCommon::new(photocraft_color::BlendMode::Normal, 1.0), color: Color::rgb(0.0, 1.0, 0.0) }];
+    d.layers.push(l);
+    assert!(close4(px(&d, 20, 20), [0.0, 1.0, 0.0, 0.5]), "{:?}", px(&d, 20, 20));
+}
+
+#[test]
+fn upper_stroke_blends_with_the_backdrop_not_the_lower_stroke() {
+    // Multiply yellow (3 px) listed above a Normal blue (8 px): the inner ring multiplies the
+    // white backdrop (stays yellow), the outer ring is blue.
+    let yellow = Effect::Stroke(StrokeFx {
+        common: FxCommon::new(photocraft_color::BlendMode::Multiply, 1.0),
+        size: 3.0,
+        position: StrokePosition::Outside,
+        paint: FxPaint::Color(Color::rgb(1.0, 1.0, 0.0)),
+    });
+    let d = fx_doc(vec![yellow, stroke(8.0, StrokePosition::Outside)]);
+    assert!(close4(px(&d, 8, 20), [1.0, 1.0, 0.0, 1.0]), "{:?}", px(&d, 8, 20));
+    assert!(close4(px(&d, 4, 20), [0.0, 0.0, 1.0, 1.0]), "{:?}", px(&d, 4, 20));
+}
+
+#[test]
+fn shadow_knockout_needs_see_through_fill() {
+    // At 100 % fill an anti-aliased edge is not attenuated twice: the result equals no knockout.
+    let mut base = Document::new("t", Size::new(40, 40), ColorMode::Rgb, SampleType::U8);
+    base.layers.push(solid_layer("bg", Rect::new(0, 0, 40, 40), [1.0; 4]));
+    let mut l = solid_layer("sq", Rect::new(10, 10, 30, 30), [1.0, 0.0, 0.0, 1.0]);
+    l.surface_mut().unwrap().fill_rect(Rect::new(10, 10, 11, 30), &[1.0, 0.0, 0.0, 0.5]);
+    l.effects.items = vec![Effect::DropShadow(Shadow { distance: 0.0, spread: 1.0, size: 4.0, ..shadow(0.0, 0.0) })];
+    base.layers.push(l);
+    let on = px(&base, 10, 20);
+    if let Effect::DropShadow(s) = &mut base.layers[1].effects.items[0] {
+        s.knocks_out = false;
+    }
+    assert!(close4(on, px(&base, 10, 20)), "{on:?}");
+}
+
+#[test]
+fn linked_pattern_overlay_anchors_at_the_effects_reference_point() {
+    use photocraft_doc::pattern::Pattern;
+    // 2 × 1 tile: red, blue. Anchored at x = 11 (reference point), x = 11 is red, 12 blue.
+    let mut tile = photocraft_raster::Surface::new(PixelFormat::RGBA8);
+    tile.fill_rect(Rect::new(0, 0, 1, 1), &[1.0, 0.0, 0.0, 1.0]);
+    tile.fill_rect(Rect::new(1, 0, 2, 1), &[0.0, 0.0, 1.0, 1.0]);
+    let pat = Pattern::new("rb", tile, 2, 1);
+    let overlay = Effect::PatternOverlay {
+        common: FxCommon::new(photocraft_color::BlendMode::Normal, 1.0),
+        name: "rb".into(),
+        id: pat.id.clone(),
+        scale: 1.0,
+        angle: 0.0,
+        link: true,
+        phase: (0.0, 0.0),
+    };
+    let mut d = fx_doc(vec![overlay]);
+    d.patterns.push(pat);
+    // Without a reference point the layer's top-left (10) anchors the tiling.
+    assert!(close4(px(&d, 10, 20), [1.0, 0.0, 0.0, 1.0]), "{:?}", px(&d, 10, 20));
+    d.layers[1].effects.reference = Some((11.0, 0.0));
+    assert!(close4(px(&d, 11, 20), [1.0, 0.0, 0.0, 1.0]), "{:?}", px(&d, 11, 20));
+    assert!(close4(px(&d, 12, 20), [0.0, 0.0, 1.0, 1.0]), "{:?}", px(&d, 12, 20));
+}

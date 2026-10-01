@@ -132,24 +132,24 @@ impl MapProgram {
         let mut count = 0;
         let mut out = vec![None; n];
         let mut held: Vec<(usize, usize)> = Vec::new();
-        for i in 0..n {
+        for (i, (stage, slot)) in self.stages.iter().zip(out.iter_mut()).enumerate() {
             // Release temporaries whose last reader was before this stage.
-            held.retain(|&(stage, t)| {
-                if last_use[stage] < i {
+            held.retain(|&(st, t)| {
+                if last_use[st] < i {
                     free.push(t);
                     false
                 } else {
                     true
                 }
             });
-            if self.stages[i].out.is_some() {
+            if stage.out.is_some() {
                 continue;
             }
             let t = free.pop().unwrap_or_else(|| {
                 count += 1;
                 count - 1
             });
-            out[i] = Some(t);
+            *slot = Some(t);
             held.push((i, t));
         }
         (out, count)
@@ -213,7 +213,7 @@ impl B {
 /// Distance up to which a field must be exact for a band / dilation of width `w`
 /// (`clamp(w + 0.5 - d)`, with `d` up to 1.5 px beyond the pixel distance).
 fn reach_for(w: f32) -> i32 {
-    (w.max(0.0).min(photocraft_compose::effects::MAX_REACH)).ceil() as i32 + 2
+    w.clamp(0.0, photocraft_compose::effects::MAX_REACH).ceil() as i32 + 2
 }
 
 /// `compose::effects::blur`'s kernel: (radius, normalised weights), or None below sigma 0.2.
@@ -478,11 +478,10 @@ pub(crate) fn shape_sources(layer: &Layer) -> (Option<&Surface>, Option<&Surface
     (content, mask)
 }
 
-/// Everything a non-group layer's shape depends on except tile contents.
-pub(crate) fn shape_key(layer: &Layer, canvas: Rect, region: Rect) -> u64 {
+/// Everything a non-group layer's shape depends on except tile contents and position.
+pub(crate) fn shape_key(layer: &Layer, canvas: Rect) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     layer.id.0.hash(&mut h);
-    (region.x0, region.y0, region.x1, region.y1).hash(&mut h);
     let (content, mask) = shape_sources(layer);
     match &layer.content {
         LayerContent::Fill(f) => {
@@ -503,7 +502,7 @@ pub(crate) fn shape_key(layer: &Layer, canvas: Rect, region: Rect) -> u64 {
 }
 
 /// Deep identity of a group (children, their pixels by tile pointer, settings).
-pub(crate) fn group_key(layer: &Layer, region: Rect, light: &GlobalLight) -> u64 {
+pub(crate) fn group_key(layer: &Layer, light: &GlobalLight) -> u64 {
     fn surface_fp(s: &Surface, h: &mut std::collections::hash_map::DefaultHasher) {
         format!("{:?}{:?}", s.format(), s.default_pixel()).hash(h);
         for (c, t) in s.tiles() {
@@ -540,7 +539,7 @@ pub(crate) fn group_key(layer: &Layer, region: Rect, light: &GlobalLight) -> u64
         h.write_u8(0xfe);
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (region.x0, region.y0, region.x1, region.y1, light.angle.to_bits(), light.altitude.to_bits()).hash(&mut h);
+    (light.angle.to_bits(), light.altitude.to_bits()).hash(&mut h);
     match &layer.content {
         LayerContent::Group(g) => {
             for c in &g.children {

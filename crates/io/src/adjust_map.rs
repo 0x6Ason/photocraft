@@ -240,9 +240,10 @@ fn write_gradient_map(stops: &[(f32, [f32; 3])], reverse: bool) -> Vec<u8> {
         v.extend_from_slice(&((t.clamp(0.0, 1.0) * 4096.0).round() as u32).to_be_bytes());
         v.extend_from_slice(&50u32.to_be_bytes());
         put16(&mut v, 0);
-        for k in 0..4 {
-            put16(&mut v, if k < 3 { (c[k].clamp(0.0, 1.0) * 65535.0).round() as u16 } else { 0 });
+        for x in c {
+            put16(&mut v, (x.clamp(0.0, 1.0) * 65535.0).round() as u16);
         }
+        put16(&mut v, 0); // fourth component
         put16(&mut v, 0);
     }
     put16(&mut v, 2);

@@ -331,13 +331,13 @@ fn uniform_entry(binding: u32, size: u64) -> wgpu::BindGroupLayoutEntry {
 /// The compositor's WGSL source (exposed for validation in tests).
 pub const SHADER: &str = include_str!("compose.wgsl");
 
-/// Pass-level resources resolved for one plan.
-struct Bound<'p> {
+/// Pass-level resources resolved for one plan: residents (texture, mask), effect maps (view and
+/// region) and pattern textures per pass.
+struct Bound {
     views: Vec<(Option<ResidentRef>, Option<ResidentRef>)>,
     keys: Vec<(LayerId, Role)>,
     maps: Vec<Option<(wgpu::TextureView, Rect)>>,
     patterns: Vec<Option<wgpu::TextureView>>,
-    _plan: std::marker::PhantomData<&'p ()>,
 }
 
 impl Compositor {
@@ -491,7 +491,7 @@ impl Compositor {
     }
 
     /// Bring every surface `plan` samples up to date and resolve its effect maps and patterns.
-    fn bind_plan<'p>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, doc: DocId, canvas: Rect, plan: &Plan<'p>, stats: &mut Stats) -> Bound<'p> {
+    fn bind_plan(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, doc: DocId, canvas: Rect, plan: &Plan<'_>, stats: &mut Stats) -> Bound {
         let mut views: Vec<(Option<ResidentRef>, Option<ResidentRef>)> = Vec::with_capacity(plan.passes.len());
         let mut keys: Vec<(LayerId, Role)> = Vec::new();
         let mut maps = Vec::with_capacity(plan.passes.len());
@@ -513,7 +513,7 @@ impl Compositor {
             }));
             patterns.push(p.pattern.map(|pat| self.pattern_view(device, queue, pat)));
         }
-        Bound { views, keys, maps, patterns, _plan: std::marker::PhantomData }
+        Bound { views, keys, maps, patterns }
     }
 
     /// Run `plan` over `chunks` (document rects, at most CHUNK square), handing each finished
@@ -568,7 +568,7 @@ impl Compositor {
             }
             let slot = |s: Option<u32>| s.map_or(dummy, |s| &self.pool[s as usize].1);
             let (tex, mask) = &bound.views[i];
-            let tv = tex.map_or(dummy, |(k, _)| resident_views[k]);
+            let tv = tex.map_or(slot(p.d), |(k, _)| resident_views[k]);
             let mv = mask.map_or(dummy, |(k, _)| resident_views[k]);
             let lv = luts[i].as_ref().map_or(dummy, |(_, v)| v);
             let map = bound.maps[i].as_ref().map_or(dummy, |(v, _)| v);
@@ -724,7 +724,7 @@ impl Compositor {
         let frame = self.frame;
         for (t, used) in &mut self.temps {
             let s = t.texture.size();
-            if s.width == w && s.height == h && !taken.iter().any(|v| *v == t.view) {
+            if s.width == w && s.height == h && !taken.contains(&t.view) {
                 *used = frame;
                 return t.view.clone();
             }
@@ -741,14 +741,18 @@ impl Compositor {
         let region = f.region;
         let canvas = doc.bounds();
         let is_group = matches!(layer.content, LayerContent::Group(_));
-        let shape_key = if is_group { fx::group_key(layer, region, &doc.global_light) } else { fx::shape_key(layer, canvas, region) };
+        let shape_key = if is_group { fx::group_key(layer, &doc.global_light) } else { fx::shape_key(layer, canvas) };
         let (content_src, mask_src) = if is_group { (None, None) } else { fx::shape_sources(layer) };
         let frame = self.frame;
+        let (rw, rh) = (region.width(), region.height());
 
-        // What changed: everything (new region / settings), some tiles, or nothing.
+        // What changed: everything (new settings / size), the position only, some tiles, or
+        // nothing.
         let mut damage = Rect::EMPTY;
-        let reuse = self.fx.get(&layer.id).is_some_and(|e| e.region == region && e.shape_key == shape_key);
-        if reuse {
+        let prev = self.fx.get(&layer.id).filter(|e| e.shape_key == shape_key).map(|e| e.region);
+        let mut rebuild = true;
+        if prev == Some(region) {
+            rebuild = false;
             let e = &self.fx[&layer.id];
             for (old, cur) in e.tiles.iter().zip([content_src, mask_src]) {
                 let d = match (old, cur) {
@@ -760,9 +764,22 @@ impl Compositor {
                 damage = if damage.is_empty() { d } else { damage.union(&d) };
             }
             damage = damage.intersect(&region);
-        } else {
+        } else if let Some(old) = prev
+            && (old.width(), old.height()) == (rw, rh)
+            && !region.is_empty()
+        {
+            // Moved by whole pixels: maps are computed relative to the region, so if the shape
+            // moved unchanged with it, every map is still exact.
+            let v = fx::shape(doc, layer, region);
+            let e = self.fx.get_mut(&layer.id).expect("entry");
+            if v == e.shape_cpu {
+                e.region = region;
+                rebuild = false;
+            }
+        }
+        if rebuild {
             let shape = Tex::map(device, "pc_fx_shape", region, MAP32);
-            let n = region.width() as usize * region.height() as usize;
+            let n = rw as usize * rh as usize;
             self.fx.insert(layer.id, FxEntry { doc: doc.id, region, shape_key, tiles: [None, None], _pin: is_group.then(|| layer.clone()), shape_cpu: vec![0.0; n], shape, fields: HashMap::new(), progs: Vec::new(), last_used: frame });
             damage = region;
         }
@@ -774,15 +791,11 @@ impl Compositor {
             return;
         }
 
-        let t_trace = std::time::Instant::now();
+        let t_trace = web_time_now();
         // Shape over the damage (compose's own alpha).
         if !damage.is_empty() {
             stats.fx_shapes += 1;
-            let ts = std::time::Instant::now();
             let v = fx::shape(doc, layer, damage);
-            if std::env::var_os("PHOTOCRAFT_FX_TRACE").is_some() {
-                eprintln!("  shape {}x{}: {:.2} ms", damage.width(), damage.height(), ts.elapsed().as_secs_f64() * 1000.0);
-            }
             fx::paste(&mut e.shape_cpu, region, damage, &v);
             e.shape.write_r32(queue, region, damage, &v);
         }
@@ -808,11 +821,7 @@ impl Compositor {
                 _ => region,
             };
             let reach = have.filter(|r| *r >= reach).unwrap_or(reach);
-            let tf = std::time::Instant::now();
             let v = fx::field(kind, reach, &e.shape_cpu, region, out);
-            if std::env::var_os("PHOTOCRAFT_FX_TRACE").is_some() {
-                eprintln!("  field {kind:?} reach {reach} over {}x{}: {:.2} ms", out.width(), out.height(), tf.elapsed().as_secs_f64() * 1000.0);
-            }
             if have.is_none_or(|r| r < reach) {
                 e.fields.insert(kind, (reach, Tex::map(device, "pc_fx_field", region, MAP32)));
             }
@@ -820,8 +829,8 @@ impl Compositor {
             stats.fx_pixels += out.width() as u64 * out.height() as u64;
         }
 
-        if std::env::var_os("PHOTOCRAFT_FX_TRACE").is_some() && !damage.is_empty() {
-            eprintln!("fx `{}`: damage {:?} shape+fields {:.2} ms", layer.name, damage, t_trace.elapsed().as_secs_f64() * 1000.0);
+        if let Some(t) = t_trace.filter(|_| !damage.is_empty()) {
+            eprintln!("effect maps of `{}`: shape + distance fields over {damage:?} in {:.2} ms (CPU)", layer.name, t.elapsed().as_secs_f64() * 1000.0);
         }
         e.progs.truncate(progs.len());
         while e.progs.len() < progs.len() {
@@ -897,6 +906,18 @@ impl Compositor {
         }
         self.kit.run(device, queue, encoder, &draws);
     }
+}
+
+/// A start time when `PHOTOCRAFT_FX_TRACE=1` (it prints the CPU time of effect shapes and
+/// distance fields); never on wasm.
+fn web_time_now() -> Option<std::time::Instant> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        T.get_or_init(|| std::env::var_os("PHOTOCRAFT_FX_TRACE").is_some()).then(std::time::Instant::now)
+    }
+    #[cfg(target_arch = "wasm32")]
+    None
 }
 
 /// The uniform record of a pass.

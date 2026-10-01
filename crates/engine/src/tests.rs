@@ -420,3 +420,18 @@ fn layer_locks_are_set_and_enforced() {
     let l = st.doc.layer(st.active_layer.unwrap()).unwrap();
     assert!(l.locks.position && !l.locks.pixels);
 }
+
+#[test]
+fn moving_a_layer_moves_its_effects_reference_point() {
+    let mut s = session_with_doc();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.edit("ref", |doc, active| {
+        doc.layer_mut(active.unwrap()).unwrap().effects.reference = Some((-201.0, 9.0));
+        Ok(())
+    })
+    .unwrap();
+    s.execute("layer.translate", json!({"dx": 10, "dy": 5})).unwrap();
+    let d = s.active().unwrap();
+    let l = d.doc.layer(d.active_layer.unwrap()).unwrap();
+    assert_eq!(l.effects.reference, Some((-191.0, 14.0)));
+}
