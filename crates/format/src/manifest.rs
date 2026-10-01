@@ -158,6 +158,8 @@ pub struct EffectsM {
     pub enabled: bool,
     pub items: Vec<Effect>,
     pub psd_raw: Option<Hash>,
+    #[serde(default)]
+    pub reference: Option<(f64, f64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

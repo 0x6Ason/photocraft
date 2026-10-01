@@ -43,6 +43,8 @@ pub fn document(d: &DocState) -> Value {
         "revision": d.revision,
         "channels": crate::channel_cmds::channels_json(d),
         "quickMask": doc.quick_mask.is_some(),
+        "layerComps": doc.layer_comps.iter().map(|c| json!({"id": c.id, "name": c.name})).collect::<Vec<_>>(),
+        "lastAppliedComp": doc.last_applied_comp,
     })
 }
 
@@ -74,6 +76,9 @@ fn layer_sel(l: &Layer, selected: &[photocraft_doc::LayerId]) -> Value {
     match &l.content {
         LayerContent::Group(g) => {
             v["children"] = Value::Array(g.children.iter().rev().map(|c| layer_sel(c, selected)).collect());
+            if let Some(a) = &g.artboard {
+                v["artboard"] = json!({"rect": [a.rect.x0, a.rect.y0, a.rect.width(), a.rect.height()], "background": a.background.name(), "preset": a.preset});
+            }
         }
         LayerContent::Adjustment(a) => {
             v["adjustment"] = serde_json::to_value(a).unwrap_or(Value::Null);

@@ -151,22 +151,28 @@ pub fn build_mesh(src: &Surface, bounds: Rect, density: PuppetDensity, expansion
             }
         }
     } else {
-        let mut row = Vec::new();
-        for by in 0..bh {
+        // One block row per task (rows are independent).
+        let scan = |by: usize, out: &mut [bool]| {
             let r = Rect::new(area.x0, area.y0 + by as i32 * g, area.x0 + bw as i32 * g, area.y0 + (by as i32 + 1) * g).intersect(&bounds);
             if r.is_empty() || !src.has_tiles_in(r) {
-                continue;
+                return;
             }
-            src.read_region_into(r, &mut row);
+            let row = src.read_region(r);
             let rw = r.width() as usize;
             for (i, p) in row.chunks_exact(n).enumerate() {
                 if p[n - 1] > ALPHA_MIN {
                     let x = r.x0 + (i % rw) as i32;
-                    let bx = ((x - area.x0) / g) as usize;
-                    cov[by * bw + bx] = true;
+                    out[((x - area.x0) / g) as usize] = true;
                 }
             }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use rayon::prelude::*;
+            cov.par_chunks_mut(bw).enumerate().for_each(|(by, out)| scan(by, out));
         }
+        #[cfg(target_arch = "wasm32")]
+        cov.chunks_mut(bw).enumerate().for_each(|(by, out)| scan(by, out));
     }
     // Grow / shrink by the expansion (round stamp in block units).
     let eb = (e.abs() / f64::from(g)).round() as i32;
@@ -324,6 +330,81 @@ impl Csr {
     }
 }
 
+/// Banded Cholesky factor `A = L Lᵀ` (grid meshes number their vertices row by row, so the
+/// system's bandwidth is about two mesh rows): factored once per pin set, then each global step
+/// is two triangular solves.
+struct BandChol {
+    n: usize,
+    p: usize,
+    /// Row `i` holds `L[i][i - p ..= i]`.
+    l: Vec<f64>,
+}
+
+impl BandChol {
+    /// `None` when the band would be too large (or the matrix isn't positive definite).
+    fn new(a: &Csr) -> Option<BandChol> {
+        let n = a.diag.len();
+        let mut p = 0;
+        for i in 0..n {
+            for k in a.rows[i]..a.rows[i + 1] {
+                p = p.max(i.abs_diff(a.cols[k]));
+            }
+        }
+        if n.saturating_mul(p + 1) > 40_000_000 {
+            return None;
+        }
+        let w = p + 1;
+        let mut l = vec![0.0f64; n * w];
+        for i in 0..n {
+            for k in a.rows[i]..a.rows[i + 1] {
+                let j = a.cols[k];
+                if j <= i {
+                    l[i * w + (j + p - i)] = a.vals[k];
+                }
+            }
+        }
+        for i in 0..n {
+            let lo = i.saturating_sub(p);
+            for j in lo..=i {
+                let jlo = j.saturating_sub(p).max(lo);
+                let mut s = l[i * w + (j + p - i)];
+                for k in jlo..j {
+                    s -= l[i * w + (k + p - i)] * l[j * w + (k + p - j)];
+                }
+                if i == j {
+                    if s <= 0.0 || !s.is_finite() {
+                        return None;
+                    }
+                    l[i * w + p] = s.sqrt();
+                } else {
+                    l[i * w + (j + p - i)] = s / l[j * w + p];
+                }
+            }
+        }
+        Some(BandChol { n, p, l })
+    }
+
+    #[allow(clippy::needless_range_loop)] // band index arithmetic reads clearer with indices
+    fn solve(&self, b: &[f64], x: &mut [f64]) {
+        let (n, p, w) = (self.n, self.p, self.p + 1);
+        let mut y = b.to_vec();
+        for i in 0..n {
+            let mut s = y[i];
+            for k in i.saturating_sub(p)..i {
+                s -= self.l[i * w + (k + p - i)] * y[k];
+            }
+            y[i] = s / self.l[i * w + p];
+        }
+        for i in (0..n).rev() {
+            let mut s = y[i];
+            for k in i + 1..(i + p + 1).min(n) {
+                s -= self.l[k * w + (i + p - k)] * x[k];
+            }
+            x[i] = s / self.l[i * w + p];
+        }
+    }
+}
+
 /// A pin bound to the mesh: barycentric weights on a triangle's vertices.
 #[derive(Clone, Debug)]
 struct Bound {
@@ -342,6 +423,7 @@ pub struct PuppetSolver {
     /// Vertices of components without pins (held at rest).
     anchored: Vec<bool>,
     matrix: Csr,
+    chol: Option<BandChol>,
     pin_weight: f64,
 }
 
@@ -454,7 +536,8 @@ impl PuppetSolver {
             }
         }
         let matrix = Csr::from_triplets(nv, trip);
-        PuppetSolver { mesh, w, bound, pin_tris, anchored, matrix, pin_weight }
+        let chol = BandChol::new(&matrix);
+        PuppetSolver { mesh, w, bound, pin_tris, anchored, matrix, chol, pin_weight }
     }
 
     /// The ARAP energy of `v` for the given per-triangle linear maps (plus the pin terms).
@@ -550,8 +633,16 @@ impl PuppetSolver {
         }
         let mut sx: Vec<f64> = v.iter().map(|p| p[0]).collect();
         let mut sy: Vec<f64> = v.iter().map(|p| p[1]).collect();
-        self.matrix.solve(&bx, &mut sx);
-        self.matrix.solve(&by, &mut sy);
+        match &self.chol {
+            Some(c) => {
+                c.solve(&bx, &mut sx);
+                c.solve(&by, &mut sy);
+            }
+            None => {
+                self.matrix.solve(&bx, &mut sx);
+                self.matrix.solve(&by, &mut sy);
+            }
+        }
         for (i, p) in v.iter_mut().enumerate() {
             *p = [sx[i], sy[i]];
         }
@@ -570,16 +661,33 @@ impl PuppetSolver {
             return (v, Vec::new());
         }
         if init.is_none_or(|i| i.len() != nv) {
-            let ident = vec![[1.0, 0.0, 0.0, 1.0]; self.mesh.tris.len()];
-            let mut r = ident;
-            for (k, tris) in self.pin_tris.iter().enumerate() {
-                if let Some(Some(deg)) = rotations.get(k) {
-                    let (s, c) = deg.to_radians().sin_cos();
-                    for &t in tris {
-                        r[t] = [c, -s, s, c];
+            // Start from R = I, or with rotated pins, each triangle turned by the inverse-distance
+            // weighted angle of the rotated pins (ARAP alone propagates a turn only slowly).
+            let rotated: Vec<([f64; 2], f64)> = self
+                .bound
+                .iter()
+                .zip(rotations)
+                .filter_map(|(b, r)| r.map(|deg| ((0..3).fold([0.0, 0.0], |a, k| [a[0] + b.bary[k] * self.mesh.verts[b.verts[k]][0], a[1] + b.bary[k] * self.mesh.verts[b.verts[k]][1]]), deg.to_radians())))
+                .collect();
+            let r: Vec<[f64; 4]> = self
+                .mesh
+                .tris
+                .iter()
+                .map(|t| {
+                    if rotated.is_empty() {
+                        return [1.0, 0.0, 0.0, 1.0];
                     }
-                }
-            }
+                    let c = t.iter().fold([0.0, 0.0], |a, &i| [a[0] + self.mesh.verts[i][0] / 3.0, a[1] + self.mesh.verts[i][1] / 3.0]);
+                    let (mut sw, mut sa) = (0.0, 0.0);
+                    for (p, a) in &rotated {
+                        let w = 1.0 / (dist2(*p, c) + 1.0);
+                        sw += w;
+                        sa += w * a;
+                    }
+                    let (s, co) = (sa / sw).sin_cos();
+                    [co, -s, s, co]
+                })
+                .collect();
             self.global(&r, pin_dst, &mut v);
         }
         let mut energies = Vec::with_capacity(iterations);
@@ -709,8 +817,6 @@ mod tests {
         for (d, x) in v.iter().zip(&solver.mesh.verts) {
             assert!((d[0] - x[0] - 10.0).abs() < 1e-3 && (d[1] - x[1] + 5.0).abs() < 1e-3, "{d:?} {x:?}");
         }
-        let err = v.iter().zip(&solver.mesh.verts).map(|(d, x)| (d[0] - x[0] - 10.0).abs().max((d[1] - x[1] + 5.0).abs())).fold(0.0, f64::max);
-        eprintln!("max translation error {err:e}");
         let out = puppet_warp(&s, b, &w, Interp::Bilinear);
         assert_eq!(out.content_bounds(), b.translate(10, -5));
         assert_eq!(out.pixel(30, 20), s.pixel(20, 25));
@@ -758,8 +864,12 @@ mod tests {
         let pins = [[28.0, 14.0], [64.0, 62.0]];
         let solver = PuppetSolver::new(mesh, &pins, &[false; 2]);
         let order = solver.draw_order(&[1, 0], &pins);
-        let last = *order.last().unwrap();
-        let c = solver.mesh.tris[last].iter().fold(0.0, |a, &i| a + solver.mesh.verts[i][1] / 3.0);
-        assert!(c < 55.0, "triangles near the raised pin draw last");
+        let near0 = |t: usize| {
+            let c = solver.mesh.tris[t].iter().fold([0.0, 0.0], |a, &i| [a[0] + solver.mesh.verts[i][0] / 3.0, a[1] + solver.mesh.verts[i][1] / 3.0]);
+            dist2(c, pins[0]) < dist2(c, pins[1])
+        };
+        // Triangles nearest the raised pin come last, all others first.
+        let k = order.iter().position(|&t| near0(t)).unwrap();
+        assert!(order[..k].iter().all(|&t| !near0(t)) && order[k..].iter().all(|&t| near0(t)));
     }
 }

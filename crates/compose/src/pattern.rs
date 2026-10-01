@@ -81,7 +81,15 @@ impl Placement {
     /// `frame`: the layer's frame (used when `link`); `phase` in pixels; `scale` as a fraction;
     /// `angle` in degrees counter-clockwise.
     pub fn new(frame: Rect, link: bool, phase: (f32, f32), scale: f32, angle: f32) -> Placement {
-        let base = if link && !frame.is_empty() { (f64::from(frame.x0), f64::from(frame.y0)) } else { (0.0, 0.0) };
+        let anchor = if frame.is_empty() { (0.0, 0.0) } else { (f64::from(frame.x0), f64::from(frame.y0)) };
+        Self::anchored(anchor, link, phase, scale, angle)
+    }
+
+    /// Like [`Placement::new`], with the linked origin given as a point. Layer effects anchor
+    /// linked patterns at the layer's effects reference point (PSD `fxrp`): Photoshop's
+    /// pattern overlays and pattern strokes match pixel-for-pixel tiled from there.
+    pub fn anchored(anchor: (f64, f64), link: bool, phase: (f32, f32), scale: f32, angle: f32) -> Placement {
+        let base = if link { anchor } else { (0.0, 0.0) };
         let origin = (base.0 + f64::from(phase.0), base.1 + f64::from(phase.1));
         let s = f64::from(scale);
         let inv_scale = if s.is_finite() && s > 1e-3 { 1.0 / s } else { 1.0 };

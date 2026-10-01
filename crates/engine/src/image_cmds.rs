@@ -129,7 +129,12 @@ fn image_size(s: &mut Session, p: &Value) -> Result<Value> {
             *surf = resize_surface(surf, sx, sy, if is_mask { Resample::Bilinear } else { filter });
         });
         let k = ((sx + sy) / 2.0) as f32;
-        for_each_layer(&mut doc.layers, &mut |l| scale_effects(&mut l.effects, k));
+        for_each_layer(&mut doc.layers, &mut |l| {
+            scale_effects(&mut l.effects, k);
+            if let Some(r) = &mut l.effects.reference {
+                *r = (r.0 * sx, r.1 * sy);
+            }
+        });
         for ch in doc.channels.iter_mut().chain(doc.quick_mask.as_mut()) {
             ch.surface = resize_surface(&ch.surface, sx, sy, Resample::Bilinear);
         }
@@ -154,6 +159,17 @@ fn translate_doc(doc: &mut Document, dx: i32, dy: i32) {
         return;
     }
     for_each_surface(&mut doc.layers, true, &mut |surf, _| *surf = translate_surface(surf, dx, dy));
+    fn shift_fx_reference(layers: &mut [photocraft_doc::Layer], dx: f64, dy: f64) {
+        for l in layers {
+            if let Some(r) = &mut l.effects.reference {
+                *r = (r.0 + dx, r.1 + dy);
+            }
+            if let LayerContent::Group(g) = &mut l.content {
+                shift_fx_reference(&mut g.children, dx, dy);
+            }
+        }
+    }
+    shift_fx_reference(&mut doc.layers, f64::from(dx), f64::from(dy));
     for ch in doc.channels.iter_mut().chain(doc.quick_mask.as_mut()) {
         ch.surface = translate_surface(&ch.surface, dx, dy);
     }

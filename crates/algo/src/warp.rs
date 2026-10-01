@@ -229,7 +229,9 @@ pub fn warp_triangles(src: &Surface, src_rect: Rect, verts: &[([f64; 2], [f64; 2
                 }
             }
             let al = acc[a].clamp(0.0, 1.0);
-            if al <= 0.0 {
+            // Float noise (a vertex a hair off the pixel grid) must not leave invisible
+            // colour behind in transparent pixels.
+            if al <= 1e-6 {
                 continue;
             }
             any = true;

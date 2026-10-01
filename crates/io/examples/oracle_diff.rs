@@ -17,6 +17,9 @@ fn main() {
     for l in doc.walk() {
         let l = l.2;
         println!("  layer {:?} {:?} blend {:?} op {} fill {} fill_cache {}", l.name, l.content.kind_name(), l.blend, l.opacity, l.fill_opacity, l.fill_cache.is_some());
+        if let photocraft_doc::LayerContent::Adjustment(a) = &l.content {
+            println!("    {}", format!("{a:?}").chars().take(800).collect::<String>());
+        }
         if let photocraft_doc::LayerContent::Fill(f) = &l.content {
             println!("    {f:?}");
         }
@@ -28,6 +31,22 @@ fn main() {
             println!("    mask column x={cx}: {}", col.join(" "));
             let row: Vec<String> = (b.x0..b.x0 + 4).chain(b.x1 - 4..b.x1).map(|x| format!("{x}:{:.2}", m.surface.pixel(x, (b.y0 + b.y1) / 2)[0])).collect();
             println!("    mask row: {}", row.join(" "));
+        }
+        if let Some(sf) = l.surface() {
+            let b = sf.content_bounds();
+            let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+            for y in b.y0..b.y1 {
+                for x in b.x0..b.x1 {
+                    let p = sf.pixel(x, y);
+                    if p[p.len() - 1] > 0.0 {
+                        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+                    }
+                }
+            }
+            println!("    alpha bounds ({x0},{y0})-({x1},{y1})");
+        }
+        if let photocraft_doc::LayerContent::Shape(sh) = &l.content {
+            println!("    shape path bounds {:?}", sh.path.control_bounds());
         }
         if let Some(vm) = &l.vector_mask {
             println!("    vector mask bounds {:?}", vm.path.control_bounds());
@@ -99,7 +118,7 @@ fn main() {
         }
         for rec in file.layers() {
             println!("-- layer {:?}", String::from_utf8_lossy(&rec.name));
-            if let Some(b) = rec.block(b"lfx2").or(rec.block(b"lmfx"))
+            if let Some(b) = rec.block(b"lmfx").or(rec.block(b"lfx2")).or(rec.block(b"lfxs"))
                 && let Ok((vd, _)) = photocraft_psd::descriptor::VersionedDescriptor::parse_prefix(&b.data[4..])
             {
                 walk(&vd.descriptor, 1);
@@ -131,6 +150,37 @@ fn main() {
         let image = photocraft_codecs::Image::from_raw((w * 3) as u32, h as u32, photocraft_codecs::ChannelLayout::Rgba, photocraft_codecs::SampleType::U8, img).unwrap();
         std::fs::write(&out, photocraft_codecs::encode(&image, photocraft_codecs::Format::Png, &Default::default()).unwrap()).unwrap();
         println!("wrote {out}");
+        return;
+    }
+    if std::env::args().nth(3).as_deref() == Some("layerpx") {
+        // layerpx x y: each layer's own pixel (0-255).
+        let x: i32 = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let y: i32 = std::env::args().nth(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+        for l in doc.walk() {
+            if let Some(s) = l.2.surface() {
+                println!("{:?}: {:?}", l.2.name, s.pixel(x, y).iter().map(|v| (v * 255.0 * 100.0).round() / 100.0).collect::<Vec<_>>());
+            }
+        }
+        return;
+    }
+    if std::env::args().nth(3).as_deref() == Some("grid") {
+        // grid x0 y0 x1 y1 [channel]: ours / photoshop values (0-255, premultiplied colour).
+        let w = doc.size.width as usize;
+        let a: Vec<usize> = (4..8).map(|i| std::env::args().nth(i).and_then(|s| s.parse().ok()).unwrap_or(0)).collect();
+        let ch: usize = std::env::args().nth(8).and_then(|s| s.parse().ok()).unwrap_or(3);
+        for (label, img) in [("ours", &ours), ("ps", &merged)] {
+            println!("{label} (channel {ch}):");
+            for y in a[1]..a[3] {
+                let row: Vec<String> = (a[0]..a[2])
+                    .map(|x| {
+                        let p = img[y * w + x];
+                        let v = if ch == 3 { p[3] } else { p[ch] * p[3] };
+                        format!("{:4}", (v * 255.0).round())
+                    })
+                    .collect();
+                println!("  y={y:4} {}", row.join(""));
+            }
+        }
         return;
     }
     if std::env::args().nth(3).as_deref() == Some("worst") {

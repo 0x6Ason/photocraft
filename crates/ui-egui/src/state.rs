@@ -421,6 +421,9 @@ pub struct UiState {
     /// Recorded actions (Actions panel).
     #[serde(default)]
     pub actions: crate::actions::Actions,
+    /// Layer Comps panel: the selected comp (by comp id).
+    #[serde(default)]
+    pub layer_comp_selected: Option<u32>,
     /// View extras: rulers (⌘R), grid (⌘'), guides (⌘;), snapping (⇧⌘;), locked guides (⌥⌘;).
     #[serde(default)]
     pub extras: Extras,
@@ -472,6 +475,7 @@ impl Default for UiState {
             extras: Extras::default(),
             view: Default::default(),
             actions: Default::default(),
+            layer_comp_selected: None,
             layer_filter: Vec::new(),
             pen: None,
             selected_path: None,

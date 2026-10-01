@@ -25,6 +25,7 @@ pub mod image_cmds;
 pub mod paint_cmds;
 pub mod pattern_cmds;
 pub mod warp_cmds;
+pub mod distort_cmds;
 pub mod selection_cmds;
 pub mod brush_cmds;
 pub mod extra_cmds;
@@ -38,6 +39,8 @@ pub mod prefs;
 pub mod snap;
 pub mod edit_menu_cmds;
 pub mod align_cmds;
+pub mod artboard_cmds;
+pub mod comps_cmds;
 
 use std::sync::Arc;
 

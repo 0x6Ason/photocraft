@@ -2,15 +2,24 @@
 //!
 //! The structure mirrors `photocraft_compose::composite_stack` / `composite_layer` /
 //! `composite_atop` one to one, so both backends share Photoshop semantics (pass-through vs
-//! isolated groups, clipping, masks, opacity × fill, adjustments). Every pass reads slots and
-//! writes a fresh slot; slots are recycled as soon as nothing refers to them.
+//! isolated groups, clipping, masks, opacity × fill, adjustments, layer effects). Every pass
+//! reads slots and writes a fresh slot; slots are recycled as soon as nothing refers to them.
+//!
+//! Layer effects follow `photocraft_compose::effects::composite_with_effects`: the layer's
+//! effect maps (shadow / glow / satin / bevel coverage, stroke bands) are built once per layer
+//! state by [`crate::fx`] and sampled here; exterior effects paint into a copy of the backdrop,
+//! the layer at fill opacity takes the interior effects, and the two merge with the layer's mode
+//! and opacity. Effect passes are clipped to the layer's effect region and the result is copied
+//! back into the backdrop in place, so a small text layer costs only its own pixels.
 
 use photocraft_color::BlendMode;
 use photocraft_compose::adjust::{self, Transfer};
 use photocraft_compose::effects::has_effects;
-use photocraft_doc::{Adjustment, Document, Fill, Layer, LayerContent, LayerId};
+use photocraft_doc::{Adjustment, Document, Effect, Fill, FxPaint, GlobalLight, Gradient, Layer, LayerContent, LayerId, Pattern, StrokePosition};
 use photocraft_geom::Rect;
 use photocraft_raster::Surface;
+
+use crate::bounds;
 
 /// Index of a chunk-sized accumulator texture.
 pub type Slot = u32;
@@ -27,6 +36,89 @@ pub enum Kernel {
     Adjust,
     AdjMix,
     Lerp,
+    /// Effect chain start: the layer at fill opacity, or an opaque copy of a clipping base.
+    FxInit,
+    /// Paint an effect through a coverage map (or the layer's alpha) into A.
+    FxPaint,
+    /// Layer + interior effects over the exterior result, then layer opacity against the backdrop.
+    FxMerge,
+    /// Copy slot A into `dst` (an existing slot) over the pass clip (no draw).
+    CopyRect,
+    /// Copy all of slot A into the fresh slot `dst` (no draw).
+    CopyFull,
+    // Effect-map kernels (single-channel targets over an effect region, see `fx`).
+    MShift,
+    MDilate,
+    MBlur,
+    MGlow,
+    MFinish,
+    MBevelH,
+    MBevelShade,
+    MStroke,
+}
+
+impl Kernel {
+    /// Fragment entry point in `compose.wgsl` (`None` for copies and clears).
+    pub fn entry(self) -> Option<&'static str> {
+        Some(match self {
+            Kernel::Clear | Kernel::CopyRect | Kernel::CopyFull => return None,
+            Kernel::Content => "fs_content",
+            Kernel::Mask => "fs_mask",
+            Kernel::Blend => "fs_blend",
+            Kernel::Atop => "fs_atop",
+            Kernel::Adjust => "fs_adjust",
+            Kernel::AdjMix => "fs_adjmix",
+            Kernel::Lerp => "fs_lerp",
+            Kernel::FxInit => "fs_fxinit",
+            Kernel::FxPaint => "fs_fxpaint",
+            Kernel::FxMerge => "fs_fxmerge",
+            Kernel::MShift => "fs_mshift",
+            Kernel::MDilate => "fs_mdilate",
+            Kernel::MBlur => "fs_mblur",
+            Kernel::MGlow => "fs_mglow",
+            Kernel::MFinish => "fs_mfinish",
+            Kernel::MBevelH => "fs_mbevelh",
+            Kernel::MBevelShade => "fs_mbevelshade",
+            Kernel::MStroke => "fs_mstroke",
+        })
+    }
+
+    /// Kernels that write effect maps (R32F / R16F targets) rather than RGBA accumulators.
+    pub fn is_map(self) -> bool {
+        matches!(
+            self,
+            Kernel::MShift
+                | Kernel::MDilate
+                | Kernel::MBlur
+                | Kernel::MGlow
+                | Kernel::MFinish
+                | Kernel::MBevelH
+                | Kernel::MBevelShade
+                | Kernel::MStroke
+        )
+    }
+
+    /// Every kernel with a pipeline.
+    pub const DRAWN: [Kernel; 18] = [
+        Kernel::Content,
+        Kernel::Mask,
+        Kernel::Blend,
+        Kernel::Atop,
+        Kernel::Adjust,
+        Kernel::AdjMix,
+        Kernel::Lerp,
+        Kernel::FxInit,
+        Kernel::FxPaint,
+        Kernel::FxMerge,
+        Kernel::MShift,
+        Kernel::MDilate,
+        Kernel::MBlur,
+        Kernel::MGlow,
+        Kernel::MFinish,
+        Kernel::MBevelH,
+        Kernel::MBevelShade,
+        Kernel::MStroke,
+    ];
 }
 
 /// Which resident texture a pass samples.
@@ -44,25 +136,46 @@ pub struct TexUse<'a> {
     pub surface: &'a Surface,
 }
 
+/// An effect map sampled by a pass: map `map` of enabled effect `item` of `plan.fx[fx]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapRef {
+    pub fx: usize,
+    pub item: usize,
+    pub map: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct Pass<'a> {
     pub kernel: Kernel,
     pub dst: Slot,
     pub a: Option<Slot>,
     pub b: Option<Slot>,
+    pub c: Option<Slot>,
     pub mode: BlendMode,
     pub opacity: f32,
     /// Layer pixels (raster / text / shape / smart cache / fill cache).
     pub tex: Option<TexUse<'a>>,
-    /// Colour outside `tex` (the surface's default pixel), or the solid fill colour.
+    /// Colour outside `tex` (the surface's default pixel), the solid fill colour, or the effect
+    /// colour.
     pub color: [f32; 4],
     pub mask: Option<MaskUse<'a>>,
-    /// Adjustment kind (see `adjust` in compose.wgsl) and parameters.
+    /// Adjustment kind (see `adjust` in compose.wgsl) and parameters; the coverage kind of an
+    /// effect paint.
     pub adjust_kind: i32,
     pub params: [[f32; 4]; 4],
-    /// 4096-entry LUT rows (Levels / Curves / Gradient map / gradient fill stops).
+    pub extra: [f32; 4],
+    /// Extra shader flags (`F_KNOCKOUT`, …).
+    pub flags: u32,
+    /// 4096-entry LUT rows (Levels / Curves / Gradient map / gradient stops).
     pub lut: Option<Vec<[f32; 4096]>>,
     pub gradient: bool,
+    /// Effect map sampled by `FxPaint`.
+    pub map: Option<MapRef>,
+    /// Pattern painted by `FxPaint`.
+    pub pattern: Option<&'a Pattern>,
+    /// Only pixels inside this rect (document coordinates) are computed; the pass is skipped for
+    /// chunks it misses. Consumers of the slot must be clipped alike.
+    pub clip: Option<Rect>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -74,8 +187,28 @@ pub struct MaskUse<'a> {
 }
 
 impl<'a> Pass<'a> {
-    fn new(kernel: Kernel, dst: Slot) -> Self {
-        Pass { kernel, dst, a: None, b: None, mode: BlendMode::Normal, opacity: 1.0, tex: None, color: [0.0; 4], mask: None, adjust_kind: 0, params: [[0.0; 4]; 4], lut: None, gradient: false }
+    pub(crate) fn new(kernel: Kernel, dst: Slot) -> Self {
+        Pass {
+            kernel,
+            dst,
+            a: None,
+            b: None,
+            c: None,
+            mode: BlendMode::Normal,
+            opacity: 1.0,
+            tex: None,
+            color: [0.0; 4],
+            mask: None,
+            adjust_kind: 0,
+            params: [[0.0; 4]; 4],
+            extra: [0.0; 4],
+            flags: 0,
+            lut: None,
+            gradient: false,
+            map: None,
+            pattern: None,
+            clip: None,
+        }
     }
 }
 
@@ -91,38 +224,96 @@ impl std::fmt::Display for Unsupported {
 
 impl std::error::Error for Unsupported {}
 
+/// A layer whose effects the plan renders: its maps are built (or reused) before the chunks run.
+#[derive(Clone, Copy, Debug)]
+pub struct FxLayer<'a> {
+    pub layer: &'a Layer,
+    /// Region the maps cover (`compose::effect_maps`).
+    pub region: Rect,
+    /// Layer bounds (gradients and linked patterns are laid out in them).
+    pub bounds: Rect,
+}
+
 #[derive(Debug)]
 pub struct Plan<'a> {
     pub passes: Vec<Pass<'a>>,
     pub slots: u32,
     pub root: Slot,
+    /// Effect layers in dependency order (a group's inner effect layers come first).
+    pub fx: Vec<FxLayer<'a>>,
+}
+
+/// Document-level inputs of a plan.
+#[derive(Clone, Copy)]
+pub struct DocCtx<'a> {
+    pub canvas: Rect,
+    pub transfer: Transfer,
+    pub light: GlobalLight,
+    pub patterns: &'a [Pattern],
+}
+
+impl<'a> DocCtx<'a> {
+    pub fn of(doc: &'a Document) -> Self {
+        DocCtx { canvas: doc.bounds(), transfer: Transfer::for_mode(doc.mode), light: doc.global_light, patterns: &doc.patterns }
+    }
 }
 
 /// Build the pass list for `doc`.
 pub fn plan(doc: &Document) -> Result<Plan<'_>, Unsupported> {
-    let mut p = Planner { passes: Vec::new(), free: Vec::new(), refs: Vec::new(), canvas: doc.bounds(), transfer: Transfer::for_mode(doc.mode) };
+    let mut p = Planner::new(DocCtx::of(doc));
     let root = p.clear();
     let root = p.stack(&doc.layers, root)?;
-    Ok(Plan { passes: p.passes, slots: p.refs.len() as u32, root })
+    Ok(p.finish(root))
 }
 
 struct Planner<'a> {
     passes: Vec<Pass<'a>>,
     free: Vec<Slot>,
     refs: Vec<u32>,
-    canvas: Rect,
-    transfer: Transfer,
+    cx: DocCtx<'a>,
+    fx: Vec<FxLayer<'a>>,
 }
 
-fn mask_use(layer: &Layer) -> Option<MaskUse<'_>> {
-    let m = layer.mask.as_ref()?;
-    if !m.enabled {
-        return None;
-    }
-    Some(MaskUse { layer: layer.id, surface: &m.surface, density: m.density, default: m.surface.default_pixel().first().copied().unwrap_or(1.0) })
+/// Coverage source of an effect paint (`kind` in `fs_fxpaint`); flags refine it.
+#[derive(Clone, Copy)]
+enum Cov {
+    /// An effect map; `outside` beyond its region.
+    Map(MapRef, f32),
+    /// Full coverage.
+    One,
 }
+
+/// Shader flags for effect passes (keep in sync with compose.wgsl). Coverage `m` of a paint, with
+/// `a` the layer's alpha and `inside` = `a > 0.5/255`:
+/// knockout `m × (1 − a)`; gate `inside ? m : 0`; rel `inside ? min(m / a, 1) : 0`;
+/// stroke-out `inside ? (vector ? 0 : 1) : m`.
+pub const F_KNOCKOUT: u32 = 16;
+/// Paint beneath A instead of over it (outside strokes).
+pub const F_UNDER: u32 = 32;
+/// Shape layer (outside strokes never show inside it).
+pub const F_VECTOR: u32 = 64;
+/// Merge onto an opaque clipping base, keeping its alpha.
+pub const F_ATOP: u32 = 128;
+pub const F_GATE: u32 = 256;
+pub const F_REL: u32 = 512;
+pub const F_STROKE_OUT: u32 = 1024;
+
+/// `FxInit` kinds: A at `opacity` × alpha; an opaque copy of A; A's colour with alpha `opacity`
+/// inside B's shape; A with alpha × B's alpha.
+pub const INIT_SCALE: i32 = 0;
+pub const INIT_OPAQUE: i32 = 1;
+pub const INIT_INSIDE: i32 = 2;
+pub const INIT_ALPHA: i32 = 3;
 
 impl<'a> Planner<'a> {
+    fn new(cx: DocCtx<'a>) -> Self {
+        Planner { passes: Vec::new(), free: Vec::new(), refs: Vec::new(), cx, fx: Vec::new() }
+    }
+
+    fn finish(self, root: Slot) -> Plan<'a> {
+        Plan { passes: self.passes, slots: self.refs.len() as u32, root, fx: self.fx }
+    }
+
     fn alloc(&mut self) -> Slot {
         if let Some(s) = self.free.pop() {
             self.refs[s as usize] = 1;
@@ -146,13 +337,10 @@ impl<'a> Planner<'a> {
     fn emit(&mut self, mut pass: Pass<'a>) -> Slot {
         let dst = self.alloc();
         pass.dst = dst;
-        let (a, b) = (pass.a, pass.b);
+        let (a, b, c) = (pass.a, pass.b, pass.c);
         self.passes.push(pass);
-        if let Some(a) = a {
-            self.release(a);
-        }
-        if let Some(b) = b {
-            self.release(b);
+        for s in [a, b, c].into_iter().flatten() {
+            self.release(s);
         }
         dst
     }
@@ -182,9 +370,6 @@ impl<'a> Planner<'a> {
         if layer.artboard().is_some() {
             return Err(Unsupported(format!("artboard `{}` (clipped and rendered on the CPU)", layer.name)));
         }
-        if has_effects(layer) {
-            return Err(Unsupported(format!("layer effects on `{}`", layer.name)));
-        }
         if layer.vector_mask.is_some() {
             return Err(Unsupported(format!("vector mask on `{}`", layer.name)));
         }
@@ -196,21 +381,23 @@ impl<'a> Planner<'a> {
         Ok(())
     }
 
+    fn mask_use(&self, layer: &'a Layer) -> Option<MaskUse<'a>> {
+        let m = layer.mask.as_ref()?;
+        if !m.enabled {
+            return None;
+        }
+        Some(MaskUse { layer: layer.id, surface: &m.surface, density: m.density, default: m.surface.default_pixel().first().copied().unwrap_or(1.0) })
+    }
+
     /// composite_layer
     fn layer(&mut self, layer: &'a Layer, clipped: &'a [Layer], backdrop: Slot) -> Result<Slot, Unsupported> {
         self.check(layer)?;
         let opacity = layer.opacity * layer.fill_opacity;
         let visible_clipped: Vec<&'a Layer> = clipped.iter().filter(|c| c.visible).collect();
-        if let LayerContent::Shape(sh) = &layer.content
-            && sh.stroke.is_some()
-            && !visible_clipped.is_empty()
-        {
-            // The vector stroke goes above the clipped layers (CPU path splits fill and stroke).
-            return Err(Unsupported(format!("stroked shape `{}` with clipped layers", layer.name)));
-        }
 
         if let LayerContent::Group(g) = &layer.content
             && layer.blend == BlendMode::PassThrough
+            && !has_effects(layer)
         {
             if !visible_clipped.is_empty() {
                 return Err(Unsupported(format!("layers clipped to pass-through group `{}`", layer.name)));
@@ -222,7 +409,7 @@ impl<'a> Planner<'a> {
                 p.a = Some(before);
                 p.b = Some(after);
                 p.opacity = opacity;
-                p.mask = mask_use(layer);
+                p.mask = self.mask_use(layer);
                 return Ok(self.emit(p));
             }
             self.release(before);
@@ -240,8 +427,20 @@ impl<'a> Planner<'a> {
             p.b = Some(adjusted);
             p.mode = layer.blend;
             p.opacity = opacity;
-            p.mask = mask_use(layer);
+            p.mask = self.mask_use(layer);
             return Ok(self.emit(p));
+        }
+
+        if has_effects(layer) {
+            return self.effects(layer, &visible_clipped, backdrop, false);
+        }
+
+        if let LayerContent::Shape(sh) = &layer.content
+            && sh.stroke.is_some()
+            && !visible_clipped.is_empty()
+        {
+            // The vector stroke goes above the clipped layers (CPU path splits fill and stroke).
+            return Err(Unsupported(format!("stroked shape `{}` with clipped layers", layer.name)));
         }
 
         let mut content = self.content(layer)?;
@@ -265,30 +464,35 @@ impl<'a> Planner<'a> {
                 if layer.mask.is_some() {
                     let mut p = Pass::new(Kernel::Mask, 0);
                     p.a = Some(s);
-                    p.mask = mask_use(layer);
+                    p.mask = self.mask_use(layer);
                     return Ok(self.emit(p));
                 }
                 Ok(s)
             }
             LayerContent::Adjustment(_) => unreachable!("adjustments handled by the caller"),
-            LayerContent::Fill(f) => {
-                let mut p = Pass::new(Kernel::Content, 0);
-                p.mask = mask_use(layer);
-                match &layer.fill_cache {
-                    Some(c) if c.fill == *f => self.surface_tex(&mut p, layer.id, &c.surface),
-                    _ => self.fill(&mut p, f, photocraft_compose::fill_frame(layer, self.canvas)),
-                }
-                Ok(self.emit(p))
-            }
             _ => {
-                let mut p = Pass::new(Kernel::Content, 0);
-                p.mask = mask_use(layer);
-                if let Some(s) = layer.surface() {
-                    self.surface_tex(&mut p, layer.id, s);
-                }
+                let p = self.content_pass(layer);
                 Ok(self.emit(p))
             }
         }
+    }
+
+    /// The Content pass of a raster / text / shape / smart / fill layer.
+    fn content_pass(&self, layer: &'a Layer) -> Pass<'a> {
+        let mut p = Pass::new(Kernel::Content, 0);
+        p.mask = self.mask_use(layer);
+        match &layer.content {
+            LayerContent::Fill(f) => match &layer.fill_cache {
+                Some(c) if c.fill == *f => self.surface_tex(&mut p, layer.id, &c.surface),
+                _ => self.fill(&mut p, f, photocraft_compose::fill_frame(layer, self.cx.canvas)),
+            },
+            _ => {
+                if let Some(s) = layer.surface() {
+                    self.surface_tex(&mut p, layer.id, s);
+                }
+            }
+        }
+        p
     }
 
     fn surface_tex(&self, p: &mut Pass<'a>, id: LayerId, s: &'a Surface) {
@@ -307,14 +511,7 @@ impl<'a> Planner<'a> {
             }
             Fill::Gradient { stops, angle, scale, style, reverse } => {
                 p.gradient = true;
-                let style_i = match style {
-                    photocraft_doc::GradientStyle::Linear => 0.0,
-                    photocraft_doc::GradientStyle::Radial => 1.0,
-                    photocraft_doc::GradientStyle::Angle => 2.0,
-                    photocraft_doc::GradientStyle::Reflected => 3.0,
-                    photocraft_doc::GradientStyle::Diamond => 4.0,
-                };
-                p.params[0] = [*angle, *scale, if *reverse { 1.0 } else { 0.0 }, style_i];
+                p.params[0] = [*angle, *scale, if *reverse { 1.0 } else { 0.0 }, style_index(*style)];
                 let c = frame;
                 p.params[1] = [c.x0 as f32, c.y0 as f32, c.width() as f32, c.height() as f32];
                 let conv: Vec<(f32, [f32; 4])> = stops
@@ -350,8 +547,11 @@ impl<'a> Planner<'a> {
             p.b = Some(adjusted);
             p.mode = layer.blend;
             p.opacity = opacity;
-            p.mask = mask_use(layer);
+            p.mask = self.mask_use(layer);
             return Ok(self.emit(p));
+        }
+        if has_effects(layer) {
+            return self.effects(layer, &[], base, true);
         }
         let content = self.content(layer)?;
         let mut p = Pass::new(Kernel::Atop, 0);
@@ -366,11 +566,281 @@ impl<'a> Planner<'a> {
     fn adjust(&mut self, adj: &Adjustment, src: Slot) -> Slot {
         let mut p = Pass::new(Kernel::Adjust, 0);
         p.a = Some(src);
-        let (kind, params, lut) = adjustment_program(adj, self.transfer);
+        let (kind, params, lut) = adjustment_program(adj, self.cx.transfer);
         p.adjust_kind = kind;
         p.params = params;
         p.lut = lut;
         self.emit(p)
+    }
+
+    /// `composite_with_effects` (atop = false) or the clipped-layer variant of `composite_atop`
+    /// (atop = true: effects over the base treated as opaque, keeping the base's alpha).
+    /// Consumes `backdrop`.
+    fn effects(&mut self, layer: &'a Layer, clipped: &[&'a Layer], backdrop: Slot, atop: bool) -> Result<Slot, Unsupported> {
+        let canvas = self.cx.canvas;
+        let region = bounds::effect_region(layer, canvas);
+        let sb = bounds::layer_bounds(layer, canvas);
+        let clip = if bounds::transparent_outside(layer) { region } else { canvas };
+        let mut content = self.content(layer)?;
+        if !matches!(layer.content, LayerContent::Group(_))
+            && let Some(p) = self.passes.last_mut()
+        {
+            p.clip = Some(clip);
+        }
+        for c in clipped {
+            content = self.atop(c, content)?;
+        }
+        let fx = self.fx.len();
+        self.fx.push(FxLayer { layer, region, bounds: sb });
+
+        let items: Vec<&'a Effect> = layer.effects.items.iter().filter(|e| e.enabled()).collect();
+        // Linked patterns tile from the effects reference point (else the layer's top-left).
+        let anchor = layer.effects.reference.unwrap_or((f64::from(sb.x0), f64::from(sb.y0)));
+        let vector_shape = matches!(layer.content, LayerContent::Shape(_));
+        let map = |item: usize, map: usize| MapRef { fx, item, map };
+        let rev: Vec<(usize, &'a Effect)> = items.iter().copied().enumerate().rev().collect();
+        let init = |s: &mut Self, src: Slot, b: Option<Slot>, kind: i32, opacity: f32| {
+            let mut p = Pass::new(Kernel::FxInit, 0);
+            p.a = Some(src);
+            p.b = b;
+            p.adjust_kind = kind;
+            p.opacity = opacity;
+            p.clip = Some(clip);
+            s.emit(p)
+        };
+
+        // Exterior effects over the backdrop (an opaque copy of it for clipped layers).
+        let mut w = if atop {
+            let b = self.retain(backdrop);
+            init(self, b, None, INIT_OPAQUE, 1.0)
+        } else {
+            self.retain(backdrop)
+        };
+        for &(i, e) in &rev {
+            if let Effect::DropShadow(s) = e {
+                let flags = if s.knocks_out { F_KNOCKOUT } else { 0 };
+                w = self.paint(w, content, Cov::Map(map(i, 0), 0.0), &Paint::Color(s.color.to_rgb()), s.common.blend, s.common.opacity, flags, clip, sb);
+            }
+        }
+        for &(i, e) in &rev {
+            if let Effect::OuterGlow(g) = e {
+                let paint = self.fx_paint(&g.paint, anchor);
+                w = self.paint(w, content, Cov::Map(map(i, 0), 0.0), &paint, g.common.blend, g.common.opacity, 0, clip, sb);
+            }
+        }
+
+        // The layer: its colour at fill opacity inside its shape; interior effects are painted
+        // relative to the shape (coverage within it), then the shape's alpha applies.
+        let c = self.retain(content);
+        let mut l = init(self, c, None, INIT_INSIDE, layer.fill_opacity);
+        for &(_, e) in &rev {
+            if let Effect::PatternOverlay { common, name, id, scale, angle, link, phase } = e
+                && let Some(pat) = photocraft_doc::pattern::find(self.cx.patterns, id, name).filter(|p| !p.is_empty())
+            {
+                let paint = Paint::Pattern(pat, placement(anchor, *link, *phase, *scale, *angle));
+                l = self.paint(l, content, Cov::One, &paint, common.blend, common.opacity, F_GATE, clip, sb);
+            }
+        }
+        for &(_, e) in &rev {
+            if let Effect::GradientOverlay { common, gradient, .. } = e {
+                l = self.paint(l, content, Cov::One, &Paint::Gradient(gradient), common.blend, common.opacity, F_GATE, clip, sb);
+            }
+        }
+        for &(_, e) in &rev {
+            if let Effect::ColorOverlay { common, color } = e {
+                l = self.paint(l, content, Cov::One, &Paint::Color(color.to_rgb()), common.blend, common.opacity, F_GATE, clip, sb);
+            }
+        }
+        for &(i, e) in &rev {
+            if let Effect::Satin(s) = e {
+                l = self.paint(l, content, Cov::Map(map(i, 0), 0.0), &Paint::Color(s.color.to_rgb()), s.common.blend, s.common.opacity, F_REL, clip, sb);
+            }
+        }
+        for &(i, e) in &rev {
+            if let Effect::InnerGlow(g) = e {
+                let paint = self.fx_paint(&g.paint, anchor);
+                l = self.paint(l, content, Cov::Map(map(i, 0), 0.0), &paint, g.common.blend, g.common.opacity, F_REL, clip, sb);
+            }
+        }
+        for &(i, e) in &rev {
+            if let Effect::InnerShadow(s) = e {
+                l = self.paint(l, content, Cov::Map(map(i, 0), 0.0), &Paint::Color(s.color.to_rgb()), s.common.blend, s.common.opacity, F_REL, clip, sb);
+            }
+        }
+        // Inside stroke parts are painted over the layer (bottom instance first).
+        for &(i, e) in &rev {
+            if let Effect::Stroke(st) = e {
+                let (in_w, _) = stroke_widths(st);
+                if in_w > 0.0 {
+                    let paint = self.fx_paint(&st.paint, anchor);
+                    l = self.paint(l, content, Cov::Map(map(i, 1), (in_w + 0.5).clamp(0.0, 1.0)), &paint, st.common.blend, st.common.opacity, F_GATE, clip, sb);
+                }
+            }
+        }
+        for &(i, e) in &rev {
+            if let Effect::BevelEmboss(b) = e
+                && b.style != photocraft_doc::BevelStyle::OuterBevel
+            {
+                l = self.paint(l, content, Cov::Map(map(i, 0), 0.0), &Paint::Color(b.highlight_color.to_rgb()), b.highlight.blend, b.highlight.opacity, F_REL, clip, sb);
+                l = self.paint(l, content, Cov::Map(map(i, 1), 0.0), &Paint::Color(b.shadow_color.to_rgb()), b.shadow.blend, b.shadow.opacity, F_REL, clip, sb);
+            }
+        }
+        // The shape's own alpha.
+        let c = self.retain(content);
+        l = init(self, l, Some(c), INIT_ALPHA, 1.0);
+        // Outside stroke parts slide beneath the layer (top instance first).
+        for (i, e) in items.iter().copied().enumerate() {
+            if let Effect::Stroke(st) = e
+                && stroke_widths(st).1 > 0.0
+            {
+                let paint = self.fx_paint(&st.paint, anchor);
+                let flags = F_UNDER | F_STROKE_OUT | if vector_shape { F_VECTOR } else { 0 };
+                l = self.paint(l, content, Cov::Map(map(i, 0), 0.0), &paint, BlendMode::Normal, st.common.opacity, flags, clip, sb);
+            }
+        }
+        for &(i, e) in &rev {
+            if let Effect::BevelEmboss(b) = e
+                && b.style == photocraft_doc::BevelStyle::OuterBevel
+            {
+                w = self.paint(w, content, Cov::Map(map(i, 0), 0.0), &Paint::Color(b.highlight_color.to_rgb()), b.highlight.blend, b.highlight.opacity, 0, clip, sb);
+                w = self.paint(w, content, Cov::Map(map(i, 1), 0.0), &Paint::Color(b.shadow_color.to_rgb()), b.shadow.blend, b.shadow.opacity, 0, clip, sb);
+            }
+        }
+
+        let mut p = Pass::new(Kernel::FxMerge, 0);
+        p.a = Some(w);
+        p.b = Some(l);
+        p.c = Some(self.retain(backdrop));
+        p.mode = if layer.blend == BlendMode::PassThrough { BlendMode::Normal } else { layer.blend };
+        p.opacity = layer.opacity;
+        p.flags = if atop { F_ATOP } else { 0 };
+        p.clip = Some(clip);
+        let merged = self.emit(p);
+        self.release(content);
+
+        // Write the clipped result back into the backdrop (in place when nothing else holds it).
+        let dst = if self.refs[backdrop as usize] == 1 {
+            backdrop
+        } else {
+            let n = self.alloc();
+            let mut p = Pass::new(Kernel::CopyFull, n);
+            p.a = Some(backdrop);
+            self.passes.push(p);
+            self.release(backdrop);
+            n
+        };
+        let mut p = Pass::new(Kernel::CopyRect, dst);
+        p.a = Some(merged);
+        p.clip = Some(clip);
+        self.passes.push(p);
+        self.release(merged);
+        Ok(dst)
+    }
+
+    fn fx_paint(&self, p: &'a FxPaint, anchor: (f64, f64)) -> Paint<'a> {
+        match p {
+            FxPaint::Color(c) => Paint::Color(c.to_rgb()),
+            FxPaint::Gradient(g) => Paint::Gradient(g),
+            FxPaint::Pattern { name, id, scale } => match photocraft_doc::pattern::find(self.cx.patterns, id, name).filter(|p| !p.is_empty()) {
+                Some(pat) => Paint::Pattern(pat, placement(anchor, true, (0.0, 0.0), *scale, 0.0)),
+                None => Paint::None,
+            },
+        }
+    }
+
+    /// One effect paint into `dst` (consumed); reads the layer's alpha from `content` (kept).
+    #[allow(clippy::too_many_arguments)]
+    fn paint(&mut self, dst: Slot, content: Slot, cov: Cov, paint: &Paint<'a>, blend: BlendMode, opacity: f32, flags: u32, clip: Rect, sb: Rect) -> Slot {
+        if matches!(paint, Paint::None) {
+            // Missing pattern: compose paints nothing.
+            return dst;
+        }
+        let mut p = Pass::new(Kernel::FxPaint, 0);
+        p.a = Some(dst);
+        p.b = Some(self.retain(content));
+        p.mode = blend;
+        p.opacity = opacity;
+        p.flags = flags;
+        p.clip = Some(clip);
+        match cov {
+            Cov::Map(m, outside) => {
+                p.adjust_kind = 0;
+                p.map = Some(m);
+                p.params[2][3] = outside;
+            }
+            Cov::One => p.adjust_kind = 1,
+        }
+        match paint {
+            Paint::None => {}
+            Paint::Color(c) => p.color = [c[0], c[1], c[2], 1.0],
+            Paint::Gradient(g) => {
+                p.params[0] = [g.angle, g.scale, if g.reverse { 1.0 } else { 0.0 }, style_index(g.style)];
+                p.params[1] = [sb.x0 as f32, sb.y0 as f32, sb.width() as f32, sb.height() as f32];
+                p.params[2][0] = g.offset.0;
+                p.params[2][1] = g.offset.1;
+                p.params[2][2] = 1.0;
+                let mut rows = vec![[0.0f32; 4096]; 4];
+                for k in 0..4096 {
+                    let v = photocraft_compose::effects::sample_gradient(g, k as f32 / 4095.0);
+                    for (ch, row) in rows.iter_mut().enumerate() {
+                        row[k] = v[ch];
+                    }
+                }
+                p.lut = Some(rows);
+            }
+            Paint::Pattern(pat, pl) => {
+                p.params[2][2] = 2.0;
+                p.params[3] = [pl.origin.0 as f32, pl.origin.1 as f32, pl.cs.0 as f32, pl.cs.1 as f32];
+                p.extra = [pl.inv_scale as f32, pat.width as f32, pat.height as f32, 0.0];
+                p.pattern = Some(pat);
+            }
+        }
+        self.emit(p)
+    }
+}
+
+/// Paint source of an effect.
+enum Paint<'a> {
+    None,
+    Color([f32; 3]),
+    Gradient(&'a Gradient),
+    Pattern(&'a Pattern, Placement),
+}
+
+/// `compose::pattern::Placement` (origin, inverse rotation, inverse scale).
+#[derive(Clone, Copy, Debug)]
+struct Placement {
+    origin: (f64, f64),
+    cs: (f64, f64),
+    inv_scale: f64,
+}
+
+/// `Placement::anchored`: linked patterns tile from `anchor` (the effects reference point).
+fn placement(anchor: (f64, f64), link: bool, phase: (f32, f32), scale: f32, angle: f32) -> Placement {
+    let base = if link { anchor } else { (0.0, 0.0) };
+    let origin = (base.0 + f64::from(phase.0), base.1 + f64::from(phase.1));
+    let s = f64::from(scale);
+    let inv_scale = if s.is_finite() && s > 1e-3 { 1.0 / s } else { 1.0 };
+    let a = f64::from(angle).to_radians();
+    Placement { origin, cs: (a.cos(), a.sin()), inv_scale }
+}
+
+/// (inside width, outside width) of a stroke.
+pub fn stroke_widths(st: &photocraft_doc::StrokeFx) -> (f32, f32) {
+    match st.position {
+        StrokePosition::Outside => (0.0, st.size),
+        StrokePosition::Inside => (st.size, 0.0),
+        StrokePosition::Center => (st.size / 2.0, st.size / 2.0),
+    }
+}
+
+fn style_index(s: photocraft_doc::GradientStyle) -> f32 {
+    match s {
+        photocraft_doc::GradientStyle::Linear => 0.0,
+        photocraft_doc::GradientStyle::Radial => 1.0,
+        photocraft_doc::GradientStyle::Angle => 2.0,
+        photocraft_doc::GradientStyle::Reflected => 3.0,
+        photocraft_doc::GradientStyle::Diamond => 4.0,
     }
 }
 
@@ -585,9 +1055,21 @@ mod tests {
     }
 
     #[test]
-    fn effects_are_unsupported() {
+    fn effects_are_planned_in_place() {
         let mut d = Document::with_background("t", Size::new(8, 8), ColorMode::Rgb, SampleType::U8, Color::WHITE);
-        d.layers[0].effects.items.push(photocraft_doc::Effect::ColorOverlay { common: photocraft_doc::FxCommon::new(BlendMode::Normal, 1.0), color: Color::WHITE });
-        assert!(plan(&d).is_err());
+        let mut l = Layer::raster("fx", d.pixel_format());
+        l.surface_mut().unwrap().fill_rect(Rect::new(2, 2, 5, 5), &[1.0, 0.0, 0.0, 1.0]);
+        l.effects.items.push(photocraft_doc::Effect::ColorOverlay { common: photocraft_doc::FxCommon::new(BlendMode::Normal, 1.0), color: Color::WHITE });
+        l.effects.items.push(photocraft_doc::Effect::default_drop_shadow());
+        d.layers.push(l);
+        let p = plan(&d).unwrap();
+        assert_eq!(p.fx.len(), 1);
+        let m = photocraft_compose::effects::margin(&d.layers[1]);
+        assert_eq!(p.fx[0].region, Rect::new(2, 2, 5, 5).inflate(m).intersect(&d.bounds().inflate(m)));
+        // The effect result lands back in the backdrop slot.
+        let last = p.passes.last().unwrap();
+        assert_eq!(last.kernel, Kernel::CopyRect);
+        assert_eq!(last.dst, p.root);
+        assert!(p.slots <= 6, "{} slots", p.slots);
     }
 }

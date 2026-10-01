@@ -3419,6 +3419,7 @@ dependencies = [
  "photocraft-geom",
  "photocraft-raster",
  "pollster 1.0.1",
+ "rayon",
  "wgpu",
 ]
 

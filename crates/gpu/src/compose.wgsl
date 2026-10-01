@@ -1,7 +1,8 @@
 // Photocraft GPU compositor kernels.
 //
-// Every pass renders one chunk of the canvas into a straight-alpha RGBA16F accumulator, reading
-// its inputs with `textureLoad` at the same pixel. The functions mirror `photocraft-compose`
+// Every pass renders one chunk of the canvas into a straight-alpha RGBA32F accumulator, reading
+// its inputs with `textureLoad` at the same pixel. Effect-map kernels (`fs_m*`) render
+// single-channel maps over a layer's effect region instead (`chunk` = the region). The functions mirror `photocraft-compose`
 // (the CPU reference) operation for operation; keep them in sync.
 
 struct Chunk {
@@ -27,12 +28,22 @@ struct Op {
     p1: vec4<f32>,
     p2: vec4<f32>,
     p3: vec4<f32>,
+    map_origin: vec2<i32>,
+    map_size: vec2<i32>,
+    p4: vec4<f32>,
 };
 
 const F_MASK: u32 = 1u;          // layer has an enabled mask
 const F_MASK_TEX: u32 = 2u;      // mask pixels live in `mask_tex`
 const F_TEX: u32 = 4u;           // layer pixels live in `layer_tex`
 const F_GRADIENT: u32 = 8u;      // gradient fill (stops in `lut_tex`)
+const F_KNOCKOUT: u32 = 16u;     // effect paint: the layer knocks out the coverage (drop shadow)
+const F_UNDER: u32 = 32u;        // effect paint: slide beneath A (outside stroke)
+const F_VECTOR: u32 = 64u;       // effect paint: shape layer (outside stroke never inside)
+const F_ATOP: u32 = 128u;        // effect merge: clipped layer over an opaque base
+const F_GATE: u32 = 256u;        // effect paint: coverage only inside the layer's shape
+const F_REL: u32 = 512u;         // effect paint: coverage relative to the layer's alpha
+const F_STROKE_OUT: u32 = 1024u; // effect paint: outside stroke band
 
 @group(0) @binding(0) var<uniform> chunk: Chunk;
 @group(0) @binding(1) var<uniform> op: Op;
@@ -41,6 +52,9 @@ const F_GRADIENT: u32 = 8u;      // gradient fill (stops in `lut_tex`)
 @group(1) @binding(2) var layer_tex: texture_2d<f32>;
 @group(1) @binding(3) var mask_tex: texture_2d<f32>;
 @group(1) @binding(4) var lut_tex: texture_2d<f32>;
+@group(1) @binding(5) var tex_c: texture_2d<f32>;
+@group(1) @binding(6) var map_tex: texture_2d<f32>;
+@group(1) @binding(7) var pat_tex: texture_2d<f32>;
 
 struct VOut { @builtin(position) pos: vec4<f32> };
 
@@ -464,11 +478,12 @@ fn adjust(c: vec3<f32>) -> vec3<f32> {
 // ---- fills ----------------------------------------------------------------------------------
 
 fn gradient_t(d: vec2<i32>) -> f32 {
-    // p0 = (angle°, scale, reverse, style), p1 = canvas (x0, y0, w, h)
+    // p0 = (angle°, scale, reverse, style), p1 = frame (x0, y0, w, h)
     let w = max(op.p1.z, 1.0);
     let h = max(op.p1.w, 1.0);
-    let cx = op.p1.x + w / 2.0;
-    let cy = op.p1.y + h / 2.0;
+    // p2.xy: centre offset as a fraction of the bounds (gradient overlays; 0 for fills).
+    let cx = op.p1.x + w / 2.0 + op.p2.x * w;
+    let cy = op.p1.y + h / 2.0 + op.p2.y * h;
     let a = radians(op.p0.x);
     let s = sin(a);
     let c = cos(a);
@@ -579,4 +594,281 @@ fn fs_lerp(in: VOut) -> @location(0) vec4<f32> {
     let b = textureLoad(tex_b, p, 0);
     let k = op.opacity * mask_value(doc_px(p));
     return a + (b - a) * k;
+}
+
+// ---- layer effects (compose::effects::composite_with_effects) -------------------------------
+
+const INSIDE_EPS: f32 = 0.5 / 255.0;
+
+// Effect map value at document pixel `d` (`outside` beyond the map's region, like
+// `FxMaps::crop`).
+fn map_value(d: vec2<i32>, outside: f32) -> f32 {
+    let q = d - op.map_origin;
+    if (inside(q, op.map_size)) {
+        return textureLoad(map_tex, q, 0).r;
+    }
+    return outside;
+}
+
+fn wrap(i: i32, n: i32) -> i32 {
+    return ((i % n) + n) % n;
+}
+
+// compose::pattern::Tile::sample through Placement::map. p3 = (origin, cos, sin),
+// p4 = (1 / scale, tile w, tile h); `pat_tex` holds premultiplied RGBA.
+fn pattern_sample(d: vec2<i32>) -> vec4<f32> {
+    let dx = f32(d.x) + 0.5 - op.p3.x;
+    let dy = f32(d.y) + 0.5 - op.p3.y;
+    let c = op.p3.z;
+    let s = op.p3.w;
+    let u = (dx * c - dy * s) * op.p4.x - 0.5;
+    let v = (dx * s + dy * c) * op.p4.x - 0.5;
+    let x0 = floor(u);
+    let y0 = floor(v);
+    let fx = u - x0;
+    let fy = v - y0;
+    let tw = i32(op.p4.y);
+    let th = i32(op.p4.z);
+    let ix = i32(x0);
+    let iy = i32(y0);
+    var acc = vec4(0.0);
+    let wy = array<f32, 2>(1.0 - fy, fy);
+    let wx = array<f32, 2>(1.0 - fx, fx);
+    for (var j = 0; j < 2; j++) {
+        if (wy[j] == 0.0) { continue; }
+        for (var i = 0; i < 2; i++) {
+            if (wx[i] == 0.0) { continue; }
+            acc += textureLoad(pat_tex, vec2(wrap(ix + i, tw), wrap(iy + j, th)), 0) * (wx[i] * wy[j]);
+        }
+    }
+    if (acc.a <= 0.0) { return vec4(0.0); }
+    return vec4(acc.rgb / acc.a, min(acc.a, 1.0));
+}
+
+// Effect paint colour at `d`: p2.z = 0 solid (`color`), 1 gradient (stops in `lut_tex`),
+// 2 pattern.
+fn fx_color(d: vec2<i32>) -> vec4<f32> {
+    let kind = i32(op.p2.z);
+    if (kind == 1) {
+        let t = gradient_t(d);
+        return vec4(lut(0, t), lut(1, t), lut(2, t), lut(3, t));
+    }
+    if (kind == 2) {
+        return pattern_sample(d);
+    }
+    return op.color;
+}
+
+// Effect chain steps (`kind`): 0 A at `opacity` × alpha; 1 an opaque copy of A (a clipping base
+// for clipped layers' effects); 2 A's colour with alpha `opacity` inside B's shape (the layer
+// before its interior effects); 3 A with its alpha × B's alpha (the shape's own alpha).
+@fragment
+fn fs_fxinit(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let c = textureLoad(tex_a, p, 0);
+    switch op.kind {
+        case 1: { return vec4(c.rgb, 1.0); }
+        case 2: { return vec4(c.rgb, select(0.0, op.opacity, c.a > INSIDE_EPS)); }
+        case 3: { return vec4(c.rgb, c.a * min(textureLoad(tex_b, p, 0).a, 1.0)); }
+        default: { return vec4(c.rgb, c.a * op.opacity); }
+    }
+}
+
+// effects::paint: composite `colour × coverage × opacity` into A. B is the layer (its alpha `a`
+// is the effect shape). Coverage `kind`: 0 the effect map, 1 full; then F_KNOCKOUT m × (1 − a),
+// F_GATE inside ? m : 0, F_REL inside ? min(m / a, 1) : 0, F_STROKE_OUT inside ? (vector ? 0 : 1)
+// : m. F_UNDER paints beneath A (outside strokes).
+@fragment
+fn fs_fxpaint(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let d = doc_px(p);
+    let dst = textureLoad(tex_a, p, 0);
+    let a = textureLoad(tex_b, p, 0).a;
+    let inside_shape = a > INSIDE_EPS;
+    var m = 1.0;
+    if (op.kind == 0) { m = map_value(d, op.p2.w); }
+    if ((op.flags & F_KNOCKOUT) != 0u) { m = m * (1.0 - a); }
+    if ((op.flags & F_GATE) != 0u && !inside_shape) { m = 0.0; }
+    if ((op.flags & F_REL) != 0u) {
+        if (inside_shape) { m = min(m / a, 1.0); } else { m = 0.0; }
+    }
+    if ((op.flags & F_STROKE_OUT) != 0u && inside_shape) {
+        m = select(1.0, 0.0, (op.flags & F_VECTOR) != 0u);
+    }
+    let k = m * op.opacity;
+    if ((op.flags & F_UNDER) != 0u) {
+        // Painted into a transparent buffer, then A goes over it.
+        var under = vec4(0.0);
+        if (k > 0.0) {
+            let c = fx_color(d);
+            under = composite(M_NORMAL, vec4(0.0), vec4(c.rgb, c.a * k), 1.0);
+        }
+        return composite(M_NORMAL, under, dst, 1.0);
+    }
+    if (k <= 0.0) { return dst; }
+    let c = fx_color(d);
+    return composite(op.mode, dst, vec4(c.rgb, c.a * k), 1.0);
+}
+
+fn mix_premul(a: vec4<f32>, b: vec4<f32>, k: f32) -> vec4<f32> {
+    let alpha = a.a + (b.a - a.a) * k;
+    if (alpha <= 0.0) { return vec4(0.0); }
+    return vec4((a.rgb * a.a + (b.rgb * b.a - a.rgb * a.a) * k) / alpha, alpha);
+}
+
+// The layer with its interior effects (B) over the exterior result (A) in the layer's mode, then
+// layer opacity against the backdrop C. F_ATOP: C is a clipping base: effects were painted over
+// it as if opaque and the base keeps its alpha.
+@fragment
+fn fs_fxmerge(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    var w = textureLoad(tex_a, p, 0);
+    let l = textureLoad(tex_b, p, 0);
+    let c = textureLoad(tex_c, p, 0);
+    if (l.a > 0.0) { w = composite(op.mode, w, l, 1.0); }
+    let atop = (op.flags & F_ATOP) != 0u;
+    var before = c;
+    if (atop) { before = vec4(c.rgb, 1.0); }
+    let o = mix_premul(before, w, op.opacity);
+    if (atop) {
+        if (c.a > 0.0) { return vec4(o.rgb, c.a); }
+        return c;
+    }
+    return o;
+}
+
+// ---- effect maps (compose::effects::build_maps) ----------------------------------------------
+//
+// Targets cover the effect region (`chunk` = region origin and size); reads outside it return 0,
+// like `Map::get`. Each kernel mirrors one step of the CPU map builders. The shape and its
+// distance fields come from the CPU (`compose::layer_shape`, `compose::effects::distance_field`).
+
+fn ra(p: vec2<i32>) -> f32 {
+    if (inside(p, chunk.size)) { return textureLoad(tex_a, p, 0).r; }
+    return 0.0;
+}
+fn mout(v: f32) -> vec4<f32> { return vec4(v, 0.0, 0.0, 1.0); }
+
+// Map::shifted by whole pixels: p0 = (dx, dy, outside, invert (1 - a before shifting)).
+@fragment
+fn fs_mshift(in: VOut) -> @location(0) vec4<f32> {
+    let s = local(in.pos) - vec2<i32>(i32(op.p0.x), i32(op.p0.y));
+    if (!inside(s, chunk.size)) { return mout(op.p0.z); }
+    var v = textureLoad(tex_a, s, 0).r;
+    if (op.p0.w > 0.5) { v = 1.0 - v; }
+    return mout(v);
+}
+
+// effects::dilate: max(A, clamp(r + 0.5 - dist_outside)), B = distances, p0.x = r.
+@fragment
+fn fs_mdilate(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let a = textureLoad(tex_a, p, 0).r;
+    let d = textureLoad(tex_b, p, 0).r;
+    return mout(max(a, clamp(op.p0.x + 0.5 - d, 0.0, 1.0)));
+}
+
+// effects::blur, one separable pass: p0 = (vertical, radius); weights in LUT row 0; zero outside
+// the region.
+@fragment
+fn fs_mblur(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let r = i32(op.p0.y);
+    var step = vec2(1, 0);
+    var n = chunk.size.x;
+    var c = p.x;
+    if (op.p0.x > 0.5) {
+        step = vec2(0, 1);
+        n = chunk.size.y;
+        c = p.y;
+    }
+    var acc = 0.0;
+    for (var k = 0; k <= 2 * r; k++) {
+        let i = c + k - r;
+        if (i >= 0 && i < n) {
+            acc += textureLoad(tex_a, p + step * (k - r), 0).r * textureLoad(lut_tex, vec2(k, 0), 0).r;
+        }
+    }
+    return mout(acc);
+}
+
+// Precise glow from a distance map: p0 = (solid, soft, invert).
+@fragment
+fn fs_mglow(in: VOut) -> @location(0) vec4<f32> {
+    let d = textureLoad(tex_a, local(in.pos), 0).r;
+    var m = clamp(1.0 - (d - op.p0.x) / op.p0.y, 0.0, 1.0);
+    if (d <= op.p0.x) { m = 1.0; }
+    if (op.p0.z > 0.5) { m = 1.0 - m; }
+    return mout(m);
+}
+
+// Last step of a coverage map: p0 = (|A - B| (satin), 1 - v, contour (LUT row 0), × shape
+// (`layer_tex`)).
+@fragment
+fn fs_mfinish(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    var v = textureLoad(tex_a, p, 0).r;
+    if (op.p0.x > 0.5) { v = abs(v - textureLoad(tex_b, p, 0).r); }
+    if (op.p0.y > 0.5) { v = 1.0 - v; }
+    if (op.p0.z > 0.5) { v = lut(0, v); }
+    if (op.p0.w > 0.5) { v = v * textureLoad(layer_tex, p, 0).r; }
+    return mout(v);
+}
+
+// Bevel height profile from A = dist_inside, B = dist_outside: p0 = (style (0 outer, 1 emboss,
+// 2 inner), size); the smooth (quarter sine) rounding comes from LUT row 0.
+@fragment
+fn fs_mbevelh(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let din = textureLoad(tex_a, p, 0).r;
+    let dout = textureLoad(tex_b, p, 0).r;
+    let size = op.p0.y;
+    var h: f32;
+    switch i32(op.p0.x) {
+        case 0: { h = 1.0 - clamp(dout / size, 0.0, 1.0); }
+        case 1: {
+            if (din > 0.0) {
+                h = 0.5 + 0.5 * clamp(din / (size / 2.0), 0.0, 1.0);
+            } else {
+                h = 0.5 - 0.5 * clamp(dout / (size / 2.0), 0.0, 1.0);
+            }
+        }
+        default: { h = clamp(din / size, 0.0, 1.0); }
+    }
+    return mout(lut(0, h));
+}
+
+// Bevel shading of the blurred height map A over shape S (`layer_tex`): p0 = light vector,
+// sin(altitude); p1 = (depth, outer, shadow (else highlight), contour (LUT row 0)).
+@fragment
+fn fs_mbevelshade(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let depth = op.p1.x;
+    let gx = (ra(p + vec2(1, 0)) - ra(p - vec2(1, 0))) * 0.5 * depth;
+    let gy = (ra(p + vec2(0, 1)) - ra(p - vec2(0, 1))) * 0.5 * depth;
+    let n = vec3(-gx, -gy, 1.0);
+    let len = sqrt(n.x * n.x + n.y * n.y + 1.0);
+    let shade = (n.x * op.p0.x + n.y * op.p0.y + n.z * op.p0.z) / len;
+    let se = op.p0.w;
+    let s = textureLoad(layer_tex, p, 0).r;
+    var region = s;
+    if (op.p1.y > 0.5) {
+        region = (1.0 - s) * select(0.0, 1.0, textureLoad(tex_a, p, 0).r > 0.0);
+    }
+    let k = shade - se;
+    var v = 0.0;
+    if (op.p1.z > 0.5) {
+        if (k <= 0.0) { v = clamp(-k / max(se, 1e-3), 0.0, 1.0) * region; }
+    } else if (k > 0.0) {
+        v = clamp(k / max(1.0 - se, 1e-3), 0.0, 1.0) * region;
+    }
+    if (op.p1.w > 0.5) { v = lut(0, v); }
+    return mout(v);
+}
+
+// Stroke band from a distance map: clamp(width + 0.5 - d), p0.x = width.
+@fragment
+fn fs_mstroke(in: VOut) -> @location(0) vec4<f32> {
+    let d = textureLoad(tex_a, local(in.pos), 0).r;
+    return mout(clamp(op.p0.x + 0.5 - d, 0.0, 1.0));
 }

@@ -164,6 +164,14 @@ fn main() {
     };
     let cpu = |doc: &Document, r: Rect| if no_cpu { None } else { Some(cpu_time(doc, r)) };
 
+    if args.iter().any(|a| a == "--baseline") {
+        let mut plain = doc.clone();
+        for l in &mut plain.layers {
+            l.effects.items.clear();
+        }
+        let _ = gt(&plain, full);
+        report("baseline: no effects, full refresh", full, None, gt(&plain, full));
+    }
     photocraft_compose::purge_effect_cache();
     report("full refresh, cold effect caches", full, cpu(&doc, full), gt(&doc, full));
     report("full refresh, warm caches", full, cpu(&doc, full), gt(&doc, full));

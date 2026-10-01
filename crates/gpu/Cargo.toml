@@ -17,6 +17,10 @@ photocraft-compose = { workspace = true }
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }
 log = { workspace = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Effect distance fields are computed in parallel bands.
+rayon = { workspace = true }
+
 [dev-dependencies]
 wgpu = { version = "30" }
 pollster = "1"

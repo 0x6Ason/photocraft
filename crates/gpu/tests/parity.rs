@@ -298,3 +298,353 @@ fn incremental_updates_follow_the_document() {
     d.layers[0].opacity = 0.5;
     check(&mut g, &d, "opacity");
 }
+
+// ---- layer effects --------------------------------------------------------------------------
+
+use photocraft_doc::adjust::CurvePoint as Cp;
+use photocraft_doc::{
+    Bevel, BevelStyle, BevelTechnique, Contour, Effect, FxCommon, FxPaint, Glow, GlowSource, GlowTechnique, Gradient, Pattern, Satin, Shadow, StrokeFx, StrokePosition,
+};
+
+/// An anti-aliased blob (disc plus a soft-edged bar and a hole) with partially transparent parts,
+/// so effects see real edge coverage, concavities and interior alpha.
+fn blob(name: &str, fmt: PixelFormat, cx: f32, cy: f32, r: f32, color: [f32; 3]) -> Layer {
+    let mut l = Layer::raster(name, fmt);
+    let rect = Rect::new((cx - r - 12.0) as i32, (cy - r - 4.0) as i32, (cx + r + 14.0) as i32, (cy + r + 4.0) as i32);
+    let ch = fmt.channels();
+    let mut data = Vec::with_capacity(rect.width() as usize * rect.height() as usize * ch);
+    for y in rect.y0..rect.y1 {
+        for x in rect.x0..rect.x1 {
+            let (fx, fy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+            let d = (fx * fx + fy * fy).sqrt();
+            let disc = (r - d + 0.5).clamp(0.0, 1.0);
+            let hole = ((d - r * 0.3) + 0.5).clamp(0.0, 1.0);
+            let bar = ((r * 0.25 - fy.abs()) + 0.5).clamp(0.0, 1.0) * ((r + 10.0 - fx.abs()) * 0.7).clamp(0.0, 1.0);
+            let a = (disc * hole).max(bar * 0.7);
+            let rgba = [color[0] * (0.7 + 0.3 * (fx / r).abs()), color[1], color[2] * (0.8 + 0.2 * (fy / r)), a];
+            let px = photocraft_raster::from_rgba(&fmt, rgba);
+            data.extend_from_slice(&px);
+        }
+    }
+    l.surface_mut().unwrap().write_region(rect, &data);
+    l
+}
+
+fn fx_doc(w: u32, h: u32, depth: SampleType) -> Document {
+    let mut d = Document::new("fx", Size::new(w, h), ColorMode::Rgb, depth);
+    let fmt = d.pixel_format();
+    d.layers.push(noise_layer("bg", fmt, Rect::from_xywh(0, 0, w, h), 7, 0.8));
+    d
+}
+
+fn contour() -> Contour {
+    Contour::Custom { name: "cove".into(), points: vec![Cp { input: 0.0, output: 0.1 }, Cp { input: 0.4, output: 0.8 }, Cp { input: 1.0, output: 0.6 }] }
+}
+
+fn shadow(blend: BlendMode, opacity: f32, angle: f32, distance: f32, size: f32, spread: f32) -> Shadow {
+    Shadow {
+        common: FxCommon::new(blend, opacity),
+        color: Color::rgb(0.1, 0.05, 0.3),
+        angle,
+        use_global_light: false,
+        distance,
+        spread,
+        size,
+        contour: Contour::Linear,
+        anti_alias: false,
+        noise: 0.0,
+        knocks_out: true,
+    }
+}
+
+fn glow(paint: FxPaint, technique: GlowTechnique, size: f32, spread: f32, source: GlowSource) -> Glow {
+    Glow { common: FxCommon::new(BlendMode::Screen, 0.8), paint, technique, spread, size, contour: Contour::Linear, anti_alias: false, range: 0.5, jitter: 0.0, noise: 0.0, source }
+}
+
+fn gradient() -> Gradient {
+    Gradient {
+        stops: vec![(0.0, Color::rgb(1.0, 0.2, 0.0)), (0.5, Color::rgb(0.1, 0.9, 0.3)), (1.0, Color::rgb(0.2, 0.1, 1.0))],
+        opacity_stops: vec![(0.0, 1.0), (1.0, 0.4)],
+        style: GradientStyle::Linear,
+        angle: 30.0,
+        scale: 0.9,
+        reverse: false,
+        align: true,
+        offset: (0.1, -0.05),
+    }
+}
+
+fn bevel(style: BevelStyle, up: bool, size: f32, soften: f32) -> Bevel {
+    Bevel {
+        enabled: true,
+        style,
+        technique: BevelTechnique::Smooth,
+        depth: 1.3,
+        up,
+        size,
+        soften,
+        angle: 135.0,
+        altitude: 35.0,
+        use_global_light: true,
+        gloss_contour: Contour::Linear,
+        highlight: FxCommon::new(BlendMode::Screen, 0.8),
+        highlight_color: Color::rgb(1.0, 1.0, 0.9),
+        shadow: FxCommon::new(BlendMode::Multiply, 0.7),
+        shadow_color: Color::rgb(0.1, 0.0, 0.2),
+    }
+}
+
+fn stroke(size: f32, position: StrokePosition, paint: FxPaint) -> StrokeFx {
+    StrokeFx { common: FxCommon::new(BlendMode::Normal, 0.9), size, position, paint }
+}
+
+fn checker_pattern() -> Pattern {
+    let mut s = photocraft_raster::Surface::new(PixelFormat::RGBA8);
+    s.fill_rect(Rect::new(0, 0, 6, 5), &[0.9, 0.2, 0.1, 1.0]);
+    s.fill_rect(Rect::new(0, 0, 3, 3), &[0.1, 0.3, 0.9, 0.6]);
+    s.fill_rect(Rect::new(3, 3, 6, 5), &[0.2, 0.8, 0.3, 1.0]);
+    Pattern::new("checker", s, 6, 5)
+}
+
+/// Every effect kind with several option combinations, one effect stack per case.
+fn effect_cases() -> Vec<(&'static str, Vec<Effect>)> {
+    let pat = checker_pattern();
+    let pat_paint = FxPaint::Pattern { name: pat.name.clone(), id: pat.id.clone(), scale: 1.0 };
+    let mut ds_contour = shadow(BlendMode::Normal, 0.8, 200.0, 4.0, 9.0, 0.35);
+    ds_contour.contour = contour();
+    ds_contour.knocks_out = false;
+    let mut ds_global = shadow(BlendMode::Multiply, 0.75, 0.0, 6.0, 7.0, 0.0);
+    ds_global.use_global_light = true;
+    let mut og_contour = glow(FxPaint::Color(Color::rgb(1.0, 0.9, 0.2)), GlowTechnique::Softer, 9.0, 0.0, GlowSource::Edge);
+    og_contour.contour = contour();
+    let mut satin_inv = Satin { common: FxCommon::new(BlendMode::Multiply, 0.6), color: Color::rgb(0.3, 0.0, 0.4), angle: 19.0, distance: 7.0, size: 8.0, contour: contour(), anti_alias: false, invert: true };
+    let satin = Satin { common: FxCommon::new(BlendMode::Overlay, 0.7), color: Color::rgb(0.9, 0.4, 0.1), angle: 60.0, distance: 5.0, size: 6.0, contour: Contour::Linear, anti_alias: false, invert: false };
+    satin_inv.common.enabled = true;
+    let mut bevel_contour = bevel(BevelStyle::InnerBevel, true, 8.0, 3.0);
+    bevel_contour.gloss_contour = contour();
+    bevel_contour.use_global_light = false;
+    vec![
+        ("drop shadow", vec![Effect::DropShadow(shadow(BlendMode::Multiply, 0.75, 120.0, 6.0, 8.0, 0.0))]),
+        ("drop shadow spread contour", vec![Effect::DropShadow(ds_contour)]),
+        ("drop shadow hard", vec![Effect::DropShadow(shadow(BlendMode::Normal, 1.0, 45.0, 3.0, 0.0, 0.0))]),
+        ("drop shadow global light", vec![Effect::DropShadow(ds_global)]),
+        ("inner shadow", vec![Effect::InnerShadow(shadow(BlendMode::Multiply, 0.8, 120.0, 4.0, 6.0, 0.0))]),
+        ("inner shadow choke", vec![Effect::InnerShadow(shadow(BlendMode::Normal, 0.9, 300.0, 3.0, 7.0, 0.4))]),
+        ("outer glow softer", vec![Effect::OuterGlow(glow(FxPaint::Color(Color::rgb(1.0, 0.9, 0.2)), GlowTechnique::Softer, 10.0, 0.3, GlowSource::Edge))]),
+        ("outer glow contour", vec![Effect::OuterGlow(og_contour)]),
+        ("outer glow precise gradient", vec![Effect::OuterGlow(glow(FxPaint::Gradient(gradient()), GlowTechnique::Precise, 8.0, 0.25, GlowSource::Edge))]),
+        ("inner glow softer edge", vec![Effect::InnerGlow(glow(FxPaint::Color(Color::rgb(0.9, 1.0, 0.8)), GlowTechnique::Softer, 7.0, 0.2, GlowSource::Edge))]),
+        ("inner glow softer center", vec![Effect::InnerGlow(glow(FxPaint::Color(Color::rgb(0.9, 1.0, 0.8)), GlowTechnique::Softer, 6.0, 0.0, GlowSource::Center))]),
+        ("inner glow precise edge", vec![Effect::InnerGlow(glow(FxPaint::Color(Color::rgb(0.2, 1.0, 0.8)), GlowTechnique::Precise, 6.0, 0.3, GlowSource::Edge))]),
+        ("inner glow precise center", vec![Effect::InnerGlow(glow(pat_paint.clone(), GlowTechnique::Precise, 5.0, 0.0, GlowSource::Center))]),
+        ("bevel inner", vec![Effect::BevelEmboss(bevel(BevelStyle::InnerBevel, true, 7.0, 2.0))]),
+        ("bevel outer", vec![Effect::BevelEmboss(bevel(BevelStyle::OuterBevel, true, 6.0, 0.0))]),
+        ("bevel emboss down", vec![Effect::BevelEmboss(bevel(BevelStyle::Emboss, false, 8.0, 1.0))]),
+        ("bevel pillow", vec![Effect::BevelEmboss(bevel(BevelStyle::PillowEmboss, true, 5.0, 4.0))]),
+        ("bevel contour own light", vec![Effect::BevelEmboss(bevel_contour)]),
+        ("satin", vec![Effect::Satin(satin)]),
+        ("satin inverted contour", vec![Effect::Satin(satin_inv)]),
+        ("stroke outside colour", vec![Effect::Stroke(stroke(4.0, StrokePosition::Outside, FxPaint::Color(Color::rgb(0.95, 0.85, 0.1))))]),
+        ("stroke inside gradient", vec![Effect::Stroke(stroke(3.0, StrokePosition::Inside, FxPaint::Gradient(gradient())))]),
+        ("stroke centre pattern", vec![Effect::Stroke(stroke(5.0, StrokePosition::Center, pat_paint.clone()))]),
+        ("colour overlay", vec![Effect::ColorOverlay { common: FxCommon::new(BlendMode::Multiply, 0.7), color: Color::rgb(0.2, 0.7, 0.9) }]),
+        ("gradient overlay", vec![Effect::GradientOverlay { common: FxCommon::new(BlendMode::Normal, 0.8), gradient: Gradient { style: GradientStyle::Radial, ..gradient() }, dither: false }]),
+        ("pattern overlay", vec![Effect::PatternOverlay { common: FxCommon::new(BlendMode::Normal, 0.9), name: pat.name.clone(), id: pat.id.clone(), scale: 1.0, angle: 0.0, link: true, phase: (2.0, 1.0) }]),
+        ("pattern overlay scaled rotated", vec![Effect::PatternOverlay { common: FxCommon::new(BlendMode::Screen, 0.8), name: pat.name.clone(), id: pat.id.clone(), scale: 1.7, angle: 30.0, link: false, phase: (0.0, 0.0) }]),
+        (
+            "multiple instances",
+            vec![
+                Effect::Stroke(stroke(2.0, StrokePosition::Outside, FxPaint::Color(Color::rgb(1.0, 1.0, 1.0)))),
+                Effect::Stroke(stroke(5.0, StrokePosition::Outside, FxPaint::Color(Color::rgb(0.1, 0.1, 0.1)))),
+                Effect::DropShadow(shadow(BlendMode::Multiply, 0.6, 90.0, 4.0, 5.0, 0.0)),
+                Effect::DropShadow(shadow(BlendMode::Normal, 0.5, 270.0, 8.0, 3.0, 0.0)),
+                Effect::ColorOverlay { common: FxCommon::new(BlendMode::Normal, 0.3), color: Color::rgb(1.0, 0.0, 0.0) },
+            ],
+        ),
+        (
+            "full stack",
+            vec![
+                Effect::DropShadow(shadow(BlendMode::Multiply, 0.75, 120.0, 5.0, 6.0, 0.1)),
+                Effect::InnerShadow(shadow(BlendMode::Multiply, 0.5, 120.0, 3.0, 4.0, 0.0)),
+                Effect::OuterGlow(glow(FxPaint::Color(Color::rgb(1.0, 1.0, 0.6)), GlowTechnique::Softer, 6.0, 0.0, GlowSource::Edge)),
+                Effect::InnerGlow(glow(FxPaint::Color(Color::rgb(1.0, 1.0, 0.6)), GlowTechnique::Softer, 4.0, 0.0, GlowSource::Edge)),
+                Effect::BevelEmboss(bevel(BevelStyle::InnerBevel, true, 5.0, 1.0)),
+                Effect::Satin(Satin { common: FxCommon::new(BlendMode::Multiply, 0.4), color: Color::rgb(0.0, 0.0, 0.0), angle: 19.0, distance: 4.0, size: 5.0, contour: Contour::Linear, anti_alias: false, invert: false }),
+                Effect::ColorOverlay { common: FxCommon::new(BlendMode::SoftLight, 0.5), color: Color::rgb(0.9, 0.3, 0.2) },
+                Effect::GradientOverlay { common: FxCommon::new(BlendMode::Overlay, 0.4), gradient: gradient(), dither: false },
+                Effect::Stroke(stroke(3.0, StrokePosition::Outside, FxPaint::Color(Color::rgb(0.0, 0.0, 0.0)))),
+            ],
+        ),
+    ]
+}
+
+/// GPU vs CPU over the whole document: Err with the worst pixel if over the tolerance.
+fn fx_diff(g: &mut Gpu, doc: &Document, what: &str) -> Result<photocraft_gpu::Stats, String> {
+    let cpu = photocraft_compose::flatten(doc);
+    let (out, stats) = photocraft_gpu::render_to_vec_stats(&mut g.comp, &g.device, &g.queue, doc, doc.bounds()).map_err(|e| format!("{what}: {e}"))?;
+    let mut worst = (0.0f32, 0usize);
+    for (i, (c, o)) in cpu.px.iter().zip(&out).enumerate() {
+        let pc = [c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]];
+        let po = [o[0] * o[3], o[1] * o[3], o[2] * o[3], o[3]];
+        for k in 0..4 {
+            let d = (pc[k] - po[k]).abs();
+            if d.is_nan() || d > worst.0 {
+                worst = (if d.is_nan() { 9.0 } else { d }, i);
+            }
+        }
+    }
+    let w = doc.size.width as usize;
+    let (x, y) = (worst.1 % w, worst.1 / w);
+    if worst.0 > TOL {
+        return Err(format!("{what}: max diff {:.2}/255 at ({x},{y}): cpu {:?} gpu {:?}", worst.0 * 255.0, cpu.px[worst.1], out[worst.1]));
+    }
+    Ok(stats)
+}
+
+fn fx_check(g: &mut Gpu, doc: &Document, what: &str) -> photocraft_gpu::Stats {
+    fx_diff(g, doc, what).unwrap_or_else(|e| panic!("{e}"))
+}
+
+#[test]
+fn layer_effects_every_kind() {
+    let Some(mut g) = gpu() else { return };
+    let mut failures = Vec::new();
+    for depth in [SampleType::U8, SampleType::U16] {
+        for (name, fx) in effect_cases() {
+            let mut d = fx_doc(96, 80, depth);
+            d.patterns.push(checker_pattern());
+            let mut l = blob("fx", d.pixel_format(), 46.0, 40.0, 22.0, [0.9, 0.4, 0.2]);
+            l.effects.items = fx;
+            d.layers.push(l);
+            if let Err(e) = fx_diff(&mut g, &d, &format!("{name} {depth:?}")) {
+                failures.push(e);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
+#[test]
+fn layer_effects_opacity_fill_blend_and_off_canvas() {
+    let Some(mut g) = gpu() else { return };
+    let stack = effect_cases().into_iter().find(|(n, _)| *n == "full stack").unwrap().1;
+    for (opacity, fill, blend) in [(0.7, 1.0, BlendMode::Normal), (1.0, 0.0, BlendMode::Normal), (0.6, 0.35, BlendMode::Multiply), (1.0, 0.5, BlendMode::Screen), (0.8, 1.0, BlendMode::Dissolve)] {
+        let mut d = fx_doc(96, 80, SampleType::U8);
+        let mut l = blob("fx", d.pixel_format(), 46.0, 40.0, 22.0, [0.2, 0.6, 0.9]);
+        l.effects.items = stack.clone();
+        l.opacity = opacity;
+        l.fill_opacity = fill;
+        l.blend = blend;
+        d.layers.push(l);
+        fx_check(&mut g, &d, &format!("opacity {opacity} fill {fill} {blend:?}"));
+    }
+    // Shapes partly off the canvas (their effects reach back in) and a masked effect layer.
+    let mut d = fx_doc(90, 70, SampleType::U8);
+    let mut l = blob("edge", d.pixel_format(), 4.0, 66.0, 18.0, [0.9, 0.9, 0.2]);
+    l.effects.items = stack.clone();
+    l.mask = Some(mask(Rect::new(0, 30, 50, 70), 77, 1.0));
+    d.layers.push(l);
+    fx_check(&mut g, &d, "off canvas + mask");
+    // Disabled master switch / disabled items are ignored.
+    let mut d = fx_doc(64, 64, SampleType::U8);
+    let mut l = blob("off", d.pixel_format(), 30.0, 30.0, 14.0, [0.9, 0.2, 0.2]);
+    l.effects.items = stack;
+    if let Effect::DropShadow(s) = &mut l.effects.items[0] {
+        s.common.enabled = false;
+    }
+    d.layers.push(l.clone());
+    fx_check(&mut g, &d, "disabled item");
+    d.layers[1].effects.enabled = false;
+    fx_check(&mut g, &d, "master switch off");
+}
+
+#[test]
+fn layer_effects_on_groups_clipping_and_fills() {
+    let Some(mut g) = gpu() else { return };
+    let ds = Effect::DropShadow(shadow(BlendMode::Multiply, 0.8, 120.0, 5.0, 6.0, 0.0));
+    let st = Effect::Stroke(stroke(3.0, StrokePosition::Outside, FxPaint::Color(Color::rgb(1.0, 1.0, 1.0))));
+    let bv = Effect::BevelEmboss(bevel(BevelStyle::InnerBevel, true, 5.0, 1.0));
+    // Effects on an isolated group and on a pass-through group (rendered isolated).
+    for blend in [BlendMode::Normal, BlendMode::PassThrough] {
+        let mut d = fx_doc(100, 80, SampleType::U8);
+        let a = blob("a", d.pixel_format(), 35.0, 35.0, 16.0, [0.9, 0.3, 0.2]);
+        let mut b = blob("b", d.pixel_format(), 62.0, 45.0, 14.0, [0.2, 0.3, 0.9]);
+        b.blend = BlendMode::Screen;
+        b.effects.items = vec![Effect::InnerGlow(glow(FxPaint::Color(Color::rgb(1.0, 1.0, 0.5)), GlowTechnique::Softer, 4.0, 0.0, GlowSource::Edge))];
+        let mut grp = Layer::group("g", vec![a, b]);
+        grp.blend = blend;
+        grp.opacity = 0.85;
+        grp.effects.items = vec![ds.clone(), st.clone()];
+        d.layers.push(grp);
+        fx_check(&mut g, &d, &format!("group {blend:?}"));
+    }
+    // An effect layer as a clipping base, and a clipped layer with effects.
+    let mut d = fx_doc(100, 80, SampleType::U8);
+    let mut base = blob("base", d.pixel_format(), 45.0, 40.0, 24.0, [0.3, 0.8, 0.4]);
+    base.effects.items = vec![ds.clone(), bv.clone()];
+    let mut c1 = noise_layer("c1", PixelFormat::RGBA8, Rect::new(10, 10, 60, 50), 91, 0.4);
+    c1.clipped = true;
+    c1.blend = BlendMode::Multiply;
+    let mut c2 = blob("c2", d.pixel_format(), 60.0, 50.0, 12.0, [0.9, 0.9, 0.1]);
+    c2.clipped = true;
+    c2.effects.items = vec![st.clone(), ds.clone()];
+    c2.opacity = 0.8;
+    d.layers.extend([base, c1, c2]);
+    fx_check(&mut g, &d, "clipping with effects");
+    // A solid fill layer with a mask and effects; a gradient fill with a stroke.
+    let mut d = fx_doc(90, 70, SampleType::U8);
+    let mut solid = Layer::new("solid", LayerContent::Fill(Fill::Solid(Color::rgb(0.2, 0.5, 0.8))));
+    let mut m = LayerMask::reveal_all();
+    m.surface = photocraft_raster::Surface::with_default(PixelFormat::GRAY8, &[0.0]);
+    m.surface.fill_rect(Rect::new(20, 15, 60, 50), &[1.0]);
+    solid.mask = Some(m);
+    solid.effects.items = vec![ds.clone(), st.clone(), bv];
+    d.layers.push(solid);
+    fx_check(&mut g, &d, "solid fill with effects");
+}
+
+#[test]
+fn layer_effects_update_incrementally() {
+    let Some(mut g) = gpu() else { return };
+    let stack = effect_cases().into_iter().find(|(n, _)| *n == "full stack").unwrap().1;
+    let mut d = fx_doc(700, 600, SampleType::U8);
+    let mut l = blob("fx", d.pixel_format(), 300.0, 280.0, 200.0, [0.9, 0.4, 0.2]);
+    l.effects.items = stack;
+    d.layers.push(l);
+    d.layers.push(noise_layer("plain", PixelFormat::RGBA8, Rect::new(500, 20, 650, 120), 5, 0.0));
+    let first = fx_check(&mut g, &d, "initial");
+    assert!(first.fx_programs > 0 && first.fx_shapes == 1);
+    // An unrelated edit (another layer's pixels, the effect layer's opacity and an effect colour)
+    // reuses every map.
+    d.layers[2].surface_mut().unwrap().fill_rect(Rect::new(520, 30, 560, 60), &[0.0, 1.0, 0.0, 1.0]);
+    d.layers[1].opacity = 0.8;
+    if let Effect::ColorOverlay { color, .. } = &mut d.layers[1].effects.items[6] {
+        *color = Color::rgb(0.1, 0.9, 0.9);
+    }
+    let s = fx_check(&mut g, &d, "unrelated edit");
+    assert_eq!((s.fx_shapes, s.fx_programs), (0, 0), "{s:?}");
+    // A dab on the effect layer recomputes a neighbourhood of it only.
+    d.layers[1].surface_mut().unwrap().fill_rect(Rect::new(290, 270, 330, 300), &[0.1, 0.1, 0.9, 1.0]);
+    let s = fx_check(&mut g, &d, "dab on the effect layer");
+    assert_eq!(s.fx_shapes, 1);
+    assert!(s.fx_pixels < first.fx_pixels / 2, "partial {} vs full {}", s.fx_pixels, first.fx_pixels);
+    // Erasing to the layer's edge grows nothing; erasing all of it empties the effects.
+    d.layers[1].surface_mut().unwrap().fill_rect(Rect::new(80, 60, 200, 200), &[0.0, 0.0, 0.0, 0.0]);
+    fx_check(&mut g, &d, "erase part");
+    // A setting change that keeps the effect reach rebuilds that effect only.
+    if let Effect::DropShadow(s) = &mut d.layers[1].effects.items[0] {
+        s.spread = 0.3;
+    }
+    let s = fx_check(&mut g, &d, "drop shadow spread");
+    assert_eq!(s.fx_programs, 1, "{s:?}");
+    // Moving the layer (new region) rebuilds everything.
+    let moved = {
+        let src = d.layers[1].surface().unwrap();
+        let b = src.content_bounds();
+        let mut dst = photocraft_raster::Surface::new(src.format());
+        dst.write_region(Rect::new(b.x0 + 17, b.y0 - 9, b.x1 + 17, b.y1 - 9), &src.read_region(b));
+        dst
+    };
+    *d.layers[1].surface_mut().unwrap() = moved;
+    fx_check(&mut g, &d, "moved");
+}

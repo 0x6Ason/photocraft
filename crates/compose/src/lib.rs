@@ -268,6 +268,13 @@ fn render_content(layer: &Layer, rect: Rect, cx: &Ctx) -> Option<Buffer> {
     Some(buf)
 }
 
+/// The alpha of `layer`'s own content over `rect` (masks applied, row-major): the shape its
+/// effect maps are built from (for the GPU compositor). Zero for adjustment layers.
+pub fn layer_shape(doc: &Document, layer: &Layer, rect: Rect) -> Vec<f32> {
+    let cx = Ctx { canvas: doc.bounds(), transfer: adjust::Transfer::for_mode(doc.mode), light: doc.global_light, patterns: &doc.patterns };
+    render_content(layer, rect, &cx).map(|b| b.px.iter().map(|p| p[3]).collect()).unwrap_or_else(|| vec![0.0; rect.width() as usize * rect.height() as usize])
+}
+
 pub fn surface_to_buffer(s: &Surface, rect: Rect) -> Buffer {
     let mut px = vec![[0.0f32; 4]; rect.width() as usize * rect.height() as usize];
     s.read_rgba_into(rect, &mut px);

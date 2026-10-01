@@ -146,6 +146,10 @@ fn downsample(buf: &photocraft_compose::Buffer, factor: u32) -> photocraft_compo
 /// The document to render: the committed one, or a clone with the live adjustment preview applied.
 fn display_doc(app: &PhotocraftApp, idx: usize) -> (std::sync::Arc<Document>, u64) {
     let st = &app.session.documents()[idx];
+    // Puppet / Perspective Warp previews hide the layer they draw on a mesh.
+    if let Some(shown) = crate::distort_ui::display_doc(app, idx) {
+        return shown;
+    }
     if let (Some(t), Some(pv)) = (&app.ui.transform, &app.transform_preview)
         && app.session.active_index() == Some(idx)
         && st.doc.layer(photocraft_doc::LayerId(t.layer)).is_some()
@@ -698,6 +702,34 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         let uv = if flip { Rect::from_min_max(pos2(1.0, 0.0), pos2(0.0, 1.0)) } else { Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)) };
         painter.image(tex, img_rect, uv, Color32::WHITE);
     }
+    // Artboards: pasteboard between the boards, outlines and names (artboard_ui.rs).
+    if doc.has_artboards() {
+        let t = crate::theme::Tokens::get(&ctx);
+        let pasteboard = crate::prefs_ui::pasteboard_color(app);
+        let dot_tex = dots(&ctx, &t);
+        for r in crate::artboard_ui::pasteboard_rects(&xf, &doc) {
+            let r = r.intersect(rect);
+            if !r.is_positive() {
+                continue;
+            }
+            match pasteboard {
+                Some(c) => {
+                    painter.rect_filled(r, 0.0, c);
+                }
+                None => {
+                    painter.rect_filled(r, 0.0, t.canvas);
+                    if let Some(id) = dot_tex {
+                        // Same phase as the dots around the document.
+                        let uv = Rect::from_min_max(((r.min - rect.min) / 22.0).to_pos2(), ((r.max - rect.min) / 22.0).to_pos2());
+                        painter.image(id, r, uv, Color32::WHITE);
+                    }
+                }
+            }
+        }
+        if primary {
+            crate::artboard_ui::draw_frames(app, &painter, &xf);
+        }
+    }
 
     // Pixel grid at high zoom (the GPU path draws its own).
     if !on_gpu && pixel_grid && view.zoom >= 12.0 {
@@ -837,6 +869,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         }
         crate::type_tool::draw_overlay(app, &painter, &xf);
         crate::transform_tool::draw_overlay(app, &painter, &xf);
+        crate::distort_ui::draw_overlay(app, &painter, &xf);
         crate::retouch_ui::draw_source_marker(app, &painter, &xf);
         crate::vector_ui::draw_overlay(app, &painter, &xf, &doc);
         // Tool cursors (Photoshop-style).
@@ -1103,6 +1136,9 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
     // View › Snap / Snap To and smart guides (snap_ui.rs).
     let ev = crate::snap_ui::filter_event(app, ev, mods);
     if crate::transform_tool::pointer(app, ev, mods) {
+        return;
+    }
+    if crate::distort_ui::pointer(app, ev, mods) {
         return;
     }
     let tool = app.ui.tool;

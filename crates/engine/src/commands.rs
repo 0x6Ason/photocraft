@@ -780,6 +780,9 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::mode_cmds::specs());
     v.extend(crate::pattern_cmds::specs());
     v.extend(crate::warp_cmds::specs());
+    v.extend(crate::comps_cmds::specs());
+    v.extend(crate::artboard_cmds::specs());
+    v.extend(crate::distort_cmds::specs());
     v
 }
 
@@ -861,6 +864,10 @@ fn combine(a: &Surface, b: &Surface, area: Rect, f: impl Fn(f32, f32) -> f32) ->
 /// `vector_cmds::translate_vectors`).
 pub(crate) fn translate_layer(doc: &Document, l: &mut Layer, dx: i32, dy: i32) {
     use photocraft_algo::resample::translate_surface;
+    // Linked patterns in the layer's effects move with it.
+    if let Some(r) = &mut l.effects.reference {
+        *r = (r.0 + f64::from(dx), r.1 + f64::from(dy));
+    }
     if let Some(m) = &mut l.mask
         && m.linked
     {
@@ -873,6 +880,10 @@ pub(crate) fn translate_layer(doc: &Document, l: &mut Layer, dx: i32, dy: i32) {
             crate::type_cmds::refresh(doc, t);
         }
         LayerContent::Group(g) => {
+            // Moving an artboard moves the board with its contents.
+            if let Some(a) = &mut g.artboard {
+                a.rect = a.rect.translate(dx, dy);
+            }
             for c in &mut g.children {
                 translate_layer(doc, c, dx, dy);
             }

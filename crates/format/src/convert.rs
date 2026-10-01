@@ -186,6 +186,7 @@ fn layer_m(l: &Layer, sink: &mut dyn Sink) -> LayerM {
             enabled: l.effects.enabled,
             items: l.effects.items.clone(),
             psd_raw: opt_blob(&l.effects.psd_raw, sink),
+            reference: l.effects.reference,
         },
         label: l.label,
         content,
@@ -278,7 +279,7 @@ pub(crate) fn doc_m(d: &Document, sink: &mut dyn Sink) -> DocM {
 }
 
 fn effects_m(e: &Effects, sink: &mut dyn Sink) -> EffectsM {
-    EffectsM { enabled: e.enabled, items: e.items.clone(), psd_raw: opt_blob(&e.psd_raw, sink) }
+    EffectsM { enabled: e.enabled, items: e.items.clone(), psd_raw: opt_blob(&e.psd_raw, sink), reference: e.reference }
 }
 
 fn comp_m(c: &LayerComp, sink: &mut dyn Sink) -> LayerCompM {
@@ -375,7 +376,12 @@ impl Loader<'_> {
                     blend: a.blend,
                     opacity: a.opacity,
                     fill_opacity: a.fill_opacity,
-                    effects: Effects { enabled: a.effects.enabled, items: a.effects.items.clone(), psd_raw: self.opt_blob(&a.effects.psd_raw)? },
+                    effects: Effects {
+                        enabled: a.effects.enabled,
+                        items: a.effects.items.clone(),
+                        psd_raw: self.opt_blob(&a.effects.psd_raw)?,
+                        reference: a.effects.reference,
+                    },
                 }),
                 None => None,
             };
@@ -530,6 +536,7 @@ impl Loader<'_> {
                 enabled: m.effects.enabled,
                 items: m.effects.items.clone(),
                 psd_raw: self.opt_blob(&m.effects.psd_raw)?,
+                reference: m.effects.reference,
             },
             label: m.label,
             content,

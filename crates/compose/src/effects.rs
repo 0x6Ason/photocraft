@@ -173,21 +173,124 @@ fn edt_nearest(inside: &[bool], w: usize, h: usize) -> (Vec<f32>, Vec<usize>) {
     (g, nearest)
 }
 
+/// Chamfer distance transform with a 5 × 5 mask of exact Euclidean step lengths (1, √2, √5),
+/// plus the index of the nearest `inside` pixel (0 on inside pixels). Photoshop's effect
+/// distances follow this metric: its stroke corners measure 3.236 = √5 + 1 at offset (1, 3)
+/// and 3.650 = √5 + √2 at (2, 3), where the exact distances are 3.162 and 3.606.
+fn chamfer_nearest(inside: &[bool], w: usize, h: usize) -> (Vec<f32>, Vec<usize>) {
+    chamfer_from(inside.iter().map(|&b| if b { 0.0 } else { CHAMFER_INF }).collect(), w, h)
+}
+
+const CHAMFER_INF: f32 = 1e20;
+
+/// [`chamfer_nearest`] from per-pixel start values (`CHAMFER_INF` = not a seed): the result is
+/// the minimum over seeds of start value + path length, so partly covered seeds can start at
+/// their sub-pixel edge offset.
+fn chamfer_from(mut d: Vec<f32>, w: usize, h: usize) -> (Vec<f32>, Vec<usize>) {
+    const S2: f32 = std::f32::consts::SQRT_2;
+    const S5: f32 = 2.236_068;
+    // Forward-pass neighbours (already visited in raster order); the backward pass mirrors them.
+    const FWD: [(i64, i64, f32); 8] = [(-1, 0, 1.0), (-1, -1, S2), (0, -1, 1.0), (1, -1, S2), (-1, -2, S5), (1, -2, S5), (-2, -1, S5), (2, -1, S5)];
+    let mut near: Vec<usize> = (0..w * h).collect();
+    let (wi, hi) = (w as i64, h as i64);
+    let mut relax = |x: i64, y: i64, sign: i64, d: &mut Vec<f32>, near: &mut Vec<usize>| {
+        let i = (y * wi + x) as usize;
+        let mut best = d[i];
+        let mut bn = near[i];
+        for &(ox, oy, wt) in &FWD {
+            let (nx, ny) = (x + ox * sign, y + oy * sign);
+            if nx < 0 || ny < 0 || nx >= wi || ny >= hi {
+                continue;
+            }
+            let j = (ny * wi + nx) as usize;
+            let c = d[j] + wt;
+            if c < best {
+                best = c;
+                bn = near[j];
+            }
+        }
+        d[i] = best;
+        near[i] = bn;
+    };
+    for y in 0..hi {
+        for x in 0..wi {
+            relax(x, y, 1, &mut d, &mut near);
+        }
+    }
+    for y in (0..hi).rev() {
+        for x in (0..wi).rev() {
+            relax(x, y, -1, &mut d, &mut near);
+        }
+    }
+    (d, near)
+}
+
 /// Distance from each pixel centre outside the shape to the shape's edge.
 /// Pixels with non-zero alpha are inside; the edge inside the nearest such
 /// pixel is placed by its alpha (coverage), as Photoshop does. Inside pixels
 /// get ≤ 0.
 fn dist_outside(s: &Map) -> Vec<f32> {
+    dist_outside_by(s, Metric::Euclidean)
+}
+
+/// Distance metric for effect distance fields.
+#[derive(Clone, Copy, PartialEq)]
+enum Metric {
+    /// Exact Euclidean (spread/choke dilation, glows, bevels).
+    Euclidean,
+    /// 5 × 5 chamfer (strokes; see [`chamfer_nearest`]).
+    Chamfer,
+}
+
+fn nearest(inside: &[bool], w: usize, h: usize, m: Metric) -> (Vec<f32>, Vec<usize>) {
+    match m {
+        Metric::Euclidean => edt_nearest(inside, w, h),
+        Metric::Chamfer => chamfer_nearest(inside, w, h),
+    }
+}
+
+fn dist_outside_by(s: &Map, m: Metric) -> Vec<f32> {
+    if m == Metric::Chamfer {
+        // Seeds start at their sub-pixel edge offset (1 − coverage).
+        let start = s.v.iter().map(|&a| if a > INSIDE_EPS { 1.0 - a.min(1.0) } else { CHAMFER_INF }).collect();
+        let (d, _) = chamfer_from(start, s.w, s.h);
+        return d.iter().zip(&s.v).map(|(d, &a)| if a > INSIDE_EPS { -0.5 } else { d - 0.5 }).collect();
+    }
     let inside: Vec<bool> = s.v.iter().map(|&a| a > INSIDE_EPS).collect();
-    let (d, near) = edt_nearest(&inside, s.w, s.h);
+    let (d, near) = nearest(&inside, s.w, s.h, m);
     (0..d.len()).map(|i| if inside[i] { -0.5 } else { d[i] - 0.5 + (1.0 - s.v[near[i]].min(1.0)) }).collect()
 }
 
 /// Distance from each pixel centre inside the shape to the shape's edge
 /// (≤ 0 outside).
 fn dist_inside(s: &Map) -> Vec<f32> {
+    dist_inside_by(s, Metric::Euclidean)
+}
+
+fn dist_inside_by(s: &Map, m: Metric) -> Vec<f32> {
+    if m == Metric::Chamfer {
+        // Partly covered edge pixels (alpha below their neighbourhood's) are seeds starting at
+        // their coverage, mirroring `dist_outside`: a 25 % edge column puts the edge 0.25 px in.
+        let cov = local_coverage(s);
+        let start = s
+            .v
+            .iter()
+            .zip(&cov.v)
+            .map(|(&a, &c)| {
+                if a <= INSIDE_EPS {
+                    0.0
+                } else if c < 1.0 - INSIDE_EPS {
+                    c
+                } else {
+                    CHAMFER_INF
+                }
+            })
+            .collect();
+        let (d, _) = chamfer_from(start, s.w, s.h);
+        return d.iter().zip(&s.v).map(|(d, &a)| if a <= INSIDE_EPS { -0.5 } else { d - 0.5 }).collect();
+    }
     let outside: Vec<bool> = s.v.iter().map(|&a| a <= INSIDE_EPS).collect();
-    let (d, _) = edt_nearest(&outside, s.w, s.h);
+    let (d, _) = nearest(&outside, s.w, s.h, m);
     d.iter().zip(&outside).map(|(d, o)| if *o { -0.5 } else { d - 0.5 }).collect()
 }
 
@@ -457,7 +560,7 @@ fn paint_pattern(dst: &mut Buffer, m: &Map, patterns: &[Pattern], name: &str, id
 }
 
 #[allow(clippy::too_many_arguments)]
-fn paint_fx(dst: &mut Buffer, m: &Map, p: &FxPaint, shape_bounds: Rect, big: Rect, blend: BlendMode, opacity: f32, patterns: &[Pattern]) {
+fn paint_fx(dst: &mut Buffer, m: &Map, p: &FxPaint, shape_bounds: Rect, anchor: (f64, f64), big: Rect, blend: BlendMode, opacity: f32, patterns: &[Pattern]) {
     match p {
         FxPaint::Color(c) => paint_color(dst, m, rgb(c), blend, opacity),
         FxPaint::Gradient(g) => {
@@ -474,7 +577,7 @@ fn paint_fx(dst: &mut Buffer, m: &Map, p: &FxPaint, shape_bounds: Rect, big: Rec
             )
         }
         FxPaint::Pattern { name, id, scale } => {
-            paint_pattern(dst, m, patterns, name, id, Placement::new(shape_bounds, true, (0.0, 0.0), *scale, 0.0), big, blend, opacity)
+            paint_pattern(dst, m, patterns, name, id, Placement::anchored(anchor, true, (0.0, 0.0), *scale, 0.0), big, blend, opacity)
         }
     }
 }
@@ -611,8 +714,8 @@ pub fn build_maps(layer: &Layer, shape: Vec<f32>, rect: Rect, light: &GlobalLigh
         .collect();
     let has_stroke = items.iter().any(|e| matches!(e, Effect::Stroke(_)));
     let vector_shape = matches!(layer.content, photocraft_doc::LayerContent::Shape(_));
-    let (din, dout) = if has_stroke { (Some(dist_inside(&shape)), Some(dist_outside(&shape))) } else { (None, None) };
-    let vdout = (has_stroke && vector_shape).then(|| dist_outside(&local_coverage(&shape)));
+    let (din, dout) = if has_stroke { (Some(dist_inside_by(&shape, Metric::Chamfer)), Some(dist_outside_by(&shape, Metric::Chamfer))) } else { (None, None) };
+    let vdout = (has_stroke && vector_shape).then(|| dist_outside_by(&local_coverage(&shape), Metric::Chamfer));
     FxMaps { rect, shape, per, outer_bevel, din, dout, vdout }
 }
 
@@ -629,6 +732,8 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
     // Layer bounds (gradients aligned with the layer use the whole layer,
     // independent of the render rect).
     let sb = layer_bounds;
+    // Linked patterns tile from the effects reference point (else the layer's top-left).
+    let anchor = layer.effects.reference.unwrap_or((f64::from(sb.x0), f64::from(sb.y0)));
     let rect = backdrop.rect;
     let before = backdrop.clone();
     // Exterior effects are painted on a backdrop copy extended to `big`.
@@ -657,22 +762,30 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
     for (i, e) in rev() {
         if let Effect::OuterGlow(g) = e {
             let m = fx(i, 0);
-            paint_fx(&mut work, &m, &g.paint, sb, big, g.common.blend, g.common.opacity, patterns);
+            paint_fx(&mut work, &m, &g.paint, sb, anchor, big, g.common.blend, g.common.opacity, patterns);
         }
     }
 
-    // The layer: content at fill opacity, then interior effects.
+    // The layer: content at fill opacity, then interior effects. Interior effects are painted
+    // relative to the layer's shape (alpha = coverage within the shape), then the shape's alpha
+    // applies: a colour overlay at 100 % replaces the colour of a half-transparent edge pixel and
+    // keeps its alpha, as in Photoshop.
     let fill = layer.fill_opacity;
-    let mut lay = Buffer { rect: big, px: content.px.iter().map(|p| [p[0], p[1], p[2], p[3] * fill]).collect() };
-    let full = shape.clone();
+    let inside = |a: f32| a > INSIDE_EPS;
+    let mut lay = Buffer { rect: big, px: content.px.iter().map(|p| [p[0], p[1], p[2], if inside(p[3]) { fill } else { 0.0 }]).collect() };
+    let rel = |m: Map| -> Map {
+        let v = m.v.iter().zip(&shape.v).map(|(m, a)| if inside(*a) { (m / a).min(1.0) } else { 0.0 }).collect();
+        Map { w: m.w, h: m.h, v }
+    };
+    let full = Map { w, h, v: shape.v.iter().map(|a| if inside(*a) { 1.0 } else { 0.0 }).collect() };
     for (_, e) in rev() {
         if let Effect::PatternOverlay { common, name, id, scale, angle, link, phase } = e {
-            paint_pattern(&mut lay, &full, patterns, name, id, Placement::new(sb, *link, *phase, *scale, *angle), big, common.blend, common.opacity);
+            paint_pattern(&mut lay, &full, patterns, name, id, Placement::anchored(anchor, *link, *phase, *scale, *angle), big, common.blend, common.opacity);
         }
     }
     for (_, e) in rev() {
         if let Effect::GradientOverlay { common, gradient, .. } = e {
-            paint_fx(&mut lay, &full, &FxPaint::Gradient(gradient.clone()), sb, big, common.blend, common.opacity, patterns)
+            paint_fx(&mut lay, &full, &FxPaint::Gradient(gradient.clone()), sb, anchor, big, common.blend, common.opacity, patterns)
         }
     }
     for (_, e) in rev() {
@@ -682,25 +795,24 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
     }
     for (i, e) in rev() {
         if let Effect::Satin(s) = e {
-            let m = fx(i, 0);
+            let m = rel(fx(i, 0));
             paint_color(&mut lay, &m, rgb(&s.color), s.common.blend, s.common.opacity);
         }
     }
     for (i, e) in rev() {
         if let Effect::InnerGlow(g) = e {
-            let m = fx(i, 0);
-            paint_fx(&mut lay, &m, &g.paint, sb, big, g.common.blend, g.common.opacity, patterns);
+            let m = rel(fx(i, 0));
+            paint_fx(&mut lay, &m, &g.paint, sb, anchor, big, g.common.blend, g.common.opacity, patterns);
         }
     }
     for (i, e) in rev() {
         if let Effect::InnerShadow(s) = e {
-            let m = fx(i, 0);
+            let m = rel(fx(i, 0));
             paint_color(&mut lay, &m, rgb(&s.color), s.common.blend, s.common.opacity);
         }
     }
-    // Strokes. Outside parts are slid beneath the layer, so the first listed
-    // (top) instance is processed first; inside parts are painted over it,
-    // bottom instance first.
+    // Strokes. Inside parts are painted over the layer (bottom instance first); outside parts
+    // are slid beneath it, so the first listed (top) instance is processed first.
     let strokes: Vec<&photocraft_doc::StrokeFx> = items.iter().filter_map(|e| if let Effect::Stroke(s) = e { Some(s) } else { None }).collect();
     let (din, dout) = match (&maps.din, &maps.dout) {
         (Some(a), Some(b)) if !strokes.is_empty() => (maps.crop_vec(a, big, 0.0), maps.crop_vec(b, big, FAR)),
@@ -711,7 +823,35 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
         StrokePosition::Inside => (st.size, 0.0),
         StrokePosition::Center => (st.size / 2.0, st.size / 2.0),
     };
+    for st in strokes.iter().rev().copied() {
+        let (in_w, _) = widths(st);
+        if in_w <= 0.0 {
+            continue;
+        }
+        let mut m = Map::new(w, h, 0.0);
+        for ((mv, a), dv) in m.v.iter_mut().zip(&shape.v).zip(&din) {
+            *mv = if inside(*a) { (in_w + 0.5 - dv).clamp(0.0, 1.0) } else { 0.0 };
+        }
+        paint_fx(&mut lay, &m, &st.paint, sb, anchor, big, st.common.blend, st.common.opacity, patterns);
+    }
+    for (i, e) in rev() {
+        if let Effect::BevelEmboss(b) = e
+            && !maps.outer_bevel[i]
+        {
+            let (hi, sh) = (rel(fx(i, 0)), rel(fx(i, 1)));
+            paint_color(&mut lay, &hi, rgb(&b.highlight_color), b.highlight.blend, b.highlight.opacity);
+            paint_color(&mut lay, &sh, rgb(&b.shadow_color), b.shadow.blend, b.shadow.opacity);
+        }
+    }
+    // The shape's own alpha.
+    for (p, a) in lay.px.iter_mut().zip(&shape.v) {
+        p[3] *= a.min(1.0);
+    }
     let vdout = maps.vdout.as_ref().filter(|_| vector_shape && !strokes.is_empty()).map(|v| maps.crop_vec(v, big, FAR));
+    // Outside parts lie beneath the layer and blend onto the backdrop with their own mode. A
+    // higher stroke knocks out the ones below it (Photoshop: a Multiply stroke listed above a
+    // wider Normal stroke multiplies the backdrop, not the lower stroke).
+    let mut cover = vec![0.0f32; w * h];
     for st in strokes.iter().copied() {
         let (_, out_w) = widths(st);
         if out_w <= 0.0 {
@@ -721,37 +861,24 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
         // local coverage; the stroke never shows through the shape's pixels.
         let d = vdout.as_ref().unwrap_or(&dout);
         let mut m = Map::new(w, h, 0.0);
-        for ((mv, a), dv) in m.v.iter_mut().zip(&shape.v).zip(d) {
-            *mv = if *a > INSIDE_EPS {
+        for (((mv, a), dv), c) in m.v.iter_mut().zip(&shape.v).zip(d).zip(cover.iter_mut()) {
+            let k = if inside(*a) {
                 if vector_shape { 0.0 } else { 1.0 }
             } else {
                 (out_w + 0.5 - dv).clamp(0.0, 1.0)
             };
+            *mv = k * (1.0 - *c);
+            *c += *mv;
         }
-        let mut under = Buffer::transparent(big);
-        paint_fx(&mut under, &m, &st.paint, sb, big, BlendMode::Normal, st.common.opacity, patterns);
-        for (u, l) in under.px.iter_mut().zip(&lay.px) {
-            *u = psblend::composite(BlendMode::Normal, *u, *l, 1.0);
-        }
-        lay = under;
-    }
-    for st in strokes.iter().rev().copied() {
-        let (in_w, _) = widths(st);
-        if in_w <= 0.0 {
-            continue;
-        }
-        let mut m = Map::new(w, h, 0.0);
-        for ((mv, a), dv) in m.v.iter_mut().zip(&shape.v).zip(&din) {
-            *mv = (in_w + 0.5 - dv).clamp(0.0, 1.0) * a;
-        }
-        paint_fx(&mut lay, &m, &st.paint, sb, big, st.common.blend, st.common.opacity, patterns);
+        paint_fx(&mut work, &m, &st.paint, sb, anchor, big, st.common.blend, st.common.opacity, patterns);
     }
     for (i, e) in rev() {
-        if let Effect::BevelEmboss(b) = e {
-            let (hi, sh, outer) = (fx(i, 0), fx(i, 1), maps.outer_bevel[i]);
-            let dst = if outer { &mut work } else { &mut lay };
-            paint_color(dst, &hi, rgb(&b.highlight_color), b.highlight.blend, b.highlight.opacity);
-            paint_color(dst, &sh, rgb(&b.shadow_color), b.shadow.blend, b.shadow.opacity);
+        if let Effect::BevelEmboss(b) = e
+            && maps.outer_bevel[i]
+        {
+            let (hi, sh) = (fx(i, 0), fx(i, 1));
+            paint_color(&mut work, &hi, rgb(&b.highlight_color), b.highlight.blend, b.highlight.opacity);
+            paint_color(&mut work, &sh, rgb(&b.shadow_color), b.shadow.blend, b.shadow.opacity);
         }
     }
 
@@ -790,6 +917,39 @@ fn mix_premul(a: [f32; 4], b: [f32; 4], k: f32) -> [f32; 4] {
     }
     out[3] = alpha;
     out
+}
+
+/// A distance field of an effect shape, as the map builders above compute it (for the GPU
+/// compositor, which builds the rest of the maps itself; keep in sync with `shadow_map`,
+/// `glow_map`, `bevel_maps` and `build_maps`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FieldKind {
+    /// `dist_outside` of the shape: spread of drop shadows and softer outer glows, precise outer
+    /// and centre glows, bevels.
+    Outside,
+    /// `dist_inside` of the shape: precise edge inner glows, bevels.
+    Inside,
+    /// `dist_outside` of `1 - alpha`: choke of inner shadows, softer inner glows.
+    OutsideInverse,
+    /// Stroke distance outside the shape.
+    StrokeOutside,
+    /// Stroke distance inside the shape.
+    StrokeInside,
+    /// Stroke distance outside a shape layer's outline (from its local coverage).
+    StrokeOutsideVector,
+}
+
+/// The `kind` distance field of the shape `alpha` (row-major `w × h`).
+pub fn distance_field(kind: FieldKind, alpha: Vec<f32>, w: usize, h: usize) -> Vec<f32> {
+    let s = Map { w, h, v: alpha };
+    match kind {
+        FieldKind::Outside => dist_outside(&s),
+        FieldKind::Inside => dist_inside(&s),
+        FieldKind::OutsideInverse => dist_outside(&s.map(|a| 1.0 - a)),
+        FieldKind::StrokeOutside => dist_outside_by(&s, Metric::Chamfer),
+        FieldKind::StrokeInside => dist_inside_by(&s, Metric::Chamfer),
+        FieldKind::StrokeOutsideVector => dist_outside_by(&local_coverage(&s), Metric::Chamfer),
+    }
 }
 
 #[cfg(test)]

@@ -8,10 +8,12 @@
 
 pub mod actions;
 pub mod adjust_ui;
+pub mod artboard_ui;
 pub mod brush_panel;
 pub mod canvas;
 pub mod channel_view;
 pub mod channels_panel;
+pub mod comps_ui;
 pub mod control;
 pub mod dialogs;
 pub mod export_dialog;
@@ -37,6 +39,10 @@ pub mod state;
 pub mod theme;
 pub mod tone;
 pub mod transform_tool;
+pub mod distort_ui;
+pub mod liquify_ui;
+pub mod puppet_ui;
+pub mod perspective_ui;
 pub mod type_tool;
 pub mod vector_ui;
 pub mod view_cmds;
@@ -162,6 +168,8 @@ pub struct PhotocraftApp {
     pub(crate) doc_hist: Option<(DocId, u64, f64, std::sync::Arc<tone::Histograms>)>,
     /// Free Transform preview (document without the moving pixels + their texture).
     pub(crate) transform_preview: Option<transform_tool::TransformPreview>,
+    /// Liquify dialog, Puppet Warp and Perspective Warp sessions (distort_ui).
+    pub(crate) distort: distort_ui::Distort,
     /// Signature of the image we last put on the OS clipboard (to tell ours from other apps').
     os_clip_sig: Option<u64>,
     /// Pointer position over the canvas (document px), for the Info panel and status bar.
@@ -224,6 +232,7 @@ impl PhotocraftApp {
             info_sample: None,
             os_clip_sig: None,
             transform_preview: None,
+            distort: Default::default(),
             tone_hist: None,
             doc_hist: None,
             gpu: None,
@@ -499,6 +508,7 @@ impl eframe::App for PhotocraftApp {
         brush_panel::window(self, &ctx);
         palette::show(self, &ctx);
         dialogs::show(self, &ctx);
+        distort_ui::show(self, &ctx);
         canvas::extra_windows(self, &ctx);
         self.perf.frame(gpu_canvas::now_ms() - t0);
         // Synthetic input is injected one press/release step per frame: keep frames coming until

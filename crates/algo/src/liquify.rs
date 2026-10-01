@@ -40,6 +40,10 @@ pub enum LiquifyTool {
     Thaw,
     /// The Reconstruct… button: scales the whole (unfrozen) field toward zero by `amount` %.
     ReconstructAll,
+    /// Mask Options › Mask All / None / Invert All (whole-field freeze edits).
+    FreezeAll,
+    ThawAll,
+    InvertFreeze,
 }
 
 impl LiquifyTool {
@@ -69,7 +73,15 @@ impl LiquifyTool {
             LiquifyTool::Freeze => "Freeze Mask",
             LiquifyTool::Thaw => "Thaw Mask",
             LiquifyTool::ReconstructAll => "Reconstruct All",
+            LiquifyTool::FreezeAll => "Mask All",
+            LiquifyTool::ThawAll => "Mask None",
+            LiquifyTool::InvertFreeze => "Invert Mask",
         }
+    }
+
+    /// Whole-field operations (no brush, no points).
+    pub fn is_global(self) -> bool {
+        matches!(self, LiquifyTool::ReconstructAll | LiquifyTool::FreezeAll | LiquifyTool::ThawAll | LiquifyTool::InvertFreeze)
     }
 
     /// Tools that act while the brush is held still (each recorded point is a dab).
@@ -203,53 +215,61 @@ impl LiquifyField {
 
     /// Applies one stroke. Returns the document rectangle whose output changed.
     pub fn apply_stroke(&mut self, s: &LiquifyStroke) -> Rect {
-        if s.tool == LiquifyTool::ReconstructAll {
-            let k = (s.amount.unwrap_or(100.0) / 100.0).clamp(0.0, 1.0) as f32;
-            for (v, f) in self.d.iter_mut().zip(&self.freeze) {
-                let m = 1.0 - k * (1.0 - f);
-                v[0] *= m;
-                v[1] *= m;
+        match s.tool {
+            LiquifyTool::ReconstructAll => {
+                let k = (s.amount.unwrap_or(100.0) / 100.0).clamp(0.0, 1.0) as f32;
+                for (v, f) in self.d.iter_mut().zip(&self.freeze) {
+                    let m = 1.0 - k * (1.0 - f);
+                    v[0] *= m;
+                    v[1] *= m;
+                }
+                return self.bounds;
             }
+            LiquifyTool::FreezeAll => self.freeze.fill(1.0),
+            LiquifyTool::ThawAll => self.freeze.fill(0.0),
+            LiquifyTool::InvertFreeze => self.freeze.iter_mut().for_each(|f| *f = 1.0 - *f),
+            _ => {}
+        }
+        if s.tool.is_global() {
             return self.bounds;
         }
-        let pts: Vec<[f64; 3]> = s.points.iter().filter(|p| p.len() >= 2).map(|p| [p[0], p[1], p.get(2).copied().unwrap_or(1.0).clamp(0.0, 1.0)]).collect();
+        let pts: Vec<[f64; 3]> = s.points.iter().filter(|p| p.len() >= 2).map(|p| [p[0], p[1], p.get(2).copied().unwrap_or(1.0)]).collect();
+        let Some(&first) = pts.first() else { return Rect::EMPTY };
+        let mut dirty = self.stroke_begin(s, first);
+        for w in pts.windows(2) {
+            dirty = dirty.union(&self.stroke_segment(s, w[0], w[1]));
+        }
+        dirty
+    }
+
+    /// Starts a stroke at `p` (`[x, y, pressure]`): stationary tools dab once there. Interactive
+    /// callers use this plus [`Self::stroke_segment`] per new point, which is exactly what
+    /// [`Self::apply_stroke`] does with the whole point list.
+    pub fn stroke_begin(&mut self, s: &LiquifyStroke, p: [f64; 3]) -> Rect {
+        if s.tool.is_stationary() && !s.tool.is_global() { self.dab(s, [p[0], p[1]], [0.0, 0.0], p[2].clamp(0.0, 1.0)) } else { Rect::EMPTY }
+    }
+
+    /// Continues a stroke from `a` to `b`: dabs every fifth of the brush radius (a stationary
+    /// tool held still dabs once at `b`).
+    pub fn stroke_segment(&mut self, s: &LiquifyStroke, a: [f64; 3], b: [f64; 3]) -> Rect {
         let mut dirty = Rect::EMPTY;
-        let Some(&first) = pts.first() else { return dirty };
+        let (pa, pb) = (a[2].clamp(0.0, 1.0), b[2].clamp(0.0, 1.0));
+        let len = (b[0] - a[0]).hypot(b[1] - a[1]);
+        if len == 0.0 {
+            return if s.tool.is_stationary() { self.dab(s, [b[0], b[1]], [0.0, 0.0], pb) } else { dirty };
+        }
         let r = (s.size / 2.0).max(0.5);
         let spacing = (r * 0.2).max(0.5);
-        if pts.len() == 1 || pts.windows(2).all(|w| w[0][..2] == w[1][..2]) {
-            // The brush never moved: stationary tools dab at every recorded point, warps do nothing.
-            if !s.tool.is_stationary() {
-                return dirty;
-            }
-            for p in &pts {
-                dirty = dirty.union(&self.dab(s, [p[0], p[1]], [0.0, 0.0], p[2]));
-            }
-            return dirty;
-        }
-        if s.tool.is_stationary() {
-            dirty = dirty.union(&self.dab(s, [first[0], first[1]], [0.0, 0.0], first[2]));
-        }
-        for w in pts.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            let len = (b[0] - a[0]).hypot(b[1] - a[1]);
-            if len == 0.0 {
-                if s.tool.is_stationary() {
-                    dirty = dirty.union(&self.dab(s, [b[0], b[1]], [0.0, 0.0], b[2]));
-                }
-                continue;
-            }
-            let steps = (len / spacing).ceil().max(1.0) as usize;
-            for k in 1..=steps {
-                let t0 = (k - 1) as f64 / steps as f64;
-                let t1 = k as f64 / steps as f64;
-                let c = [a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1];
-                let delta = [(b[0] - a[0]) * (t1 - t0), (b[1] - a[1]) * (t1 - t0)];
-                let pr = a[2] + (b[2] - a[2]) * t1;
-                // Forward Warp centres the dab where the brush was (it drags what is under it).
-                let centre = if s.tool.is_stationary() { c } else { [c[0] - delta[0], c[1] - delta[1]] };
-                dirty = dirty.union(&self.dab(s, centre, delta, pr));
-            }
+        let steps = (len / spacing).ceil().max(1.0) as usize;
+        for k in 1..=steps {
+            let t0 = (k - 1) as f64 / steps as f64;
+            let t1 = k as f64 / steps as f64;
+            let c = [a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1];
+            let delta = [(b[0] - a[0]) * (t1 - t0), (b[1] - a[1]) * (t1 - t0)];
+            let pr = pa + (pb - pa) * t1;
+            // Forward Warp centres the dab where the brush was (it drags what is under it).
+            let centre = if s.tool.is_stationary() { c } else { [c[0] - delta[0], c[1] - delta[1]] };
+            dirty = dirty.union(&self.dab(s, centre, delta, pr));
         }
         dirty
     }
@@ -616,7 +636,7 @@ impl ProxyImage {
         let (bx, by) = (f64::from(self.bounds.x0), f64::from(self.bounds.y0));
         let row = |y: usize, line: &mut [[u8; 4]]| {
             let py = by + (y as f64 + 0.5) * s;
-            for x in x0..x1 {
+            for (x, slot) in line.iter_mut().enumerate().take(x1).skip(x0) {
                 let px = bx + (x as f64 + 0.5) * s;
                 let d = field.sample(px, py);
                 let (u, v) = ((px + d[0] - bx) / s - 0.5, (py + d[1] - by) / s - 0.5);
@@ -624,21 +644,20 @@ impl ProxyImage {
                 let (fu, fv) = ((u - iu) as f32, (v - iv) as f32);
                 let at = |x: f64, y: f64| self.px[(y.clamp(0.0, (self.h - 1) as f64) as usize) * self.w + x.clamp(0.0, (self.w - 1) as f64) as usize];
                 let (a, b, c, e) = (at(iu, iv), at(iu + 1.0, iv), at(iu, iv + 1.0), at(iu + 1.0, iv + 1.0));
-                let mut o = [0u8; 4];
-                for k in 0..4 {
+                *slot = std::array::from_fn(|k| {
                     let v = (a[k] * (1.0 - fu) + b[k] * fu) * (1.0 - fv) + (c[k] * (1.0 - fu) + e[k] * fu) * fv;
-                    o[k] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                }
-                line[x] = o;
+                    (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+                });
             }
         };
         let rows = &mut out[y0 * self.w..y1 * self.w];
+        // A dab's few thousand pixels are faster on this thread than waking the pool.
         #[cfg(not(target_arch = "wasm32"))]
-        {
+        if (x1 - x0) * (y1 - y0) > 150_000 {
             use rayon::prelude::*;
             rows.par_chunks_mut(self.w).enumerate().for_each(|(i, line)| row(y0 + i, line));
+            return;
         }
-        #[cfg(target_arch = "wasm32")]
         rows.chunks_mut(self.w).enumerate().for_each(|(i, line)| row(y0 + i, line));
     }
 
@@ -736,6 +755,16 @@ mod tests {
         th.tool = LiquifyTool::Thaw;
         g.apply_stroke(&th);
         assert!(g.freeze_at(40.0, 32.0) < 0.01);
+        // Mask All / Invert / None.
+        g.apply_stroke(&LiquifyStroke::new(LiquifyTool::FreezeAll, 1.0));
+        assert!(g.freeze.iter().all(|f| *f == 1.0));
+        g.apply_stroke(&LiquifyStroke::new(LiquifyTool::InvertFreeze, 1.0));
+        assert!(g.freeze.iter().all(|f| *f == 0.0));
+        g.apply_stroke(&fr);
+        g.apply_stroke(&LiquifyStroke::new(LiquifyTool::InvertFreeze, 1.0));
+        assert!(g.freeze_at(40.0, 32.0) < 0.01 && g.freeze_at(5.0, 5.0) > 0.99);
+        g.apply_stroke(&LiquifyStroke::new(LiquifyTool::ThawAll, 1.0));
+        assert!(g.freeze.iter().all(|f| *f == 0.0));
     }
 
     #[test]

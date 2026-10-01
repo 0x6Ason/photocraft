@@ -111,6 +111,10 @@ pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: Va
     if let Some(r) = crate::view_cmds::invoke(app, ctx, id, &params) {
         return r;
     }
+    // Liquify dialog, Puppet Warp and Perspective Warp modes (and their control params).
+    if let Some(r) = crate::distort_ui::menu(app, ctx, id, &params) {
+        return r;
+    }
     if let Some(profile) = proof_preset(id) {
         // View › Proof Setup presets: set the proof profile and turn Proof Colors on.
         app.run("view.proofSetup", json!({"profile": profile}))?;

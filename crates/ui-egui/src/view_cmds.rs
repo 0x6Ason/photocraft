@@ -174,6 +174,7 @@ fn panel_tab(app: &PhotocraftApp, id: &str) -> Option<(&'static str, usize)> {
         "window.panel.histogram" => ("navigator", 1),
         "window.panel.navigator" => ("navigator", 0),
         "window.panel.actions" => ("history", 1),
+        "window.panel.layerComps" => ("history", 2),
         "window.panel.history" => ("history", 0),
         "window.panel.channels" => ("layers", 1),
         "window.panel.paths" => ("layers", 2),
@@ -226,6 +227,8 @@ pub fn handles(id: &str) -> bool {
             | "view.twoHundredPercent"
             | "view.printSize"
             | "view.fitLayersOnScreen"
+            | "view.fitArtboardOnScreen"
+            | "window.panel.layerComps"
             | "view.flipHorizontal"
             | "view.pixelAspectRatioCorrection"
             | "view.patternPreview"
@@ -257,6 +260,7 @@ pub fn is_enabled(app: &PhotocraftApp, id: &str) -> Option<bool> {
     Some(match id {
         "view.screenMode.cycle" => app.ui.text_edit.is_none(),
         "view.twoHundredPercent" | "view.printSize" | "view.fitLayersOnScreen" => doc,
+        "view.fitArtboardOnScreen" => app.session.active().is_some_and(|d| d.doc.has_artboards()),
         i if i.starts_with("window.arrange.") => match &i["window.arrange.".len()..] {
             "consolidateAllToTabs" => true,
             "floatInWindow" | "newWindowForDocument" => doc,
@@ -363,6 +367,10 @@ fn wraps(id: &str) -> bool {
             | "file.scripts.imageProcessor"
             | "file.scripts.loadFilesIntoStack"
             | "file.export.layersToFiles"
+            | "file.export.layerCompsToFiles"
+            | "file.export.artboardsToFiles"
+            | "file.export.artboardsToPdf"
+            | "layer.new.artboard"
             | "file.export.colorLookupTables"
             | "view.newGuideLayout"
             | "type.warpText"
@@ -491,6 +499,7 @@ fn run(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, p: &Value) -> Res
             Ok(json!({"zoom": app.ui.views[i].zoom}))
         }
         "view.fitLayersOnScreen" => fit_layers(app),
+        "view.fitArtboardOnScreen" => crate::artboard_ui::fit_artboard(app),
         _ => Err(format!("unhandled {id}")),
     }
 }
@@ -758,6 +767,26 @@ fn front(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<Val
         "file.export.layersToFiles" => {
             let (_, _, name) = doc?;
             dialog(app, json!({"dir": dir, "prefix": name.rsplit_once('.').map_or(name.as_str(), |(a, _)| a), "format": "png", "visibleOnly": true}), json!({"format": ["png", "jpg", "psd", "tiff", "webp", "bmp"]}))
+        }
+        "file.export.layerCompsToFiles" | "file.export.artboardsToFiles" => {
+            let (_, _, name) = doc?;
+            let prefix = name.rsplit_once('.').map_or(name.as_str(), |(a, _)| a).to_string();
+            let fields = if id == "file.export.layerCompsToFiles" {
+                json!({"dir": dir, "prefix": prefix, "format": "png", "selectedOnly": false})
+            } else {
+                json!({"dir": dir, "prefix": prefix, "format": "png"})
+            };
+            dialog(app, fields, json!({"format": ["png", "jpg", "psd", "tiff", "webp", "bmp"]}))
+        }
+        "file.export.artboardsToPdf" => {
+            let (_, _, name) = doc?;
+            let stem = name.rsplit_once('.').map_or(name.as_str(), |(a, _)| a).to_string();
+            dialog(app, json!({"path": format!("{dir}/{stem}.pdf"), "quality": 10}), json!({}))
+        }
+        "layer.new.artboard" => {
+            let (w, h, _) = doc?;
+            let presets: Vec<&str> = std::iter::once("").chain(photocraft_engine::artboard_cmds::PRESETS.iter().map(|p| p.0)).collect();
+            dialog(app, json!({"name": "", "preset": "", "width": w, "height": h, "background": "white"}), json!({"preset": presets, "background": ["white", "black", "transparent"]}))
         }
         "file.export.colorLookupTables" => {
             let (_, _, name) = doc?;

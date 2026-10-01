@@ -26,7 +26,7 @@ pub fn selected(s: &Session) -> Vec<LayerId> {
 
 /// Ids in `ids` that have no ancestor also in `ids` (a selected group already carries its
 /// selected children), bottom-to-top.
-fn top_level(doc: &Document, ids: &[LayerId]) -> Vec<LayerId> {
+pub(crate) fn top_level(doc: &Document, ids: &[LayerId]) -> Vec<LayerId> {
     let walk = doc.walk();
     let paths: Vec<_> = walk.iter().filter(|(_, _, l)| ids.contains(&l.id)).map(|(p, _, l)| (p.clone(), l.id)).collect();
     paths.iter().filter(|(p, _)| !paths.iter().any(|(q, _)| q.len() < p.len() && p.starts_with(q))).map(|(_, id)| *id).collect()

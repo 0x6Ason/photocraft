@@ -27,11 +27,11 @@ fn has_doc(s: &Session) -> std::result::Result<(), String> {
 }
 
 /// The file system is reachable (not on the web).
-fn native(_: &Session) -> std::result::Result<(), String> {
+pub(crate) fn native(_: &Session) -> std::result::Result<(), String> {
     if cfg!(target_arch = "wasm32") { Err("not available on the web (no file system)".into()) } else { Ok(()) }
 }
 
-fn native_doc(s: &Session) -> std::result::Result<(), String> {
+pub(crate) fn native_doc(s: &Session) -> std::result::Result<(), String> {
     native(s)?;
     has_doc(s)
 }
@@ -84,14 +84,14 @@ fn read_file(path: &str) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = std::path::Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
     }
     std::fs::write(path, bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))
 }
 #[cfg(target_arch = "wasm32")]
-fn write_file(path: &str, _bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_file(path: &str, _bytes: &[u8]) -> Result<()> {
     Err(EngineError::Other(format!("cannot write {path}: no file system on the web")))
 }
 
@@ -120,7 +120,7 @@ fn file_name(path: &str) -> String {
     path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
 
-fn stem(path: &str) -> String {
+pub(crate) fn stem(path: &str) -> String {
     let n = file_name(path);
     match n.rfind('.') {
         Some(i) if i > 0 => n[..i].to_string(),
@@ -128,7 +128,7 @@ fn stem(path: &str) -> String {
     }
 }
 
-fn join(dir: &str, name: &str) -> String {
+pub(crate) fn join(dir: &str, name: &str) -> String {
     if dir.is_empty() {
         name.to_string()
     } else if dir.ends_with('/') || dir.ends_with('\\') {
@@ -139,7 +139,7 @@ fn join(dir: &str, name: &str) -> String {
 }
 
 /// A file-name-safe version of a layer name.
-fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     let s: String = name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ' | '.') { c } else { '_' }).collect();
     let s = s.trim().trim_matches('.').to_string();
     if s.is_empty() { "layer".into() } else { s }
@@ -150,7 +150,7 @@ fn import(name: &str, bytes: &[u8]) -> Result<Document> {
 }
 
 /// Encodes `doc` for `path`'s extension. `quality` is Photoshop's 0–12 JPEG scale.
-fn encode(doc: &Document, path: &str, quality: Option<f64>) -> Result<(Vec<u8>, Vec<String>)> {
+pub(crate) fn encode(doc: &Document, path: &str, quality: Option<f64>) -> Result<(Vec<u8>, Vec<String>)> {
     let mut opts = photocraft_io::ExportOptions::default();
     if let Some(q) = quality {
         opts.encode.jpeg_quality = (q.clamp(0.0, 12.0) / 12.0 * 99.0 + 1.0).round() as u8;
@@ -158,17 +158,17 @@ fn encode(doc: &Document, path: &str, quality: Option<f64>) -> Result<(Vec<u8>, 
     photocraft_io::export(doc, path, &opts).map(|r| (r.bytes, r.warnings)).map_err(|e| EngineError::Other(format!("{path}: {e}")))
 }
 
-fn save_doc(doc: &Document, path: &str, quality: Option<f64>) -> Result<Vec<String>> {
+pub(crate) fn save_doc(doc: &Document, path: &str, quality: Option<f64>) -> Result<Vec<String>> {
     let (bytes, warnings) = encode(doc, path, quality)?;
     write_file(path, &bytes)?;
     Ok(warnings)
 }
 
-fn str_param<'a>(p: &'a Value, key: &str, cmd: &str) -> Result<&'a str> {
+pub(crate) fn str_param<'a>(p: &'a Value, key: &str, cmd: &str) -> Result<&'a str> {
     p.get(key).and_then(Value::as_str).filter(|v| !v.is_empty()).ok_or_else(|| EngineError::BadParams { cmd: cmd.into(), msg: format!("missing \"{key}\"") })
 }
 
-fn f64_param(p: &Value, key: &str) -> Option<f64> {
+pub(crate) fn f64_param(p: &Value, key: &str) -> Option<f64> {
     p.get(key).and_then(Value::as_f64).filter(|v| v.is_finite())
 }
 
@@ -940,14 +940,19 @@ fn guides_from_shape(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn clear_canvas_guides(s: &mut Session) -> Result<Value> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
-    if d.doc.guides.vertical.is_empty() && d.doc.guides.horizontal.is_empty() {
+    // Guides inside an artboard belong to it (View › Clear Selected Artboard Guides); the rest
+    // are canvas guides. Without artboards every guide is a canvas guide.
+    let boards: Vec<Rect> = d.doc.artboards().iter().map(|b| b.2.rect).collect();
+    let in_x = move |x: f32| boards.iter().any(|r| f64::from(x) > f64::from(r.x0) && f64::from(x) < f64::from(r.x1));
+    let boards_y: Vec<Rect> = d.doc.artboards().iter().map(|b| b.2.rect).collect();
+    let in_y = move |y: f32| boards_y.iter().any(|r| f64::from(y) > f64::from(r.y0) && f64::from(y) < f64::from(r.y1));
+    let n = d.doc.guides.vertical.iter().filter(|x| !in_x(**x)).count() + d.doc.guides.horizontal.iter().filter(|y| !in_y(**y)).count();
+    if n == 0 {
         return Ok(json!({"cleared": 0}));
     }
-    let n = d.doc.guides.vertical.len() + d.doc.guides.horizontal.len();
-    // Without artboards every guide is a canvas guide.
     s.edit("Clear Canvas Guides", |doc, _| {
-        doc.guides.vertical.clear();
-        doc.guides.horizontal.clear();
+        doc.guides.vertical.retain(|x| in_x(*x));
+        doc.guides.horizontal.retain(|y| in_y(*y));
         Ok(())
     })?;
     Ok(json!({"cleared": n}))

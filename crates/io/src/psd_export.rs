@@ -275,6 +275,17 @@ impl Ex {
             }
             LayerContent::Raster(_) | LayerContent::Group(_) => {}
         }
+        // Effects reference point: written from the field (in place, keeping block order).
+        match l.effects.reference {
+            Some((x, y)) => {
+                let data: Vec<u8> = x.to_be_bytes().into_iter().chain(y.to_be_bytes()).collect();
+                match raw.iter_mut().find(|(k, _)| k == b"fxrp") {
+                    Some(e) => e.1 = data,
+                    None => raw.push((*b"fxrp", data)),
+                }
+            }
+            None => raw.retain(|(k, _)| k != b"fxrp"),
+        }
         if !matches!(l.content, LayerContent::Shape(_)) {
             self.vector_mask_block(l, &mut raw);
         }
@@ -379,6 +390,41 @@ impl Ex {
             }
         }
     }
+}
+
+/// Resource 1026 (Layer › Link Layers): one u16 group id per layer record, in the order
+/// [`Ex::emit`] writes records (a group's bounding divider, its children, then the group).
+/// Imported ids that fit in a u16 are kept, so unchanged files write the same bytes; otherwise
+/// groups are renumbered by first appearance. `None` when no layer is linked.
+fn link_group_resource(layers: &[Layer]) -> Option<Vec<u8>> {
+    fn walk(layers: &[Layer], out: &mut Vec<Option<u64>>) {
+        for l in layers {
+            if let LayerContent::Group(g) = &l.content {
+                out.push(None);
+                walk(&g.children, out);
+            }
+            out.push(l.link_group);
+        }
+    }
+    let mut per = Vec::new();
+    walk(layers, &mut per);
+    if per.iter().all(Option::is_none) {
+        return None;
+    }
+    let fits = per.iter().flatten().all(|&g| (1..=u64::from(u16::MAX)).contains(&g));
+    let mut seen: Vec<u64> = Vec::new();
+    let ids = per.iter().map(|g| match *g {
+        None => 0u16,
+        Some(g) if fits => g as u16,
+        Some(g) => {
+            let i = seen.iter().position(|&s| s == g).unwrap_or_else(|| {
+                seen.push(g);
+                seen.len() - 1
+            });
+            u16::try_from(i + 1).unwrap_or(u16::MAX)
+        }
+    });
+    Some(ids.flat_map(u16::to_be_bytes).collect())
 }
 
 /// Whether the layer's effects still equal what its preserved `lmfx`/`lfx2`
@@ -600,6 +646,9 @@ pub fn document_to_psd_with(doc: &Document, opts: &PsdExportOptions) -> (PsdFile
             data.extend_from_slice(&((c.flatness.max(0.0) * 65536.0) as u32).to_be_bytes());
             resources.push(ImageResource::new(CLIPPING_PATH, data));
         }
+    }
+    if let Some(groups) = link_group_resource(&doc.layers) {
+        resources.push(ImageResource::new(ids::LAYER_GROUP_INFO, groups));
     }
     if let Some(x) = &doc.metadata.xmp {
         resources.push(ImageResource::new(ids::XMP, x.as_bytes().to_vec()));

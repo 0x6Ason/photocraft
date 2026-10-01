@@ -168,9 +168,103 @@ fn parse_any(key: &[u8; 4], data: &[u8], cged: Option<&[u8]>) -> Adjustment {
         b"curv" => parse_curves(data),
         b"selc" => parse_selective(data),
         b"clrL" => parse_lookup(data),
+        b"grdm" => parse_gradient_map(data),
         _ => None,
     };
     parsed.unwrap_or_else(|| unsupported(key, data))
+}
+
+fn be32(d: &[u8], at: usize) -> Option<u32> {
+    d.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// `grdm` (Adobe spec, "Gradient settings"): version (1, or 3 with an interpolation method
+/// key), reverse, dither, [method], name, colour stops (location /4096, midpoint %, colour
+/// space + four u16 components, 2 bytes), transparency stops, then smoothness (/4096) among
+/// noise-gradient fields. Smoothness, midpoints and the method are baked into dense stops like
+/// gradient fills. Noise gradients (no colour stops) and non-RGB stops stay unsupported.
+fn parse_gradient_map(d: &[u8]) -> Option<Adjustment> {
+    let version = be16(d, 0)?;
+    let reverse = *d.get(2)? != 0;
+    let (method, mut at) = match version {
+        1 => (None, 4),
+        3 => (Some(d.get(4..8)?), 8),
+        _ => return None,
+    };
+    at += 4 + be32(d, at)? as usize * 2;
+    let n = usize::from(be16(d, at)?);
+    at += 2;
+    let mut stops = Vec::with_capacity(n);
+    let mut mids = Vec::with_capacity(n);
+    for _ in 0..n {
+        let loc = (be32(d, at)? as f32 / 4096.0).clamp(0.0, 1.0);
+        let mid = be32(d, at + 4)? as f32 / 100.0;
+        if be16(d, at + 8)? != 0 {
+            return None;
+        }
+        let c = |k: usize| be16(d, at + 10 + 2 * k).map(|v| f32::from(v) / 65535.0);
+        stops.push((loc, photocraft_color::Color::rgb(c(0)?, c(1)?, c(2)?)));
+        mids.push(mid);
+        at += 20;
+    }
+    if stops.len() < 2 {
+        return None;
+    }
+    let nt = usize::from(be16(d, at)?);
+    at += 2 + nt * 10 + 2; // transparency stops, expansion count
+    let smooth = f32::from(be16(d, at)?) / 4096.0;
+    // Midpoint k applies to the segment after stop k (in location order).
+    let mut order: Vec<usize> = (0..stops.len()).collect();
+    order.sort_by(|a, b| stops[*a].0.total_cmp(&stops[*b].0));
+    let mids: Vec<f32> = order.iter().skip(1).map(|i| mids[*i]).collect();
+    let baked = crate::gradient_bake::bake(stops, &mids, smooth, crate::gradient_bake::Method::from_code(method));
+    let mut stops: Vec<(f32, [f32; 3])> = baked.iter().map(|(t, c)| (*t, c.to_rgb())).collect();
+    stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Some(Adjustment::GradientMap { stops, reverse })
+}
+
+/// `grdm` version 1 for [`Adjustment::GradientMap`] (Classic interpolation, Smoothness 0, so
+/// the stops are reproduced exactly).
+fn write_gradient_map(stops: &[(f32, [f32; 3])], reverse: bool) -> Vec<u8> {
+    let mut v = Vec::new();
+    put16(&mut v, 1);
+    v.push(u8::from(reverse));
+    v.push(0);
+    let name: Vec<u16> = "Custom".encode_utf16().chain(std::iter::once(0)).collect();
+    v.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    for u in name {
+        put16(&mut v, u);
+    }
+    put16(&mut v, stops.len().min(usize::from(u16::MAX)) as u16);
+    for (t, c) in stops.iter().take(usize::from(u16::MAX)) {
+        v.extend_from_slice(&((t.clamp(0.0, 1.0) * 4096.0).round() as u32).to_be_bytes());
+        v.extend_from_slice(&50u32.to_be_bytes());
+        put16(&mut v, 0);
+        for k in 0..4 {
+            put16(&mut v, if k < 3 { (c[k].clamp(0.0, 1.0) * 65535.0).round() as u16 } else { 0 });
+        }
+        put16(&mut v, 0);
+    }
+    put16(&mut v, 2);
+    for t in [0u32, 4096] {
+        v.extend_from_slice(&t.to_be_bytes());
+        v.extend_from_slice(&50u32.to_be_bytes());
+        put16(&mut v, 255);
+    }
+    put16(&mut v, 2); // expansion count
+    put16(&mut v, 0); // smoothness
+    put16(&mut v, 32); // length
+    put16(&mut v, 0); // mode
+    v.extend_from_slice(&0u32.to_be_bytes()); // random seed
+    put16(&mut v, 0); // showing transparency
+    put16(&mut v, 0); // using vector colour
+    v.extend_from_slice(&2048u32.to_be_bytes()); // roughness
+    put16(&mut v, 3); // colour model
+    for x in [0u16, 0, 0, 0, 0x8000, 0x8000, 0x8000, 0x8000] {
+        put16(&mut v, x);
+    }
+    put16(&mut v, 0);
+    v
 }
 
 /// `selc`: version, method (0 relative / 1 absolute), then 10 CMYK records of i16 percentages;
@@ -368,6 +462,7 @@ pub fn write(adj: &Adjustment) -> Vec<([u8; 4], Vec<u8>)> {
             v.extend_from_slice(&VersionedDescriptor::new(d).to_bytes());
             return vec![(*b"clrL", v)];
         }
+        Adjustment::GradientMap { stops, reverse } if stops.len() >= 2 => return vec![(*b"grdm", write_gradient_map(stops, *reverse))],
         Adjustment::Unsupported { psd_key, raw } => {
             let k = psd_key.as_bytes();
             if k.len() == 4 {
@@ -382,6 +477,42 @@ pub fn write(adj: &Adjustment) -> Vec<([u8; 4], Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gradient_map_v3_methods_and_smoothness() {
+        let classic = vec![(0.0, [0.0, 0.0, 1.0]), (1.0, [1.0, 1.0, 0.0])];
+        let v1 = write_gradient_map(&classic, false);
+        // Version 3 inserts the interpolation method after reverse/dither.
+        let v3 = |m: &[u8; 4]| {
+            let mut v = v1.clone();
+            v[1] = 3;
+            v.splice(4..4, m.iter().copied());
+            v
+        };
+        let at_t = |data: &[u8], t: f32| match parse(b"grdm", data, None, Channels::Rgb) {
+            Adjustment::GradientMap { stops, .. } => {
+                let i = stops.windows(2).position(|w| w[0].0 <= t && t <= w[1].0).unwrap();
+                let (x, y) = (stops[i], stops[i + 1]);
+                let u = (t - x.0) / (y.0 - x.0).max(1e-6);
+                std::array::from_fn::<f32, 3, _>(|k| x.1[k] + (y.1[k] - x.1[k]) * u)
+            }
+            other => panic!("{other:?}"),
+        };
+        let mid = |data: &[u8]| at_t(data, 0.5);
+        let c = mid(&v3(b"Gcls"));
+        assert!((c[0] - 0.5).abs() < 1e-3 && (c[2] - 0.5).abs() < 1e-3, "classic = sRGB lerp {c:?}");
+        let p = mid(&v3(b"Perc"));
+        assert!((p[0] - c[0]).abs() > 0.02, "perceptual differs from classic {p:?}");
+        // Smoothness 100 % (4096) bends a three-stop ramp.
+        let three = vec![(0.0, [0.0; 3]), (0.25, [1.0, 0.0, 0.0]), (0.75, [0.0, 0.0, 1.0]), (1.0, [1.0; 3])];
+        let mut smooth = write_gradient_map(&three, false);
+        let at = smooth.len() - 2 - 16 - 2 - 4 - 2 - 2 - 4 - 2 - 2 - 2;
+        smooth[at..at + 2].copy_from_slice(&4096u16.to_be_bytes());
+        let (a, b) = (at_t(&write_gradient_map(&three, false), 0.4), at_t(&smooth, 0.4));
+        assert!((0..3).any(|k| (a[k] - b[k]).abs() > 1e-3), "{a:?} {b:?}");
+        // Noise gradients (no colour stops) stay unsupported.
+        assert!(matches!(parse(b"grdm", &[0, 1, 0, 0, 0, 0, 0, 0, 0, 0], None, Channels::Rgb), Adjustment::Unsupported { .. }));
+    }
 
     fn rt(a: Adjustment) {
         let blocks = write(&a);
@@ -417,6 +548,7 @@ mod tests {
             per_channel: [pts(&[(0, 10), (255, 255)]), pts(&[(0, 0), (255, 245)]), pts(&[(0, 0), (64, 32), (255, 255)])],
         });
         rt(Adjustment::Unsupported { psd_key: "selc".into(), raw: vec![1, 2, 3] });
+        rt(Adjustment::GradientMap { stops: vec![(0.0, [0.0, 0.0, 0.0]), (0.5, [1.0, 0.0, 0.0]), (1.0, [1.0, 1.0, 1.0])], reverse: true });
         rt(Adjustment::SelectiveColor { relative: true, adjustments: std::array::from_fn(|r| [r as f32 * 10.0 - 40.0, 5.0, -100.0, 100.0]) });
         rt(Adjustment::SelectiveColor { relative: false, adjustments: [[0.0; 4]; 9] });
         let id = photocraft_cms::lutfile::LutFile::identity(5);

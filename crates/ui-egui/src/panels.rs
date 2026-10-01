@@ -246,6 +246,9 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 crate::transform_tool::options_bar(app, ui);
                 return;
             }
+            if crate::distort_ui::options_bar(app, ui) {
+                return;
+            }
             let tool = app.ui.tool;
             if (tool.is_brushlike() && !matches!(tool, Tool::Brush | Tool::Eraser)) || tool == Tool::QuickSelection {
                 brush_preset_chip(ui, &mut app.session.tools.brush);
@@ -615,7 +618,11 @@ fn dock_panels(app: &mut PhotocraftApp, ui: &mut egui::Ui, p: &crate::state::Pan
             }
             if p.history {
                 let mut sel = app.ui.dock_tabs.history;
-                widgets::card(ui, "history", &["History", "Actions"], &mut sel, |ui, tab| if tab == 0 { history(app, ui) } else { crate::actions::panel(app, ui) });
+                widgets::card(ui, "history", &["History", "Actions", "Layer Comps"], &mut sel, |ui, tab| match tab {
+                    0 => history(app, ui),
+                    1 => crate::actions::panel(app, ui),
+                    _ => crate::comps_ui::panel(app, ui),
+                });
                 app.ui.dock_tabs.history = sel;
             }
             if p.layers {
@@ -1572,6 +1579,7 @@ fn properties_body(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         icons::paint(ui, r, icon, 15.0, t.icon);
         let kind = match &layer.content {
             LayerContent::Adjustment(a) => a.label().to_string(),
+            LayerContent::Group(g) if g.artboard.is_some() => "Artboard".to_string(),
             other => format!("{} Layer", other.kind_name()),
         };
         ui.label(RichText::new(kind).color(t.text));
@@ -1581,6 +1589,8 @@ fn properties_body(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     ui.add_space(6.0);
     if let LayerContent::Adjustment(adj) = &layer.content {
         adjustment_controls(app, ui, id, adj);
+    } else if layer.artboard().is_some() {
+        crate::artboard_ui::properties(app, ui, &layer);
     } else {
         layer_controls(app, ui, &layer);
         if matches!(layer.content, LayerContent::Text(_)) {

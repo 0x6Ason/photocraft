@@ -50,6 +50,10 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
     if ctx.egui_wants_keyboard_input() || !app.ui.dialogs.is_empty() {
         return;
     }
+    // Liquify / Puppet Warp / Perspective Warp: ↩ commits, Esc cancels.
+    if crate::distort_ui::keys(app, ctx) {
+        return;
+    }
     // Free Transform: ↩ commits, Esc cancels.
     if app.ui.transform.is_some() {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {

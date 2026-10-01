@@ -145,6 +145,10 @@ pub struct Effects {
     /// Original PSD `lfx2` (`lfxs` on groups) block data (object-effects version + descriptor),
     /// written back verbatim on PSD export. Not duplicated in `Layer::psd_blocks`.
     pub psd_raw: Option<Arc<Vec<u8>>>,
+    /// Effects reference point (PSD `fxrp`): where linked patterns (Pattern Overlay, pattern
+    /// strokes and glows) anchor their tiling. It moves with the layer. `None` = the layer's
+    /// top-left.
+    pub reference: Option<(f64, f64)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

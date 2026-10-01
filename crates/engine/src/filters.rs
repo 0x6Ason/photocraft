@@ -130,6 +130,10 @@ pub fn apply_filter_to_surface(
     selection: Option<&photocraft_raster::Surface>,
     canvas: photocraft_geom::Rect,
 ) -> Option<photocraft_raster::Surface> {
+    // Liquify / Puppet Warp / Perspective Warp smart filters (distort_cmds).
+    if let Some(out) = crate::distort_cmds::apply_to_surface(id, params, surf, canvas) {
+        return Some(out);
+    }
     let fp = params_for(id, params)?;
     let sel_bounds = selection.map(photocraft_raster::Surface::content_bounds);
     let content = surf.content_bounds();

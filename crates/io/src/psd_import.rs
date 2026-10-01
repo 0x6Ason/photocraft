@@ -169,14 +169,22 @@ impl Ctx<'_> {
         let single = rec.block(b"lfx2").or_else(|| rec.block(b"lfxs"));
         if let Some(fx) = rec.block(b"lmfx").or(single) {
             let (enabled, items) = crate::effects_map::parse_lfx2(&fx.data).unwrap_or_else(|| (blocks::effects_enabled(&fx.data), Vec::new()));
-            l.effects = Effects { enabled, items, psd_raw: single.map(|b| Arc::new(b.data.clone())) };
+            l.effects = Effects { enabled, items, psd_raw: single.map(|b| Arc::new(b.data.clone())), reference: None };
         } else if let Some(fx) = rec.block(b"lrFX")
             && !rec.section_type().is_folder()
             && let Some((enabled, items)) = crate::effects_map::parse_lrfx(&fx.data)
         {
             // Legacy effects only on non-group layers (Photoshop ignores
             // them on groups, see psd-tools effects/shape-fx.psd).
-            l.effects = Effects { enabled, items, psd_raw: None };
+            l.effects = Effects { enabled, items, psd_raw: None, reference: None };
+        }
+        // Effects reference point (`fxrp`: two f64, x then y); also left in `psd_blocks`, where
+        // export overwrites it from the field.
+        if let Some(b) = rec.block(b"fxrp")
+            && let (Some(x), Some(y)) = (b.data.get(..8), b.data.get(8..16))
+        {
+            let f = |s: &[u8]| f64::from_be_bytes(s.try_into().unwrap_or([0; 8]));
+            l.effects.reference = Some((f(x), f(y)));
         }
         l.psd_id = rec.layer_id();
         let name = l.name.clone();
@@ -306,6 +314,22 @@ impl Ctx<'_> {
     }
 }
 
+/// Sets `Layer::link_group` from resource 1026's per-record ids (`nodes` and `layers` correspond).
+fn apply_link_groups(nodes: &[LayerNode], layers: &mut [Layer], ids: &[u16]) {
+    for (n, l) in nodes.iter().zip(layers.iter_mut()) {
+        let index = match n {
+            LayerNode::Layer { index } => *index,
+            LayerNode::Group { index, children, .. } => {
+                if let LayerContent::Group(g) = &mut l.content {
+                    apply_link_groups(children, &mut g.children, ids);
+                }
+                *index
+            }
+        };
+        l.link_group = ids.get(index).copied().filter(|&g| g != 0).map(u64::from);
+    }
+}
+
 fn preserved_blocks(rec: &LayerRecord) -> Vec<([u8; 4], Arc<Vec<u8>>)> {
     rec.blocks.iter().filter(|b| !REGENERATED.contains(&&b.key)).map(|b| (b.key, Arc::new(b.data.clone()))).collect()
 }
@@ -430,6 +454,12 @@ pub fn psd_to_document(file: &PsdFile) -> (Document, Vec<String>) {
     if layered {
         let tree = file.layer_tree();
         doc.layers = cx.build(&tree);
+        // Layer › Link Layers: resource 1026 holds one group id per layer record (0 = unlinked).
+        if let Some(Ok(photocraft_psd::resources::ResourceData::LayerGroupInfo(groups))) =
+            file.resources.iter().find(|r| r.id == ids::LAYER_GROUP_INFO).and_then(photocraft_psd::resources::ImageResource::parsed)
+        {
+            apply_link_groups(&tree, &mut doc.layers, &groups);
+        }
         if doc.layers.is_empty()
             && let Ok(all) = &merged
         {
