@@ -9,7 +9,7 @@ use crate::noise::hash01;
 use crate::other::edge_of;
 use crate::{Ctx, PolarMode, RippleSize, SpherizeMode, UndefinedAreas, WaveType};
 
-fn remap(src: &Image, out: Rect, ctx: &Ctx, edge: Edge, f: impl Fn(f32, f32) -> (f32, f32)) -> Vec<f32> {
+pub(crate) fn remap(src: &Image, out: Rect, ctx: &Ctx, edge: Edge, f: impl Fn(f32, f32) -> (f32, f32)) -> Vec<f32> {
     let n = src.ch;
     let mut res = Vec::with_capacity(out.width() as usize * out.height() as usize * n);
     let mut tmp = vec![0.0f32; n];
@@ -23,7 +23,7 @@ fn remap(src: &Image, out: Rect, ctx: &Ctx, edge: Edge, f: impl Fn(f32, f32) -> 
     res
 }
 
-fn centre(b: Rect) -> (f32, f32, f32) {
+pub(crate) fn centre(b: Rect) -> (f32, f32, f32) {
     let (w, h) = (b.width() as f32, b.height() as f32);
     (b.x0 as f32 + w / 2.0, b.y0 as f32 + h / 2.0, w.min(h) / 2.0)
 }

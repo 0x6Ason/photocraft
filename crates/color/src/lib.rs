@@ -148,12 +148,12 @@ impl Color {
     pub const WHITE: Color = Color::rgb(1.0, 1.0, 1.0);
     pub const TRANSPARENT: Color = Color::rgba(0.0, 0.0, 0.0, 0.0);
 
-    /// Convert to display RGB (naive, non-ICC conversion; ICC comes via `convert` later).
+    /// Convert to sRGB (CMYK through the built-in CMYK profile, Lab via D50 formulas).
     pub fn to_rgb(&self) -> [f32; 3] {
         match self.mode {
             ColorMode::Rgb | ColorMode::Indexed | ColorMode::Multichannel => [self.c[0], self.c[1], self.c[2]],
             ColorMode::Grayscale | ColorMode::Bitmap | ColorMode::Duotone => [self.c[0]; 3],
-            ColorMode::Cmyk => convert::cmyk_to_rgb_naive([self.c[0], self.c[1], self.c[2], self.c[3]]),
+            ColorMode::Cmyk => convert::cmyk_to_rgb([self.c[0], self.c[1], self.c[2], self.c[3]]),
             ColorMode::Lab => convert::lab_to_srgb([self.c[0] * 100.0, self.c[1] * 255.0 - 128.0, self.c[2] * 255.0 - 128.0]),
         }
     }
@@ -214,7 +214,9 @@ mod tests {
     fn color_to_rgba8() {
         assert_eq!(Color::WHITE.to_rgba8(), [255, 255, 255, 255]);
         assert_eq!(Color::gray(0.5).to_rgba8(), [128, 128, 128, 255]);
-        let k = Color { mode: ColorMode::Cmyk, c: [0.0, 0.0, 0.0, 1.0], alpha: 1.0 };
-        assert_eq!(k.to_rgba8(), [0, 0, 0, 255]);
+        let w = Color { mode: ColorMode::Cmyk, c: [0.0; 4], alpha: 1.0 };
+        assert_eq!(w.to_rgba8(), [255, 255, 255, 255]);
+        let k = Color { mode: ColorMode::Cmyk, c: [0.75, 0.68, 0.67, 0.9], alpha: 1.0 };
+        assert!(k.to_rgba8()[..3].iter().all(|v| *v < 20), "{:?}", k.to_rgba8());
     }
 }

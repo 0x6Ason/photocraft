@@ -188,7 +188,7 @@ fn fill_json(f: &Fill) -> Value {
         Fill::Gradient { stops, angle, scale, style, reverse } => json!({ "gradient": {
             "stops": stops.iter().map(|(t, c)| json!([t, hex(c)])).collect::<Vec<_>>(),
             "angle": angle, "scale": scale * 100.0, "style": format!("{style:?}").to_ascii_lowercase(), "reverse": reverse } }),
-        Fill::Pattern { name, scale } => json!({ "pattern": name, "scale": scale * 100.0 }),
+        Fill::Pattern { name, scale, .. } => json!({ "pattern": name, "scale": scale * 100.0 }),
     }
 }
 
@@ -223,7 +223,7 @@ fn parse_fill(v: &Value) -> std::result::Result<Option<Fill>, String> {
         }));
     }
     if let Some(name) = v.get("pattern").and_then(Value::as_str) {
-        return Ok(Some(Fill::Pattern { name: name.into(), scale: f64p(v, "scale").unwrap_or(100.0) as f32 / 100.0 }));
+        return Ok(Some(Fill::Pattern { name: name.into(), scale: f64p(v, "scale").unwrap_or(100.0) as f32 / 100.0, id: String::new(), angle: 0.0, link: true, phase: (0.0, 0.0) }));
     }
     Err(format!("unrecognised fill {v}"))
 }
@@ -827,7 +827,7 @@ fn path_stroke(s: &mut Session, p: &Value) -> Result<Value> {
         let surf = l.surface_mut().ok_or_else(|| EngineError::Other("Stroke Path needs a pixel layer".into()))?;
         let mut dmg = Rect::EMPTY;
         for pl in &lines {
-            let mut pts: Vec<photocraft_paint::StrokePoint> = pl.pts.iter().map(|&(x, y)| photocraft_paint::StrokePoint { x, y, pressure: 1.0 }).collect();
+            let mut pts: Vec<photocraft_paint::StrokePoint> = pl.pts.iter().map(|&(x, y)| photocraft_paint::StrokePoint::new(x, y, 1.0)).collect();
             if pl.closed && let Some(first) = pts.first().copied() {
                 pts.push(first);
             }

@@ -29,6 +29,30 @@ impl Image {
         Image { rect, ch: s.channels(), data: s.read_region(rect) }
     }
 
+    /// Reads `rect`, repeating the nearest pixel of `extent` for samples outside it. Photoshop
+    /// treats the canvas edge this way when filtering a layer, so a blur doesn't fade a
+    /// full-canvas layer to transparent at the document edge.
+    pub fn read_clamped(s: &Surface, rect: Rect, extent: Rect) -> Self {
+        let inner = rect.intersect(&extent);
+        if inner.is_empty() || inner == rect {
+            return Self::read(s, rect);
+        }
+        let src = Self::read(s, inner);
+        let mut img = Self::new(rect, src.ch);
+        let ch = src.ch;
+        let w = rect.width() as usize;
+        for y in rect.y0..rect.y1 {
+            let sy = y.clamp(inner.y0, inner.y1 - 1);
+            let row = (y - rect.y0) as usize * w * ch;
+            for x in rect.x0..rect.x1 {
+                let sx = x.clamp(inner.x0, inner.x1 - 1);
+                let d = row + (x - rect.x0) as usize * ch;
+                img.data[d..d + ch].copy_from_slice(src.px(sx, sy));
+            }
+        }
+        img
+    }
+
     /// New zeroed image.
     pub fn new(rect: Rect, ch: usize) -> Self {
         Image { rect, ch, data: vec![0.0; rect.width() as usize * rect.height() as usize * ch] }

@@ -27,6 +27,39 @@ pub fn open(app: &mut PhotocraftApp) -> Result<u64, String> {
     Ok(app.ui.open_dialog(DialogKind::Command, f))
 }
 
+/// Layer › Export As…: the same dialog for just the active layer (trimmed to its pixels).
+pub fn open_layer(app: &mut PhotocraftApp, layer: photocraft_doc::LayerId) -> Result<u64, String> {
+    let st = app.session.active().ok_or("no document")?;
+    let ldoc = photocraft_engine::layer_menu_cmds::layer_document(&st.doc, layer).map_err(|e| e.to_string())?;
+    let id = open(app)?;
+    if let Some(d) = app.ui.dialogs.iter_mut().find(|d| d.id == id) {
+        d.fields.insert("__layer".into(), json!(layer.0));
+        d.fields.insert("__label".into(), json!(format!("Export As: {}", ldoc.name)));
+        d.fields.insert("__w".into(), json!(ldoc.size.width));
+        d.fields.insert("__h".into(), json!(ldoc.size.height));
+    }
+    Ok(id)
+}
+
+/// Layer › Quick Export as PNG.
+pub fn quick_export_layer_png(app: &mut PhotocraftApp, layer: photocraft_doc::LayerId) -> Result<Value, String> {
+    let mut f = Map::new();
+    f.insert("format".into(), json!("png"));
+    f.insert("transparency".into(), json!(true));
+    f.insert("scale".into(), json!(100));
+    f.insert("__layer".into(), json!(layer.0));
+    confirm(app, &f)
+}
+
+/// The document a dialog exports: the whole image, or one layer (`__layer`).
+fn source_document(app: &PhotocraftApp, f: &Map<String, Value>) -> Result<Arc<Document>, String> {
+    let st = app.session.active().ok_or("no document")?;
+    match f.get("__layer").and_then(Value::as_u64) {
+        Some(id) => photocraft_engine::layer_menu_cmds::layer_document(&st.doc, photocraft_doc::LayerId(id)).map(Arc::new).map_err(|e| e.to_string()),
+        None => Ok(st.doc.clone()),
+    }
+}
+
 fn s(f: &Map<String, Value>, k: &str) -> String {
     f.get(k).and_then(Value::as_str).unwrap_or_default().to_string()
 }
@@ -111,20 +144,23 @@ pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Valu
                 crate::widgets::value_field(ui, &mut sc, 1.0..=1000.0, "%", 70.0);
             });
             f.insert("scale".into(), json!(sc.round()));
-            let (w, h) = ((doc.size.width as f32 * sc / 100.0).round(), (doc.size.height as f32 * sc / 100.0).round());
+            let (bw, bh) = (n(f, "__w", f64::from(doc.size.width)) as f32, n(f, "__h", f64::from(doc.size.height)) as f32);
+            let (w, h) = ((bw * sc / 100.0).round(), (bh * sc / 100.0).round());
             ui.label(egui::RichText::new(format!("{w} × {h} px")).color(t.text_dim).size(11.5));
         });
         ui.add_space(12.0);
         // Right: preview + estimated size.
         ui.vertical(|ui| {
-            let key = egui::Id::new(("export-preview", doc.id.0, app.session.active().map_or(0, |s| s.revision)));
+            let layer = f.get("__layer").and_then(Value::as_u64);
+            let key = egui::Id::new(("export-preview", doc.id.0, app.session.active().map_or(0, |s| s.revision), layer));
             let sig = format!("{}{}{}{}", s_fmt(f), n(f, "quality", 85.0), f.get("transparency").map(|v| v.to_string()).unwrap_or_default(), n(f, "scale", 100.0));
             let cached: Option<(String, Option<u64>, Arc<egui::TextureHandle>)> = ui.data(|d| d.get_temp(key));
             let (size, tex) = match cached.filter(|c| c.0 == sig) {
                 Some((_, size, tex)) => (size, tex),
                 None => {
-                    let size = estimate(app, &doc, f);
-                    let img = photocraft_compose::thumbnail(&export_document(&doc, f, Some(360)).unwrap_or_else(|_| (*doc).clone()), 360);
+                    let src = source_document(app, f).unwrap_or_else(|_| doc.clone());
+                    let size = estimate(app, &src, f);
+                    let img = photocraft_compose::thumbnail(&export_document(&src, f, Some(360)).unwrap_or_else(|_| (*src).clone()), 360);
                     let color = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.pixels);
                     let tex = Arc::new(ui.ctx().load_texture("export-preview", color, egui::TextureOptions::LINEAR));
                     ui.data_mut(|d| d.insert_temp(key, (sig, size, tex.clone())));
@@ -147,8 +183,7 @@ pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Valu
 
 /// Export with the dialog's settings: choose a path, render, encode, write.
 pub fn confirm(app: &mut PhotocraftApp, f: &Map<String, Value>) -> Result<Value, String> {
-    let st = app.session.active().ok_or("no document")?;
-    let doc = st.doc.clone();
+    let doc = source_document(app, f)?;
     let stem = doc.name.rsplit_once('.').map_or(doc.name.as_str(), |(a, _)| a).to_string();
     let ext = s_fmt(f);
     let suggested = format!("{stem}.{ext}");

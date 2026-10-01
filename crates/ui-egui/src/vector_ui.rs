@@ -339,14 +339,41 @@ fn color_of(f: &photocraft_doc::Fill) -> Option<Color32> {
 }
 
 /// A colour swatch that opens a picker; returns the new `#rrggbb` when changed.
-fn swatch(ui: &mut egui::Ui, current: Option<Color32>, tip: &str) -> Option<String> {
+fn swatch(ui: &mut egui::Ui, fill: Option<&photocraft_doc::Fill>, tip: &str) -> Option<String> {
     let t = Tokens::get(ui.ctx());
     let (r, resp) = ui.allocate_exact_size(vec2(26.0, 18.0), Sense::click());
-    match current {
-        Some(c) => {
+    let current = fill.and_then(color_of);
+    match (current, fill) {
+        (Some(c), _) => {
             ui.painter().rect_filled(r, 2.0, c);
         }
-        None => {
+        (None, Some(photocraft_doc::Fill::Gradient { stops, .. })) if !stops.is_empty() => {
+            // Gradient fills preview as a left-to-right ramp through their stops.
+            let rgb = |c: &photocraft_doc::Color| {
+                let v = c.to_rgba8();
+                Color32::from_rgb(v[0], v[1], v[2])
+            };
+            let mut mesh = egui::Mesh::default();
+            let mut ramp: Vec<(f32, Color32)> = stops.iter().map(|(p, c)| (p.clamp(0.0, 1.0), rgb(c))).collect();
+            ramp.insert(0, (0.0, ramp[0].1));
+            ramp.push((1.0, ramp[ramp.len() - 1].1));
+            for (i, (p, c)) in ramp.iter().enumerate() {
+                let x = r.left() + r.width() * p;
+                mesh.colored_vertex(egui::pos2(x, r.top()), *c);
+                mesh.colored_vertex(egui::pos2(x, r.bottom()), *c);
+                if i > 0 {
+                    let k = (i as u32) * 2;
+                    mesh.add_triangle(k - 2, k - 1, k);
+                    mesh.add_triangle(k - 1, k, k + 1);
+                }
+            }
+            ui.painter().add(mesh);
+        }
+        (None, Some(_)) => {
+            // Pattern fill: a neutral checker hint.
+            crate::widgets::checker(ui.painter(), r, 4.0);
+        }
+        (None, None) => {
             // "No colour": white with a red slash, like Photoshop.
             ui.painter().rect_filled(r, 2.0, Color32::WHITE);
             ui.painter().line_segment([r.left_bottom(), r.right_top()], Stroke::new(1.5, Color32::from_rgb(220, 40, 40)));
@@ -360,7 +387,7 @@ fn swatch(ui: &mut egui::Ui, current: Option<Color32>, tip: &str) -> Option<Stri
         if egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque) {
             out = Some(format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b()));
         }
-        if current.is_some() && ui.button("No Color").clicked() {
+        if fill.is_some() && ui.button("No Color").clicked() {
             out = Some("none".into());
         }
     });
@@ -382,12 +409,12 @@ pub fn shape_properties(app: &mut PhotocraftApp, ui: &mut egui::Ui, id: photocra
     ui.label(egui::RichText::new("Appearance").font(crate::theme::semibold(12.0)).color(t.text));
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Fill").color(t.text_dim).size(12.0));
-        if let Some(c) = swatch(ui, sh.fill.as_ref().and_then(color_of), "Set shape fill type") {
+        if let Some(c) = swatch(ui, sh.fill.as_ref(), "Set shape fill type") {
             edit = Some(if c == "none" { json!({"fill": null}) } else { json!({"fill": c, "coalesce": key("fill")}) });
         }
         ui.add_space(12.0);
         ui.label(egui::RichText::new("Stroke").color(t.text_dim).size(12.0));
-        if let Some(c) = swatch(ui, sh.stroke.as_ref().and_then(|s| color_of(&s.paint)), "Set shape stroke type") {
+        if let Some(c) = swatch(ui, sh.stroke.as_ref().map(|s| &s.paint), "Set shape stroke type") {
             edit = Some(if c == "none" { json!({"stroke": null}) } else { json!({"stroke": {"color": c, "width": sh.stroke.as_ref().map_or(3.0, |s| s.width)}, "coalesce": key("stroke")}) });
         }
         let mut w = sh.stroke.as_ref().map_or(0.0, |s| s.width);

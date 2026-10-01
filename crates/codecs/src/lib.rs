@@ -27,6 +27,7 @@ pub use crate::options::{
     DecodeOptions, EncodeOptions, ExrCompression, Limits, PngCompression, TiffCompression,
 };
 pub use half::f16;
+pub use crate::codecs::png::encode_indexed as encode_png_indexed;
 
 use crate::codecs::{exr, jpeg, png, pnm, tiff, via_image, webp};
 

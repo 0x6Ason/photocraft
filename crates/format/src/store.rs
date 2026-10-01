@@ -202,6 +202,7 @@ pub(crate) fn load(src: &dyn Source, opts: &LoadOptions) -> Result<Document> {
         fetch: &mut fetch,
         preserve_ids: opts.preserve_ids,
         max_id: 0,
+        id_map: HashMap::new(),
     };
     let doc = loader.document(&m.document)?;
     if opts.preserve_ids && !convert::reserve_ids_through(loader.max_id) {

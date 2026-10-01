@@ -121,25 +121,14 @@ pub fn stroke_bounds(ds: &[Dab]) -> Rect {
     ds.iter().fold(Rect::EMPTY, |r, d| r.union(&dab_rect(d)))
 }
 
-/// Accumulated coverage of a whole stroke: dabs build up (`c ← c + d·(1 − c)`, "flow"), capped at 1.
-/// Returns the stroke bounds and `width × height` coverage values.
+/// Accumulated coverage of a whole stroke: dabs build up (`c ← c + d·(ceil − c)`, "flow"), capped at
+/// each dab's opacity ceiling; stroke-level masks (dual brush, texture) applied. Returns the stroke
+/// bounds and `width × height` coverage values. Uses the full brush engine (tips and dynamics).
 pub fn stroke_coverage(stroke: &Stroke) -> (Rect, Vec<f32>) {
-    let ds = dabs(stroke);
-    let bounds = stroke_bounds(&ds);
-    let w = bounds.width() as usize;
-    let mut cov = vec![0.0f32; w * bounds.height() as usize];
-    for (i, d) in ds.iter().enumerate() {
-        let fp = footprint(d, i, stroke.brush.hardness);
-        let fw = fp.rect.width() as usize;
-        for y in fp.rect.y0..fp.rect.y1 {
-            for x in fp.rect.x0..fp.rect.x1 {
-                let c = fp.cov[(y - fp.rect.y0) as usize * fw + (x - fp.rect.x0) as usize];
-                let o = &mut cov[(y - bounds.y0) as usize * w + (x - bounds.x0) as usize];
-                *o += c * (1.0 - *o);
-            }
-        }
-    }
-    (bounds, cov)
+    let mut r = crate::StrokeRenderer::new(&stroke.brush, None, 1.0);
+    r.push(&stroke.points);
+    r.finish();
+    r.dense_coverage()
 }
 
 /// Index of the alpha channel, if the format has one.
@@ -245,12 +234,13 @@ pub fn apply_dab_stroke(
     if ds.is_empty() {
         return Rect::EMPTY;
     }
-    let bounds = stroke_bounds(&ds);
+    let ctx = crate::BrushContext::new(&stroke.brush);
+    let bounds = ds.iter().fold(Rect::EMPTY, |r, d| r.union(&ctx.dab_rect(d, false)));
     let outer = Rect::new(bounds.x0 - halo, bounds.y0 - halo, bounds.x1 + halo, bounds.y1 + halo);
     let orig = Region::read(target, outer);
     let mut work = orig.clone();
     for (i, d) in ds.iter().enumerate() {
-        effect(&mut work, &footprint(d, i, stroke.brush.hardness));
+        effect(&mut work, &ctx.footprint(d, i));
     }
     let fmt = target.format();
     let a = alpha_index(&fmt);
@@ -357,7 +347,7 @@ mod tests {
     fn stroke(points: &[(f64, f64)], size: f32, hardness: f32) -> Stroke {
         Stroke {
             brush: BrushSettings { size, hardness, spacing: 0.25, pressure_size: false, ..Default::default() },
-            points: points.iter().map(|&(x, y)| StrokePoint { x, y, pressure: 1.0 }).collect(),
+            points: points.iter().map(|&(x, y)| StrokePoint::new(x, y, 1.0)).collect(),
         }
     }
 

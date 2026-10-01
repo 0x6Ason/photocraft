@@ -95,7 +95,10 @@ pub fn document_to_image(doc: &Document, warnings: &mut Vec<String>) -> Result<I
     let canvas = doc.bounds();
     let fmt = doc.pixel_format();
     let n = (w as usize) * (h as usize);
-    let img = if let Some(s) = single_layer(doc) {
+    // Lab has no flat-format layout here: Lab documents always go through the composite.
+    let native = single_layer(doc).filter(|_| fmt.mode != ColorMode::Lab);
+    let mut icc = doc.icc_profile.as_ref().map(|i| i.to_vec());
+    let img = if let Some(s) = native {
         // Native path: keep model and depth.
         let vals = s.read_region(canvas);
         let ch = fmt.channels();
@@ -111,7 +114,10 @@ pub fn document_to_image(doc: &Document, warnings: &mut Vec<String>) -> Result<I
         // The compositor works in RGB; write RGB/gray.
         let gray = fmt.mode == ColorMode::Grayscale;
         if fmt.mode == ColorMode::Cmyk || fmt.mode == ColorMode::Lab {
-            warnings.push(format!("{:?} composite written as RGB (naive conversion, no color management)", fmt.mode));
+            // The compositor renders CMYK/Lab documents in sRGB (CMYK through the built-in
+            // profile), so the file is tagged sRGB.
+            warnings.push(format!("{:?} composite written as sRGB RGB (colour-managed conversion)", fmt.mode));
+            icc = Some(photocraft_cms::Builtin::Srgb.profile().to_bytes().to_vec());
         }
         let layout = layout_for(if gray { ColorMode::Grayscale } else { ColorMode::Rgb }, !opaque);
         let mut data = Vec::with_capacity(n * layout.channels());
@@ -133,13 +139,20 @@ pub fn document_to_image(doc: &Document, warnings: &mut Vec<String>) -> Result<I
         dpi: Some((doc.resolution_dpi, doc.resolution_dpi)),
         text: Vec::new(),
     };
-    Ok(img.with_icc(doc.icc_profile.as_ref().map(|i| i.to_vec())).with_meta(meta))
+    Ok(img.with_icc(icc).with_meta(meta))
 }
 
 /// Flattens and encodes as `format`.
 pub fn export_flat(doc: &Document, format: Format, opts: &ExportOptions) -> Result<ExportResult, IoError> {
+    if let Some(r) = export_mode_specific(doc, format, opts)? {
+        return Ok(r);
+    }
     let mut warnings = Vec::new();
-    let img = document_to_image(doc, &mut warnings)?;
+    let mut img = document_to_image(doc, &mut warnings)?;
+    if img.layout().is_cmyk() && !format.caps().layouts.iter().any(|l| l.is_cmyk()) {
+        img = cmyk_image_to_srgb(&img)?;
+        warnings.push(format!("CMYK converted to sRGB for {format:?} through the document's colour profile"));
+    }
     for w in codecs::fidelity_warnings_with(&img, format, &opts.encode) {
         if w.is_fatal() {
             return Err(IoError::Unsupported(w.to_string()));
@@ -148,4 +161,63 @@ pub fn export_flat(doc: &Document, format: Format, opts: &ExportOptions) -> Resu
     }
     let bytes = codecs::encode(&img, format, &opts.encode)?;
     Ok(ExportResult { bytes, warnings })
+}
+
+/// Colour-managed CMYK → sRGB for formats that cannot store CMYK (the document's embedded
+/// CMYK profile when it parses, else the built-in coated CMYK; relative colorimetric + BPC).
+fn cmyk_image_to_srgb(img: &Image) -> Result<Image, IoError> {
+    use photocraft_cms::{Builtin, ColorSpace, Intent, Profile, Transform};
+    let src = img
+        .icc
+        .as_ref()
+        .and_then(|b| Profile::parse(b).ok())
+        .filter(|p| p.color_space == ColorSpace::Cmyk)
+        .unwrap_or_else(|| Builtin::CoatedCmyk.profile().clone());
+    let dst = Builtin::Srgb.profile();
+    let t = Transform::new(&src, dst, Intent::RelativeColorimetric, true).map_err(|e| IoError::Unsupported(e.to_string()))?;
+    let alpha = img.layout().has_alpha();
+    let (ss, ds) = (if alpha { 5 } else { 4 }, if alpha { 4 } else { 3 });
+    let vals = img.to_normalized();
+    let mut out = vec![0.0f32; img.pixel_count() * ds];
+    t.convert_f32(&vals, ss, &mut out, ds, true);
+    let (w, h) = img.dimensions();
+    let layout = if alpha { ChannelLayout::Rgba } else { ChannelLayout::Rgb };
+    let sample = match img.sample_type() {
+        CSample::F16 => CSample::F32,
+        s => s,
+    };
+    Ok(Image::from_normalized(w, h, layout, sample, &out)?.with_icc(Some(dst.to_bytes().to_vec())).with_meta(img.meta.clone()))
+}
+
+/// Indexed Color → PNG-8 with its colour table; Duotone → the inks rendered as RGB.
+fn export_mode_specific(doc: &Document, format: Format, opts: &ExportOptions) -> Result<Option<ExportResult>, IoError> {
+    match doc.mode {
+        ColorMode::Indexed if format == Format::Png => {
+            let Some(table) = doc.color_table.as_ref().filter(|t| !t.colors.is_empty() && t.colors.len() <= 256) else { return Ok(None) };
+            let buf = photocraft_compose::flatten(doc);
+            let idx: Vec<u8> = buf
+                .px
+                .iter()
+                .map(|p| match table.transparent {
+                    Some(t) if p[3] < 0.5 => t,
+                    _ => table.nearest([p[0], p[1], p[2]]) as u8,
+                })
+                .collect();
+            let bytes = codecs::encode_png_indexed(doc.size.width, doc.size.height, &idx, &table.colors, table.transparent)?;
+            Ok(Some(ExportResult { bytes, warnings: vec![format!("written as an 8-bit palette PNG ({} colours)", table.colors.len())] }))
+        }
+        ColorMode::Duotone => {
+            let Some(d) = doc.duotone.as_ref() else { return Ok(None) };
+            let mut shown = doc.clone();
+            shown.layers.push(photocraft_doc::Layer::new("Duotone", photocraft_doc::LayerContent::Adjustment(d.display_adjustment())));
+            shown.mode = ColorMode::Rgb;
+            shown.icc_profile = None;
+            shown.duotone = None;
+            let mut r = export_flat(&shown, format, opts)?;
+            r.warnings.retain(|w| !w.contains("flattened"));
+            r.warnings.push(format!("Duotone ({} inks) written as RGB", d.inks.len()));
+            Ok(Some(r))
+        }
+        _ => Ok(None),
+    }
 }

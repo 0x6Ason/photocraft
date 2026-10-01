@@ -75,10 +75,19 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
     // Inline type editing eats text and navigation keys; ⌘-shortcuts still reach the menus.
     let editing = crate::type_tool::handle_keys(app, ctx);
     // Registry + UI command shortcuts, most-modifiers first so ⇧⌘Z wins over ⌘Z.
+    // Edit › Keyboard Shortcuts overrides replace the defaults (and can bind any menu item).
+    let prefs = app.session.prefs();
     let mut all: Vec<(String, KeyboardShortcut)> = crate::menus::UI_COMMANDS
         .iter()
-        .filter_map(|(id, _, _, sc)| Some((id.to_string(), parse((*sc)?)?)))
-        .chain(photocraft_engine::command_specs().iter().filter_map(|c| Some((c.id.to_string(), parse(c.shortcut?)?))))
+        .filter_map(|(id, _, _, sc)| Some((id.to_string(), parse(prefs.shortcut(id, *sc)?)?)))
+        .chain(photocraft_engine::command_specs().iter().filter_map(|c| Some((c.id.to_string(), parse(prefs.shortcut(c.id, c.shortcut)?)?))))
+        .chain(
+            prefs
+                .shortcuts
+                .iter()
+                .filter(|(id, sc)| !sc.is_empty() && photocraft_engine::commands::find(id).is_none() && !crate::menus::UI_COMMANDS.iter().any(|c| c.0 == id.as_str()))
+                .filter_map(|(id, sc)| Some((id.clone(), parse(sc)?))),
+        )
         .filter(|(_, sc)| sc.modifiers != Modifiers::NONE || !matches!(sc.logical_key, Key::X | Key::D))
         .collect();
     all.sort_by_key(|(_, sc)| std::cmp::Reverse(sc.modifiers.shift as u8 + sc.modifiers.alt as u8 + sc.modifiers.command as u8));
@@ -124,12 +133,17 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
             return;
         }
     }
-    // Tool keys; pressing the key of the current group cycles within it (Photoshop's Shift+key cycle).
+    // Tool keys; pressing the key of the current group cycles within it. With Preferences ›
+    // Tools › Use Shift Key for Tool Switch, only ⇧+key cycles and the plain key keeps the
+    // group's current tool.
+    let shift_switch = app.session.prefs().tools.use_shift_key_for_tool_switch;
     for t in Tool::ALL {
         let Some(k) = Key::from_name(&t.key().to_string()) else { continue };
-        if pressed(k) {
+        let cycle_shift = shift_switch && ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, k));
+        if cycle_shift || pressed(k) {
             let group: Vec<Tool> = Tool::ALL.iter().copied().filter(|x| x.key() == t.key()).collect();
             app.ui.tool = match group.iter().position(|x| *x == app.ui.tool) {
+                Some(i) if shift_switch && !cycle_shift => group[i],
                 Some(i) => group[(i + 1) % group.len()],
                 None => group[0],
             };

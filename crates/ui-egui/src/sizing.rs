@@ -10,7 +10,33 @@ use crate::PhotocraftApp;
 use crate::state::DialogKind;
 use crate::theme::Tokens;
 
-const UNITS: [(&str, &str); 4] = [("px", "Pixels"), ("percent", "Percent"), ("in", "Inches"), ("cm", "Centimeters")];
+const UNITS: [(&str, &str); 7] = [("px", "Pixels"), ("percent", "Percent"), ("in", "Inches"), ("cm", "Centimeters"), ("mm", "Millimeters"), ("pt", "Points"), ("pica", "Picas")];
+
+/// Dialog unit for the Units & Rulers preference.
+fn pref_unit(u: photocraft_engine::prefs::Unit) -> &'static str {
+    use photocraft_engine::prefs::Unit;
+    match u {
+        Unit::Pixels => "px",
+        Unit::Percent => "percent",
+        Unit::Inches => "in",
+        Unit::Centimeters => "cm",
+        Unit::Millimeters => "mm",
+        Unit::Points => "pt",
+        Unit::Picas => "pica",
+    }
+}
+
+/// Image Size resampling for Preferences › General › Image Interpolation.
+fn pref_resample(i: photocraft_engine::prefs::Interpolation) -> &'static str {
+    use photocraft_engine::prefs::Interpolation;
+    match i {
+        Interpolation::Nearest => "nearest",
+        Interpolation::Bilinear => "bilinear",
+        Interpolation::BicubicSharper => "lanczos",
+        Interpolation::PreserveDetails => "preserveDetails",
+        _ => "bicubic",
+    }
+}
 const ANCHORS: [&str; 9] = ["topLeft", "top", "topRight", "left", "center", "right", "bottomLeft", "bottom", "bottomRight"];
 
 pub fn is_sizing(command: &str) -> bool {
@@ -18,6 +44,8 @@ pub fn is_sizing(command: &str) -> bool {
 }
 
 pub fn open(app: &mut PhotocraftApp, command: &str) -> Option<u64> {
+    let unit = pref_unit(app.session.prefs().units_and_rulers.rulers);
+    let resample = pref_resample(app.session.prefs().general.image_interpolation);
     let d = &app.session.active()?.doc;
     let (w, h, res) = (d.size.width as f64, d.size.height as f64, d.resolution_dpi as f64);
     let label = photocraft_engine::commands::find(command).map(|c| c.label).unwrap_or("Image Size…");
@@ -28,14 +56,14 @@ pub fn open(app: &mut PhotocraftApp, command: &str) -> Option<u64> {
     f.insert("__origW".into(), json!(w));
     f.insert("__origH".into(), json!(h));
     f.insert("__origRes".into(), json!(res));
-    f.insert("__unit".into(), json!("px"));
+    f.insert("__unit".into(), json!(unit));
     f.insert("__bytesPerPixel".into(), json!(d.layers.first().and_then(|l| l.surface()).map_or(4, |s| s.format().bytes_per_pixel())));
     f.insert("width".into(), json!(w));
     f.insert("height".into(), json!(h));
     if command == "image.imageSize" {
         f.insert("__constrain".into(), json!(true));
         f.insert("resolution".into(), json!(res));
-        f.insert("resample".into(), json!("bicubic"));
+        f.insert("resample".into(), json!(resample));
     } else {
         f.insert("relative".into(), json!(false));
         f.insert("anchor".into(), json!("center"));
@@ -54,6 +82,9 @@ fn to_unit(px: f64, unit: &str, orig: f64, res: f64) -> f64 {
         "percent" => px / orig.max(1.0) * 100.0,
         "in" => px / res.max(1.0),
         "cm" => px / res.max(1.0) * 2.54,
+        "mm" => px / res.max(1.0) * 25.4,
+        "pt" => px / res.max(1.0) * 72.0,
+        "pica" => px / res.max(1.0) * 6.0,
         _ => px,
     }
 }
@@ -63,6 +94,9 @@ fn from_unit(v: f64, unit: &str, orig: f64, res: f64) -> f64 {
         "percent" => v * orig / 100.0,
         "in" => v * res,
         "cm" => v / 2.54 * res,
+        "mm" => v / 25.4 * res,
+        "pt" => v / 72.0 * res,
+        "pica" => v / 6.0 * res,
         _ => v,
     }
 }
@@ -329,7 +363,7 @@ mod tests {
 
     #[test]
     fn unit_conversions_round_trip() {
-        for unit in ["px", "percent", "in", "cm"] {
+        for unit in ["px", "percent", "in", "cm", "mm", "pt", "pica"] {
             let v = to_unit(1500.0, unit, 3000.0, 300.0);
             assert!((from_unit(v, unit, 3000.0, 300.0) - 1500.0).abs() < 1e-9, "{unit}");
         }

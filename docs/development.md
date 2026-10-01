@@ -13,6 +13,7 @@ cargo run --release -p photocraft -- --control 7878 img.jpg # with the JSON cont
 cargo test --workspace                                     # everything
 cargo xtask ci                                             # fmt + clippy + tests + layers + wasm
 cargo xtask stats                                          # tests and lines per crate
+cargo xtask parity                                         # Photoshop menu coverage -> docs/parity.md
 ```
 
 Image code is slow at `opt-level 0`, so the workspace profile builds dependencies at `opt-level 2`. Use `--release` for anything interactive.
@@ -24,6 +25,7 @@ Image code is slow at `opt-level 0`, so the workspace profile builds dependencie
 | `PHOTOCRAFT_CONTROL_PORT` | Same as `--control <port>` |
 | `PHOTOCRAFT_CPU_CANVAS=1` | Force the CPU canvas path instead of the wgpu shader canvas |
 | `PHOTOCRAFT_GPU_TILE=2048` | Force GPU canvas tiling (tests tile seams) |
+| `PHOTOCRAFT_FX_NOCACHE=1` | Bypass the layer-effect map cache (`compose::effect_maps`) |
 | `PHOTOCRAFT_THEME_FILE=tokens.json` | **Debug builds only:** live design-token overrides, re-read on change |
 
 ### Live design tokens
@@ -113,6 +115,13 @@ cargo build --release -p photocraft-cli
 claude mcp add photocraft -- "$PWD/target/release/photocraft-cli" mcp
 ```
 
+`doc_inspect` (and the engine command `document.inspect`) reports the layer tree with kinds,
+bounds, masks, selection, effects (`effects.items[].kind`), smart filters (`smartFilters[]`), type
+text, adjustment settings, channels and history, so agents can verify what they did without a
+screenshot. `crates/automation/tests/agent_tasks.rs` is the reference: ten realistic edit tasks
+(title card, colour grade, undo/redo, editable smart blur, masks, saved selections, align, layer
+export, resize/crop, CMYK + native save) driven purely over MCP.
+
 A typical agent loop:
 
 1. `doc_open {path}`
@@ -120,6 +129,25 @@ A typical agent loop:
 3. `command_run {id:"filter.blur.gaussian", params:{radius:4}}`
 4. `doc_render_preview` to check the result
 5. `doc_save {path:"out.pcraft"}`
+
+## Colour management
+
+`crates/cms` is our own pure-Rust ICC engine (v2/v4 parsing, matrix/TRC and LUT profiles, all four
+intents, black point compensation). It ships CC0 built-in profiles, including a synthetic
+"Photocraft Coated CMYK", because Adobe's CMYK profiles are proprietary (see `crates/cms/README.md`).
+
+- Documents carry an optional embedded ICC profile (`Document::icc_profile`); `edit.assignProfile`
+  and `edit.convertToProfile` change it. Mode changes (`image.mode.*`) convert through cms.
+- **Proof Colors** (⌘Y), **Proof Setup** and **Gamut Warning** (⇧⌘Y) bake a 3D LUT
+  (`cms::Lut3d`) that the canvas shader applies; the document pixels never change.
+- Convert colours with `photocraft_cms::transform::cached(src, dst, opts)`: transforms are cached
+  process-wide and integer buffers use precomputed tables or a device link.
+
+## Menu parity
+
+`cargo xtask parity` compares Photoshop's menu tree (`crates/ui-egui/src/menu_catalog.rs`) with
+the live command registry (`menus::is_live`) and rewrites [`docs/parity.md`](parity.md). The test
+`parity::tests::parity_does_not_regress` fails if the live count drops below `parity::FLOOR`.
 
 ## Testing strategy
 
@@ -136,7 +164,9 @@ A typical agent loop:
 ## Performance notes
 
 - The canvas is presented by a custom WGSL shader (`ui-egui/src/gpu_canvas.rs`): mip-mapped/nearest sampling, procedural checkerboard, pixel grid, tiling. Brush strokes upload only their damage rect.
-- **Compositing is still CPU** (`photocraft-compose`). Live adjustment previews on large documents use a downsampled proxy (`ui-egui/src/proxy.rs`). The GPU compositor is milestone M5.
+- **The canvas composites on the GPU** (`photocraft-gpu`, driven from `gpu_canvas.rs`). Anything the GPU planner can't express (layer effects, layers clipped to pass-through groups, documents over the texture limit) returns `Unsupported` and falls back to the CPU compositor (`photocraft-compose`), which is also the reference for export and tests.
+- **Layer effects** are expensive. `compose::effect_maps` caches shadow, glow, bevel and satin maps per layer state (LRU, 768 MB budget).
+- Live adjustment previews on large documents use a downsampled proxy (`ui-egui/src/proxy.rs`).
 - `ui.inspect` returns `perf` timings (UI ms per frame, composite ms, upload ms).
 - Never scan full surfaces per frame. Cache per document revision (`PhotocraftApp::cached_bounds`). An uncached `content_bounds()` on a 36 MP layer once cost 77 ms per frame.
 

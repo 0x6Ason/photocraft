@@ -103,6 +103,16 @@ pub fn effect_from_params(kind: &str, p: &Value) -> Option<Effect> {
         }),
         "colorOverlay" => Effect::ColorOverlay { common: common(p, BlendMode::Normal, 1.0), color: color(p, "color", [1.0, 0.0, 0.0]) },
         "gradientOverlay" => Effect::GradientOverlay { common: common(p, BlendMode::Normal, 1.0), gradient: gradient(p), dither: false },
+        // `name` carries the requested pattern key; `set_effect` resolves it (pattern_cmds).
+        "patternOverlay" => Effect::PatternOverlay {
+            common: common(p, BlendMode::Normal, 1.0),
+            name: p.get("pattern").and_then(Value::as_str).unwrap_or("").to_string(),
+            id: String::new(),
+            scale: (f(p, "scale", 100.0) / 100.0).clamp(0.01, 10.0),
+            angle: f(p, "angle", 0.0),
+            link: b(p, "link", true),
+            phase: (f(p, "phaseX", 0.0), f(p, "phaseY", 0.0)),
+        },
         "satin" => Effect::Satin(Satin {
             common: common(p, BlendMode::Multiply, 0.5),
             color: color(p, "color", [0.0; 3]),
@@ -145,6 +155,7 @@ fn same_kind(a: &Effect, b: &Effect) -> bool {
 
 fn set_effect(s: &mut Session, p: &Value, kind: &str) -> Result<Value> {
     let fx = effect_from_params(kind, p).ok_or_else(|| EngineError::Other(format!("unknown effect {kind}")))?;
+    let (fx, pattern) = crate::pattern_cmds::resolve_effect(s, fx)?;
     let label = format!("Layer Style: {}", fx.label());
     let add = b(p, "add", false);
     let id = match p.get("layer").and_then(Value::as_u64) {
@@ -152,6 +163,9 @@ fn set_effect(s: &mut Session, p: &Value, kind: &str) -> Result<Value> {
         None => s.active().and_then(|d| d.active_layer).ok_or(EngineError::Other("no active layer".into()))?,
     };
     s.edit(&label, |doc, _| {
+        if let Some(pat) = &pattern {
+            crate::pattern_cmds::ensure_in_doc(doc, pat);
+        }
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
         l.effects.enabled = true;
         match l.effects.items.iter_mut().find(|e| same_kind(e, &fx)) {
@@ -193,6 +207,7 @@ pub fn specs() -> Vec<CommandSpec> {
         style_cmd!("stroke", "Stroke…", r##"{"size":px=3,"position":"outside|inside|center","color":"#rrggbb","from":"#rrggbb","to":"#rrggbb","style":str,"angle":deg,"opacity":0..100,"blend":str,"add":bool}"##),
         style_cmd!("colorOverlay", "Color Overlay…", r##"{"color":"#rrggbb","opacity":0..100=100,"blend":str,"add":bool}"##),
         style_cmd!("gradientOverlay", "Gradient Overlay…", r##"{"from":"#rrggbb","to":"#rrggbb","style":"linear|radial|angle|reflected|diamond","angle":deg=90,"scale":10..150=100,"reverse":bool,"opacity":0..100,"blend":str,"add":bool}"##),
+        style_cmd!("patternOverlay", "Pattern Overlay…", r##"{"pattern":id|name?=first library pattern,"opacity":0..100=100,"blend":str,"scale":1..1000=100,"angle":deg=0,"link":bool=true,"phaseX":px,"phaseY":px,"add":bool}"##),
         style_cmd!("bevelEmboss", "Bevel & Emboss…", r##"{"style":"inner|outer|emboss|pillow","depth":1..1000=100,"direction":"up|down","size":px=5,"soften":px,"angle":deg,"altitude":deg,"add":bool}"##),
         style_cmd!("satin", "Satin…", r##"{"color":"#rrggbb","opacity":0..100=50,"blend":str,"angle":deg,"distance":px,"size":px,"invert":bool,"add":bool}"##),
         CommandSpec {

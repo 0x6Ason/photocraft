@@ -188,9 +188,111 @@ pub fn apply_with(adj: &Adjustment, buf: &mut Buffer, transfer: Transfer) {
                 out
             }
         }),
-        // Not yet evaluated: identity (still round-trips through PSD).
-        Adjustment::SelectiveColor { .. } | Adjustment::ColorLookup { .. } | Adjustment::Unsupported { .. } => {}
+        Adjustment::SelectiveColor { relative, adjustments } => map_rgb(buf, |c| selective_color(c, *relative, adjustments)),
+        Adjustment::ColorLookup { lut: Some(table), size, tetrahedral, dither, .. } if *size >= 2 && table.len() >= (*size as usize).pow(3) * 3 => {
+            let (n, w, x0, y0) = (*size as usize, buf.rect.width().max(1) as usize, buf.rect.x0, buf.rect.y0);
+            for (i, p) in buf.px.iter_mut().enumerate() {
+                if p[3] <= 0.0 {
+                    continue;
+                }
+                let mut o = lut3d_sample(table, n, [p[0], p[1], p[2]], *tetrahedral);
+                if *dither {
+                    let d = bayer4(x0 + (i % w) as i32, y0 + (i / w) as i32) / 255.0;
+                    o = o.map(|v| (v + d).clamp(0.0, 1.0));
+                }
+                p[..3].copy_from_slice(&o);
+            }
+        }
+        // Not evaluated: identity (still round-trips through PSD).
+        Adjustment::ColorLookup { .. } | Adjustment::Unsupported { .. } => {}
     }
+}
+
+/// Ordered-dither offset in -0.5..0.5 (4×4 Bayer matrix) for document pixel (x, y).
+pub fn bayer4(x: i32, y: i32) -> f32 {
+    const M: [f32; 16] = [0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0];
+    (M[((y & 3) * 4 + (x & 3)) as usize] + 0.5) / 16.0 - 0.5
+}
+
+/// Samples a 3D LUT (`n`³ RGB triplets, red fastest) at `c`, trilinear or tetrahedral.
+pub fn lut3d_sample(lut: &[f32], n: usize, c: [f32; 3], tetrahedral: bool) -> [f32; 3] {
+    let m = (n - 1) as f32;
+    let pos = c.map(|v| v.clamp(0.0, 1.0) * m);
+    let i0 = pos.map(|p| (p.floor() as usize).min(n - 2));
+    let f: [f32; 3] = std::array::from_fn(|k| pos[k] - i0[k] as f32);
+    let at = |dr: usize, dg: usize, db: usize| -> [f32; 3] {
+        let idx = (((i0[2] + db) * n + i0[1] + dg) * n + i0[0] + dr) * 3;
+        [lut[idx], lut[idx + 1], lut[idx + 2]]
+    };
+    let mix = |w: &[(f32, [f32; 3])]| -> [f32; 3] { std::array::from_fn(|k| w.iter().map(|(a, v)| a * v[k]).sum()) };
+    let (fr, fg, fb) = (f[0], f[1], f[2]);
+    if tetrahedral {
+        let (c000, c111) = (at(0, 0, 0), at(1, 1, 1));
+        if fr > fg {
+            if fg > fb {
+                mix(&[(1.0 - fr, c000), (fr - fg, at(1, 0, 0)), (fg - fb, at(1, 1, 0)), (fb, c111)])
+            } else if fr > fb {
+                mix(&[(1.0 - fr, c000), (fr - fb, at(1, 0, 0)), (fb - fg, at(1, 0, 1)), (fg, c111)])
+            } else {
+                mix(&[(1.0 - fb, c000), (fb - fr, at(0, 0, 1)), (fr - fg, at(1, 0, 1)), (fg, c111)])
+            }
+        } else if fb > fg {
+            mix(&[(1.0 - fb, c000), (fb - fg, at(0, 0, 1)), (fg - fr, at(0, 1, 1)), (fr, c111)])
+        } else if fb > fr {
+            mix(&[(1.0 - fg, c000), (fg - fb, at(0, 1, 0)), (fb - fr, at(0, 1, 1)), (fr, c111)])
+        } else {
+            mix(&[(1.0 - fg, c000), (fg - fr, at(0, 1, 0)), (fr - fb, at(1, 1, 0)), (fb, c111)])
+        }
+    } else {
+        let lerp = |a: [f32; 3], b: [f32; 3], t: f32| -> [f32; 3] { std::array::from_fn(|k| a[k] + (b[k] - a[k]) * t) };
+        let c00 = lerp(at(0, 0, 0), at(1, 0, 0), fr);
+        let c10 = lerp(at(0, 1, 0), at(1, 1, 0), fr);
+        let c01 = lerp(at(0, 0, 1), at(1, 0, 1), fr);
+        let c11 = lerp(at(0, 1, 1), at(1, 1, 1), fr);
+        lerp(lerp(c00, c10, fg), lerp(c01, c11, fg), fb)
+    }
+}
+
+/// How much a colour belongs to each Selective Color range: reds, yellows, greens, cyans,
+/// blues, magentas (by chroma within the hue sector), whites, neutrals and blacks (by lightness).
+pub fn selective_color_weights(c: [f32; 3]) -> [f32; 9] {
+    let max = c[0].max(c[1]).max(c[2]);
+    let min = c[0].min(c[1]).min(c[2]);
+    let mid = c[0] + c[1] + c[2] - max - min;
+    let top = |i: usize| if c[i] >= max { max - mid } else { 0.0 };
+    let bottom = |i: usize| if c[i] <= min { mid - min } else { 0.0 };
+    [
+        top(0),
+        bottom(2),
+        top(1),
+        bottom(0),
+        top(2),
+        bottom(1),
+        ((min - 0.5) * 2.0).max(0.0),
+        (1.0 - (max - 0.5).abs() - (min - 0.5).abs()).clamp(0.0, 1.0),
+        ((0.5 - max) * 2.0).max(0.0),
+    ]
+}
+
+/// Photoshop Selective Color (approximation): each range shifts the cyan, magenta and yellow ink
+/// (1 − R, G, B) by its percentage, plus its black percentage on every ink, weighted by how much
+/// the colour belongs to the range. Relative mode scales the shift by the ink already present
+/// (so it can't tint pure white); absolute adds it outright.
+pub fn selective_color(c: [f32; 3], relative: bool, adj: &[[f32; 4]; 9]) -> [f32; 3] {
+    let w = selective_color_weights(c);
+    let mut delta = [0.0f32; 3];
+    for (r, wr) in w.iter().enumerate() {
+        if *wr <= 0.0 {
+            continue;
+        }
+        let a = adj[r].map(|v| v / 100.0);
+        for i in 0..3 {
+            let ink = 1.0 - c[i];
+            let d = if relative { (a[i] + a[3]) * ink } else { a[i] + a[3] };
+            delta[i] += d * wr;
+        }
+    }
+    std::array::from_fn(|i| (c[i] - delta[i]).clamp(0.0, 1.0))
 }
 
 const LUT_SIZE: usize = 4096;
@@ -342,4 +444,53 @@ pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 3] {
         }
     };
     [f(h + 1.0 / 3.0), f(h), f(h - 1.0 / 3.0)]
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+
+    fn identity(n: usize) -> Vec<f32> {
+        let m = (n - 1) as f32;
+        (0..n * n * n).flat_map(|i| [(i % n) as f32 / m, ((i / n) % n) as f32 / m, (i / (n * n)) as f32 / m]).collect()
+    }
+
+    #[test]
+    fn identity_lut_is_identity_both_interpolations() {
+        let t = identity(5);
+        for c in [[0.1, 0.5, 0.9], [0.33, 0.77, 0.0], [1.0, 1.0, 1.0]] {
+            for tet in [false, true] {
+                let o = lut3d_sample(&t, 5, c, tet);
+                for k in 0..3 {
+                    assert!((o[k] - c[k]).abs() < 1e-5, "{c:?} {tet} {o:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selective_color_zero_is_identity_and_ranges_are_local() {
+        let zero = [[0.0f32; 4]; 9];
+        for c in [[0.9, 0.1, 0.1], [0.5, 0.5, 0.5], [0.2, 0.4, 0.8]] {
+            assert_eq!(selective_color(c, true, &zero), c);
+        }
+        // +100 % cyan on reds only: red loses red, blue is untouched.
+        let mut a = zero;
+        a[0][0] = 100.0;
+        let red = selective_color([0.9, 0.1, 0.1], false, &a);
+        assert!(red[0] < 0.2, "{red:?}");
+        assert_eq!(selective_color([0.1, 0.1, 0.9], false, &a), [0.1, 0.1, 0.9]);
+        // Relative mode can't tint pure white; absolute can (via whites).
+        let mut w = zero;
+        w[6] = [0.0, 0.0, 50.0, 0.0];
+        assert_eq!(selective_color([1.0; 3], true, &w), [1.0; 3]);
+        assert!(selective_color([1.0; 3], false, &w)[2] < 0.6);
+    }
+
+    #[test]
+    fn dither_offsets_are_balanced() {
+        let sum: f32 = (0..4).flat_map(|y| (0..4).map(move |x| bayer4(x, y))).sum();
+        assert!(sum.abs() < 1e-5);
+        assert_eq!(bayer4(-4, -4), bayer4(0, 0));
+    }
 }

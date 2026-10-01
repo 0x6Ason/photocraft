@@ -228,10 +228,15 @@ pub enum AntiAlias {
     Strong,
     #[default]
     Smooth,
+    /// Photoshop's "Windows" (platform grayscale) anti-aliasing; rendered like `Sharp`.
+    Windows,
+    /// Photoshop's "Windows LCD" (platform subpixel) anti-aliasing; rendered like `Sharp` (we
+    /// never produce colour-fringed subpixel text in document pixels).
+    WindowsLcd,
 }
 
-/// Warp text settings (Photoshop `warp` descriptor). Placeholder: stored and round-tripped,
-/// not yet applied by the renderer.
+/// Warp text settings (Photoshop `warp` descriptor), applied to the glyph outlines by
+/// `photocraft-text` (see its `warp` module) and round-tripped through PSD.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TextWarp {
     /// `warpNone`, `warpArc`, `warpFlag`, …

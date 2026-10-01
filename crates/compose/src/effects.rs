@@ -17,8 +17,10 @@ use photocraft_doc::{
     Bevel, BevelStyle, Contour, Effect, FxPaint, GlobalLight, Glow, GlowSource, GlowTechnique, Gradient, GradientStyle, Layer, Shadow,
     StrokePosition,
 };
+use photocraft_doc::Pattern;
 use photocraft_geom::Rect;
 
+use crate::pattern::{Placement, Tile};
 use crate::{Buffer, psblend};
 
 /// `true` if the layer has at least one enabled effect and the master switch is on.
@@ -436,7 +438,26 @@ fn glow_map(shape: &Map, g: &Glow, inner: bool) -> Map {
     m
 }
 
-fn paint_fx(dst: &mut Buffer, m: &Map, p: &FxPaint, shape_bounds: Rect, big: Rect, blend: BlendMode, opacity: f32) {
+/// Paints a pattern (looked up in `patterns`) through coverage `m`; missing patterns paint nothing.
+#[allow(clippy::too_many_arguments)]
+fn paint_pattern(dst: &mut Buffer, m: &Map, patterns: &[Pattern], name: &str, id: &str, place: Placement, big: Rect, blend: BlendMode, opacity: f32) {
+    let Some(tile) = photocraft_doc::pattern::find(patterns, id, name).and_then(Tile::new) else { return };
+    let w = big.width() as usize;
+    paint(
+        dst,
+        m,
+        |i| {
+            let (x, y) = (f64::from(big.x0 + (i % w) as i32) + 0.5, f64::from(big.y0 + (i / w) as i32) + 0.5);
+            let (u, v) = place.map(x, y);
+            tile.sample(u, v)
+        },
+        blend,
+        opacity,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_fx(dst: &mut Buffer, m: &Map, p: &FxPaint, shape_bounds: Rect, big: Rect, blend: BlendMode, opacity: f32, patterns: &[Pattern]) {
     match p {
         FxPaint::Color(c) => paint_color(dst, m, rgb(c), blend, opacity),
         FxPaint::Gradient(g) => {
@@ -452,7 +473,9 @@ fn paint_fx(dst: &mut Buffer, m: &Map, p: &FxPaint, shape_bounds: Rect, big: Rec
                 opacity,
             )
         }
-        FxPaint::Pattern { .. } => {}
+        FxPaint::Pattern { name, id, scale } => {
+            paint_pattern(dst, m, patterns, name, id, Placement::new(shape_bounds, true, (0.0, 0.0), *scale, 0.0), big, blend, opacity)
+        }
     }
 }
 
@@ -598,7 +621,7 @@ const FAR: f32 = 1.0e9;
 
 /// Composites `content` (the layer's own pixels over `big`, alpha already
 /// masked, clipped layers applied) plus its effects into `backdrop`.
-pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Buffer, maps: &FxMaps, layer_bounds: Rect) {
+pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Buffer, maps: &FxMaps, layer_bounds: Rect, patterns: &[Pattern]) {
     let big = content.rect;
     let (w, h) = (big.width() as usize, big.height() as usize);
     let shape = Map { w, h, v: content.px.iter().map(|p| p[3]).collect() };
@@ -634,7 +657,7 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
     for (i, e) in rev() {
         if let Effect::OuterGlow(g) = e {
             let m = fx(i, 0);
-            paint_fx(&mut work, &m, &g.paint, sb, big, g.common.blend, g.common.opacity);
+            paint_fx(&mut work, &m, &g.paint, sb, big, g.common.blend, g.common.opacity, patterns);
         }
     }
 
@@ -643,8 +666,13 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
     let mut lay = Buffer { rect: big, px: content.px.iter().map(|p| [p[0], p[1], p[2], p[3] * fill]).collect() };
     let full = shape.clone();
     for (_, e) in rev() {
+        if let Effect::PatternOverlay { common, name, id, scale, angle, link, phase } = e {
+            paint_pattern(&mut lay, &full, patterns, name, id, Placement::new(sb, *link, *phase, *scale, *angle), big, common.blend, common.opacity);
+        }
+    }
+    for (_, e) in rev() {
         if let Effect::GradientOverlay { common, gradient, .. } = e {
-            paint_fx(&mut lay, &full, &FxPaint::Gradient(gradient.clone()), sb, big, common.blend, common.opacity)
+            paint_fx(&mut lay, &full, &FxPaint::Gradient(gradient.clone()), sb, big, common.blend, common.opacity, patterns)
         }
     }
     for (_, e) in rev() {
@@ -661,7 +689,7 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
     for (i, e) in rev() {
         if let Effect::InnerGlow(g) = e {
             let m = fx(i, 0);
-            paint_fx(&mut lay, &m, &g.paint, sb, big, g.common.blend, g.common.opacity);
+            paint_fx(&mut lay, &m, &g.paint, sb, big, g.common.blend, g.common.opacity, patterns);
         }
     }
     for (i, e) in rev() {
@@ -701,7 +729,7 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
             };
         }
         let mut under = Buffer::transparent(big);
-        paint_fx(&mut under, &m, &st.paint, sb, big, BlendMode::Normal, st.common.opacity);
+        paint_fx(&mut under, &m, &st.paint, sb, big, BlendMode::Normal, st.common.opacity, patterns);
         for (u, l) in under.px.iter_mut().zip(&lay.px) {
             *u = psblend::composite(BlendMode::Normal, *u, *l, 1.0);
         }
@@ -716,7 +744,7 @@ pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Bu
         for ((mv, a), dv) in m.v.iter_mut().zip(&shape.v).zip(&din) {
             *mv = (in_w + 0.5 - dv).clamp(0.0, 1.0) * a;
         }
-        paint_fx(&mut lay, &m, &st.paint, sb, big, st.common.blend, st.common.opacity);
+        paint_fx(&mut lay, &m, &st.paint, sb, big, st.common.blend, st.common.opacity, patterns);
     }
     for (i, e) in rev() {
         if let Effect::BevelEmboss(b) = e {

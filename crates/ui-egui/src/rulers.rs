@@ -11,8 +11,41 @@ use crate::canvas::ViewXform;
 use crate::theme::Tokens;
 
 pub const RULER: f32 = 16.0;
-/// Photoshop's default guide colour (cyan) and grid colour (grey).
-const GUIDE: Color32 = Color32::from_rgb(74, 255, 255);
+
+/// A `#rrggbb` preference colour.
+fn pref_color(s: &str, fallback: Color32) -> Color32 {
+    photocraft_engine::prefs::parse_hex(s).map_or(fallback, |c| Color32::from_rgb(c[0], c[1], c[2]))
+}
+
+/// Draw a line in a Guides/Grid preference style (lines, dashed lines, dots).
+fn styled_line(painter: &egui::Painter, a: Pos2, b: Pos2, stroke: Stroke, style: photocraft_engine::prefs::LineStyle) {
+    use photocraft_engine::prefs::LineStyle;
+    match style {
+        LineStyle::Lines => {
+            painter.line_segment([a, b], stroke);
+        }
+        LineStyle::Dashed => {
+            painter.extend(egui::Shape::dashed_line(&[a, b], stroke, 4.0, 3.0));
+        }
+        LineStyle::Dots => {
+            painter.extend(egui::Shape::dotted_line(&[a, b], stroke.color, 3.0, 0.6));
+        }
+    }
+}
+
+/// Ruler step in units so labelled ticks are at least `min` units apart: …0.1, 0.25, 0.5, 1, 2, 5,
+/// 10… (whole steps only for pixels).
+fn nice_step(min: f64, whole: bool) -> f64 {
+    let mut step = if whole { 1.0 } else { 0.001 };
+    loop {
+        for m in [1.0, 2.0, 2.5, 5.0] {
+            if (m != 2.5 || !whole) && step * m >= min {
+                return step * m;
+            }
+        }
+        step *= 10.0;
+    }
+}
 
 /// A guide being dragged: from a ruler (new) or an existing one (index).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,37 +61,33 @@ pub fn content_rect(app: &PhotocraftApp, rect: Rect) -> Rect {
 }
 
 /// Tick step (document px) so major ticks are at least ~60 screen px apart: 1, 2, 5, 10, 20, 50…
+#[cfg(test)]
 fn tick_step(zoom: f32) -> f64 {
-    let min = 60.0 / zoom.max(1e-4) as f64;
-    let mut step = 1.0;
-    loop {
-        for m in [1.0, 2.0, 5.0] {
-            if step * m >= min {
-                return step * m;
-            }
-        }
-        step *= 10.0;
-    }
+    nice_step(60.0 / zoom.max(1e-4) as f64, true)
 }
 
-pub fn draw_grid(painter: &egui::Painter, xf: &ViewXform, doc: &Document) {
-    // Photoshop default: a gridline every inch with 4 subdivisions.
-    let major = doc.resolution_dpi.max(1.0) as f64;
-    let minor = major / 4.0;
+/// View › Show › Grid, from Preferences › Guides, Grid & Slices (spacing, subdivisions, colour,
+/// style). Photoshop's default is a gridline every inch with 4 subdivisions.
+pub fn draw_grid(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform, doc: &Document) {
+    let g = &app.session.prefs().guides_grid_and_slices;
+    let ppi = app.session.prefs().units_and_rulers.point_size.per_inch();
+    let major = g.major_px(doc.resolution_dpi.max(1.0) as f64, doc.size.width as f64, ppi);
+    let minor = major / g.subdivisions.max(1) as f64;
+    let base = pref_color(&g.grid_color, Color32::from_gray(140));
     let (w, h) = (doc.size.width as f64, doc.size.height as f64);
-    for (step, alpha) in [(minor, 60u8), (major, 130u8)] {
-        if step * (xf.zoom as f64) < 6.0 {
+    for (step, alpha) in [(minor, 0.45f32), (major, 1.0)] {
+        if step * (xf.zoom as f64) < 6.0 || (alpha < 1.0 && g.subdivisions <= 1) {
             continue;
         }
-        let st = Stroke::new(1.0, Color32::from_rgba_unmultiplied(128, 128, 128, alpha));
+        let st = Stroke::new(1.0, base.gamma_multiply(alpha));
         let mut x = step;
         while x < w {
-            painter.line_segment([xf.to_screen(x as f32, 0.0), xf.to_screen(x as f32, h as f32)], st);
+            styled_line(painter, xf.to_screen(x as f32, 0.0), xf.to_screen(x as f32, h as f32), st, g.grid_style);
             x += step;
         }
         let mut y = step;
         while y < h {
-            painter.line_segment([xf.to_screen(0.0, y as f32), xf.to_screen(w as f32, y as f32)], st);
+            styled_line(painter, xf.to_screen(0.0, y as f32), xf.to_screen(w as f32, y as f32), st, g.grid_style);
             y += step;
         }
     }
@@ -67,13 +96,15 @@ pub fn draw_grid(painter: &egui::Painter, xf: &ViewXform, doc: &Document) {
 pub fn draw_guides(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform, doc: &Document) {
     let clip = painter.clip_rect();
     let drag = app.guide_drag;
+    let g = &app.session.prefs().guides_grid_and_slices;
+    let (guide, style) = (pref_color(&g.guide_color, Color32::from_rgb(74, 255, 255)), g.guide_style);
     let line = |vertical: bool, pos: f64, color: Color32| {
         if vertical {
             let x = xf.to_screen(pos as f32, 0.0).x;
-            painter.line_segment([pos2(x, clip.top()), pos2(x, clip.bottom())], Stroke::new(1.0, color));
+            styled_line(painter, pos2(x, clip.top()), pos2(x, clip.bottom()), Stroke::new(1.0, color), style);
         } else {
             let y = xf.to_screen(0.0, pos as f32).y;
-            painter.line_segment([pos2(clip.left(), y), pos2(clip.right(), y)], Stroke::new(1.0, color));
+            styled_line(painter, pos2(clip.left(), y), pos2(clip.right(), y), Stroke::new(1.0, color), style);
         }
     };
     if app.ui.extras.guides {
@@ -82,12 +113,12 @@ pub fn draw_guides(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform,
                 if drag.is_some_and(|d| d.vertical == vertical && d.index == Some(i)) {
                     continue;
                 }
-                line(vertical, *p as f64, GUIDE);
+                line(vertical, *p as f64, guide);
             }
         }
     }
     if let Some(d) = drag {
-        line(d.vertical, d.pos, GUIDE);
+        line(d.vertical, d.pos, guide);
     }
 }
 
@@ -143,38 +174,49 @@ pub fn draw_rulers(app: &mut PhotocraftApp, ui: &mut egui::Ui, full: Rect, xf: &
     }
     p.line_segment([top.left_bottom(), top.right_bottom()], Stroke::new(1.0, t.separator));
     p.line_segment([left.right_top(), left.right_bottom()], Stroke::new(1.0, t.separator));
-    let step = tick_step(xf.zoom);
     let font = egui::FontId::proportional(9.0);
     let tick = Stroke::new(1.0, t.text_faint);
-    // Horizontal ruler.
-    let (d0, d1) = (xf.to_doc(top.left_top())[0], xf.to_doc(top.right_top())[0]);
-    let mut v = (d0 / step).floor() * step;
-    while v <= d1 {
-        let x = xf.to_screen(v as f32, 0.0).x;
-        p.line_segment([pos2(x, top.bottom() - RULER), pos2(x, top.bottom())], tick);
-        p.text(pos2(x + 2.0, top.top() + 1.0), Align2::LEFT_TOP, format!("{}", v as i64), font.clone(), t.text_dim);
-        for k in 1..10 {
-            let xm = xf.to_screen((v + step * k as f64 / 10.0) as f32, 0.0).x;
-            let len = if k == 5 { 6.0 } else { 3.0 };
-            p.line_segment([pos2(xm, top.bottom() - len), pos2(xm, top.bottom())], tick);
+    // Preferences › Units & Rulers: labels in the ruler unit (percent of the document's side).
+    let ur = &app.session.prefs().units_and_rulers;
+    let (unit, ppi) = (ur.rulers, ur.point_size.per_inch());
+    let (dpi, size) = app.session.active().map_or((72.0, [1.0, 1.0]), |d| (d.doc.resolution_dpi.max(1.0) as f64, [d.doc.size.width as f64, d.doc.size.height as f64]));
+    let whole = unit == photocraft_engine::prefs::Unit::Pixels;
+    let label = |v: f64, step: f64| -> String {
+        if step >= 1.0 || whole { format!("{}", v.round() as i64) } else { crate::widgets::fmt_num2(v) }
+    };
+    for (vertical, extent) in [(false, size[0]), (true, size[1])] {
+        let px_per_unit = unit.to_px(1.0, dpi, extent, ppi).max(1e-9);
+        let step = nice_step(60.0 / (xf.zoom as f64 * px_per_unit).max(1e-6), whole);
+        let (d0, d1) = if vertical { (xf.to_doc(left.left_top())[1], xf.to_doc(left.left_bottom())[1]) } else { (xf.to_doc(top.left_top())[0], xf.to_doc(top.right_top())[0]) };
+        let (u0, u1) = (d0 / px_per_unit, d1 / px_per_unit);
+        let mut v = (u0 / step).floor() * step;
+        while v <= u1 {
+            let at = |u: f64| -> f32 {
+                let px = (u * px_per_unit) as f32;
+                if vertical { xf.to_screen(0.0, px).y } else { xf.to_screen(px, 0.0).x }
+            };
+            let c = at(v);
+            if vertical {
+                p.line_segment([pos2(left.right() - RULER, c), pos2(left.right(), c)], tick);
+                // Labels stacked, as in Photoshop.
+                for (i, ch) in label(v, step).chars().enumerate() {
+                    p.text(pos2(left.left() + 3.0, c + 2.0 + i as f32 * 8.5), Align2::LEFT_TOP, ch, font.clone(), t.text_dim);
+                }
+            } else {
+                p.line_segment([pos2(c, top.bottom() - RULER), pos2(c, top.bottom())], tick);
+                p.text(pos2(c + 2.0, top.top() + 1.0), Align2::LEFT_TOP, label(v, step), font.clone(), t.text_dim);
+            }
+            for k in 1..10 {
+                let m = at(v + step * k as f64 / 10.0);
+                let len = if k == 5 { 6.0 } else { 3.0 };
+                if vertical {
+                    p.line_segment([pos2(left.right() - len, m), pos2(left.right(), m)], tick);
+                } else {
+                    p.line_segment([pos2(m, top.bottom() - len), pos2(m, top.bottom())], tick);
+                }
+            }
+            v += step;
         }
-        v += step;
-    }
-    // Vertical ruler (labels stacked, as in Photoshop).
-    let (d0, d1) = (xf.to_doc(left.left_top())[1], xf.to_doc(left.left_bottom())[1]);
-    let mut v = (d0 / step).floor() * step;
-    while v <= d1 {
-        let y = xf.to_screen(0.0, v as f32).y;
-        p.line_segment([pos2(left.right() - RULER, y), pos2(left.right(), y)], tick);
-        for (i, ch) in format!("{}", v as i64).chars().enumerate() {
-            p.text(pos2(left.left() + 3.0, y + 2.0 + i as f32 * 8.5), Align2::LEFT_TOP, ch, font.clone(), t.text_dim);
-        }
-        for k in 1..10 {
-            let ym = xf.to_screen(0.0, (v + step * k as f64 / 10.0) as f32).y;
-            let len = if k == 5 { 6.0 } else { 3.0 };
-            p.line_segment([pos2(left.right() - len, ym), pos2(left.right(), ym)], tick);
-        }
-        v += step;
     }
     // Pointer position markers.
     if let Some(h) = ui.ctx().pointer_hover_pos().filter(|h| full.contains(*h)) {
@@ -190,7 +232,8 @@ pub fn draw_rulers(app: &mut PhotocraftApp, ui: &mut egui::Ui, full: Rect, xf: &
         }
         if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.drag_started()) {
             let d = xf.to_doc(pos);
-            app.guide_drag = Some(GuideDrag { vertical, index: None, pos: if vertical { d[0] } else { d[1] } });
+            let pos = crate::snap_ui::snap_guide(app, vertical, if vertical { d[0] } else { d[1] });
+            app.guide_drag = Some(GuideDrag { vertical, index: None, pos });
         }
         if resp.drag_stopped()
             && let Some(d) = app.guide_drag.take()
@@ -204,6 +247,15 @@ pub fn draw_rulers(app: &mut PhotocraftApp, ui: &mut egui::Ui, full: Rect, xf: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_steps_allow_fractions() {
+        assert_eq!(nice_step(0.3, false), 0.5);
+        assert_eq!(nice_step(0.2, false), 0.2);
+        assert_eq!(nice_step(0.22, false), 0.25);
+        assert_eq!(nice_step(0.3, true), 1.0);
+        assert_eq!(nice_step(23.0, true), 50.0);
+    }
 
     #[test]
     fn ticks_follow_1_2_5_series() {

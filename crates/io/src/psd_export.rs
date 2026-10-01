@@ -38,6 +38,10 @@ struct Ex {
     canvas: photocraft_geom::Rect,
     records: Vec<LayerRecord>,
     warnings: Vec<String>,
+    /// Guides (artboard blocks list the guides inside each board).
+    guides: photocraft_doc::Guides,
+    /// Layer comps to regenerate into each layer's `cmls`; None = preserved data still matches.
+    comps: Option<(Vec<photocraft_doc::LayerComp>, Option<photocraft_doc::LayerComp>)>,
 }
 
 fn psd_mode(m: ColorMode) -> PsdMode {
@@ -274,6 +278,12 @@ impl Ex {
         if !matches!(l.content, LayerContent::Shape(_)) {
             self.vector_mask_block(l, &mut raw);
         }
+        crate::comps_map::artboard_block(&self.guides, l, &mut raw);
+        if let Some((comps, last)) = &self.comps {
+            // Ids are assigned to every layer before emitting.
+            let id = self.layer_ids.get(&l.id).copied().unwrap_or(0);
+            crate::comps_map::set_cmls(&mut raw, crate::comps_map::write_cmls(comps, last.as_ref(), l, id));
+        }
         regenerated.into_iter().chain(raw).map(|(k, d)| TaggedBlock::new(k, d)).collect()
     }
 
@@ -447,6 +457,8 @@ pub fn document_to_psd_with(doc: &Document, opts: &PsdExportOptions) -> (PsdFile
         canvas: doc.bounds(),
         records: Vec::new(),
         warnings: Vec::new(),
+        guides: doc.guides.clone(),
+        comps: (!crate::comps_map::comps_unchanged(doc)).then(|| (doc.layer_comps.clone(), doc.last_document_state.clone())),
     };
     if big && !opts.force_psb {
         ex.warnings.push("document exceeds 30000 px; written as PSB".into());
@@ -507,7 +519,16 @@ pub fn document_to_psd_with(doc: &Document, opts: &PsdExportOptions) -> (PsdFile
     if doc.channels.len() > max_extra {
         ex.warnings.push(format!("only {max_extra} alpha channels fit in PSD; the rest were dropped"));
     }
-    let extra: Vec<_> = doc.channels.iter().take(max_extra).collect();
+    let mut extra: Vec<_> = doc.channels.iter().take(max_extra).collect();
+    // Saved in Quick Mask mode: the mask is written as the last extra channel and flagged by
+    // resource 1022 (quick mask info: channel id, initially-empty flag), as Photoshop does.
+    let quick_mask_id = match &doc.quick_mask {
+        Some(q) if extra.len() < max_extra => {
+            extra.push(q);
+            Some((cc + usize::from(has_alpha) + extra.len() - 1) as u16)
+        }
+        _ => None,
+    };
     for a in &extra {
         let s = if a.surface.format() != ex.mask_fmt { a.surface.convert(ex.mask_fmt) } else { a.surface.clone() };
         let bytes = s.to_interleaved(canvas);
@@ -536,6 +557,12 @@ pub fn document_to_psd_with(doc: &Document, opts: &PsdExportOptions) -> (PsdFile
         let names: Vec<&str> = extra.iter().map(|a| a.name.as_str()).collect();
         resources.push(ImageResource::new(1006, pascal_names_resource(&names)));
         resources.push(ImageResource::new(1045, unicode_names_resource(&names)));
+        resources.push(ImageResource::new(crate::channel_map::DISPLAY_INFO, crate::channel_map::display_info(&extra)));
+    }
+    if let Some(id) = quick_mask_id {
+        let mut data = id.to_be_bytes().to_vec();
+        data.push(0);
+        resources.push(ImageResource::new(crate::channel_map::QUICK_MASK_INFO, data));
     }
     // Paths: saved paths (2000+), the work path (1025), the clipping path name (2999).
     {
@@ -581,12 +608,17 @@ pub fn document_to_psd_with(doc: &Document, opts: &PsdExportOptions) -> (PsdFile
         resources.push(ImageResource::new(ids::EXIF, e.to_vec()));
     }
     let mut global_blocks = Vec::new();
-    for (sig, key, data) in &doc.metadata.psd_global_blocks {
+    for (sig, key, data) in &crate::pattern_map::export_global_blocks(doc) {
         let mut tb = TaggedBlock::new(*key, data.to_vec());
         tb.signature = *sig;
         global_blocks.push(tb);
     }
+    let comps_resource = ex.comps.is_some().then(|| crate::comps_map::write_comps_resource(doc));
     for (id, name, data) in &doc.metadata.psd_resources {
+        // Layer comps: the preserved list while unchanged, else regenerated (or dropped) below.
+        if *id == crate::comps_map::LAYER_COMPS && comps_resource.is_some() {
+            continue;
+        }
         // A preserved clipping-path resource is only valid while it names the current one.
         if *id == crate::vector_map::CLIPPING_PATH {
             let n = usize::from(data.first().copied().unwrap_or(0));
@@ -598,6 +630,9 @@ pub fn document_to_psd_with(doc: &Document, opts: &PsdExportOptions) -> (PsdFile
         let mut r = ImageResource::new(*id, data.to_vec());
         r.name = legacy_name(name);
         resources.push(r);
+    }
+    if let Some(Some(data)) = comps_resource {
+        resources.push(ImageResource::new(crate::comps_map::LAYER_COMPS, data));
     }
     resources.push(version_info_resource(true));
 

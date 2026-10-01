@@ -6,10 +6,15 @@
 //! server. This is what makes the UI swappable and the app fully scriptable.
 #![forbid(unsafe_code)]
 
+pub mod adjust_cmds;
+pub mod layer_menu_cmds;
+pub mod mode_cmds;
+pub mod channel_cmds;
 pub mod commands;
 pub mod inspect;
 pub mod layer_style;
 pub mod filters;
+pub mod filters_ext;
 pub mod type_cmds;
 pub mod transform_cmds;
 pub mod vector_cmds;
@@ -18,8 +23,21 @@ pub mod edit_cmds;
 pub mod retouch_cmds;
 pub mod image_cmds;
 pub mod paint_cmds;
+pub mod pattern_cmds;
+pub mod warp_cmds;
 pub mod selection_cmds;
+pub mod brush_cmds;
+pub mod extra_cmds;
+pub mod color_cmds;
+pub mod layer_multi_cmds;
+pub mod smart_cmds;
+pub mod file_cmds;
+pub mod type_extra_cmds;
 mod pixels;
+pub mod prefs;
+pub mod snap;
+pub mod edit_menu_cmds;
+pub mod align_cmds;
 
 use std::sync::Arc;
 
@@ -30,6 +48,7 @@ use serde_json::Value;
 pub use commands::{CommandSpec, command_specs};
 pub use photocraft_doc as doc;
 pub use photocraft_paint::BrushSettings;
+pub use photocraft_paint as paint;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -54,7 +73,14 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 pub struct DocState {
     pub doc: Arc<Document>,
     pub history: History,
+    /// The primary ("key") layer: what single-layer commands act on. Always a member of
+    /// `selected_layers` when set.
     pub active_layer: Option<LayerId>,
+    /// Every selected layer in the Layers panel (⌘/⇧-click), in selection order. Like
+    /// `active_layer` this is UI state, not history; see [`DocState::selected_layers`].
+    pub selected_layers: Vec<LayerId>,
+    /// Anchor of ⇧-click range selection (the last plainly or ⌘-clicked layer).
+    pub layer_anchor: Option<LayerId>,
     pub path: Option<String>,
     /// Increments on every change; UIs re-render when it moves.
     pub revision: u64,
@@ -63,12 +89,37 @@ pub struct DocState {
     pub last_damage: Option<photocraft_geom::Rect>,
     /// Coalescing key of the latest history step (see [`Session::execute`]'s `coalesce` param).
     pub coalesce: Option<String>,
+    /// Channels panel: targeted channel and eye toggles (view state, not history).
+    pub channel_view: channel_cmds::ChannelView,
 }
 
 impl DocState {
     pub fn new(doc: Document, path: Option<String>) -> Self {
         let active_layer = doc.top_layer();
-        Self { doc: Arc::new(doc), history: History::default(), active_layer, path, revision: 1, saved_revision: 1, last_damage: None, coalesce: None }
+        Self {
+            doc: Arc::new(doc),
+            history: History::default(),
+            active_layer,
+            selected_layers: active_layer.into_iter().collect(),
+            layer_anchor: active_layer,
+            path,
+            revision: 1,
+            saved_revision: 1,
+            last_damage: None,
+            coalesce: None,
+            channel_view: Default::default(),
+        }
+    }
+    /// The selected layers in bottom-to-top document order, always including the active layer.
+    /// Robust against stale state: ids no longer in the document are skipped, and if the active
+    /// layer was changed without updating the set, the selection is just the active layer.
+    pub fn selected_layers(&self) -> Vec<LayerId> {
+        let Some(active) = self.active_layer else { return Vec::new() };
+        let set: &[LayerId] = if self.selected_layers.contains(&active) { &self.selected_layers } else { std::slice::from_ref(&active) };
+        self.doc.walk().into_iter().map(|(_, _, l)| l.id).filter(|id| set.contains(id)).collect()
+    }
+    pub fn is_layer_selected(&self, id: LayerId) -> bool {
+        self.active_layer == Some(id) || (self.active_layer.is_some_and(|a| self.selected_layers.contains(&a)) && self.selected_layers.contains(&id))
     }
     pub fn is_dirty(&self) -> bool {
         self.revision != self.saved_revision
@@ -81,11 +132,21 @@ pub struct ToolState {
     pub foreground: [f32; 4],
     pub background: [f32; 4],
     pub brush: photocraft_paint::BrushSettings,
+    /// Brush presets (built-ins plus user presets; see `brush.presets.*`).
+    pub presets: Vec<photocraft_paint::BrushPreset>,
+    /// Mixer Brush paint carried between strokes.
+    pub mixer: photocraft_paint::mixer::MixerState,
 }
 
 impl Default for ToolState {
     fn default() -> Self {
-        Self { foreground: [0.0, 0.0, 0.0, 1.0], background: [1.0, 1.0, 1.0, 1.0], brush: Default::default() }
+        Self {
+            foreground: [0.0, 0.0, 0.0, 1.0],
+            background: [1.0, 1.0, 1.0, 1.0],
+            brush: Default::default(),
+            presets: photocraft_paint::presets::builtin(),
+            mixer: Default::default(),
+        }
     }
 }
 
@@ -100,6 +161,24 @@ pub struct Session {
     coalesce_request: Option<String>,
     /// Pixels copied with Edit › Copy / Cut (shared by all documents, like Photoshop).
     pub clipboard: Option<edit_cmds::Clip>,
+    /// Layer › Layer Style › Copy Layer Style: effects, blend mode and fill opacity.
+    pub style_clipboard: Option<(photocraft_doc::Effects, photocraft_color::BlendMode, f32)>,
+    /// Colour management: proofing state, monitor profile, display transforms.
+    pub color: color_cmds::ColorState,
+    /// Open Edit Contents documents and the smart objects they update.
+    pub smart_links: Vec<smart_cmds::SmartLink>,
+    /// Type › Save Default Type Styles: character and paragraph style new type layers start from.
+    pub type_defaults: Option<(photocraft_doc::text::CharStyle, photocraft_doc::text::ParagraphStyle)>,
+    /// Quick Mask Options (colour, opacity, colour indicates) used when entering Quick Mask.
+    pub quick_mask_options: channel_cmds::QuickMaskOptions,
+    /// Colour channel the running command may change (a single colour channel is targeted).
+    color_restrict: Option<usize>,
+    /// Edit › Preferences, keyboard shortcuts, menu and toolbar customisation (see `prefs`).
+    pub prefs: prefs::PrefsStore,
+    /// Edit menu state: Fade source, custom shape library (see `edit_menu_cmds`).
+    pub edit_state: edit_menu_cmds::EditState,
+    /// The pattern library (Window › Patterns; see `pattern.*`).
+    pub patterns: pattern_cmds::PatternLibrary,
 }
 
 impl Session {
@@ -130,7 +209,9 @@ impl Session {
 
     /// Add a document (from File → New, an import, etc.) and make it active.
     pub fn add_document(&mut self, doc: Document, path: Option<String>) -> usize {
-        self.docs.push(DocState::new(doc, path));
+        let mut st = DocState::new(doc, path);
+        st.history.max_states = self.prefs.get().performance.history_states.max(1) as usize;
+        self.docs.push(st);
         let i = self.docs.len() - 1;
         self.active = Some(i);
         i
@@ -140,6 +221,7 @@ impl Session {
         if index >= self.docs.len() {
             return None;
         }
+        smart_cmds::on_close(self, index);
         let d = self.docs.remove(index);
         self.active = if self.docs.is_empty() { None } else { Some(index.min(self.docs.len() - 1)) };
         Some(d)
@@ -156,9 +238,14 @@ impl Session {
             return Err(EngineError::Disabled(id.to_string(), why));
         }
         self.coalesce_request = params.get("coalesce").and_then(Value::as_str).map(str::to_string);
-        let r = (spec.run)(self, &commands::inject_kind(id, params.clone()));
+        // Pixel commands follow the Channels panel target unless the caller names one.
+        let run_params = channel_cmds::inject_target(self, id, commands::inject_kind(id, params.clone()));
+        self.color_restrict = channel_cmds::color_restriction(self, id, &run_params);
+        let r = (spec.run)(self, &run_params);
         self.coalesce_request = None;
+        self.color_restrict = None;
         let r = r?;
+        edit_menu_cmds::after_command(self, id);
         if spec.journal {
             self.journal.push((id.to_string(), params));
         }
@@ -172,13 +259,19 @@ impl Session {
 
     /// Apply an undoable edit to the active document.
     pub fn edit<R>(&mut self, label: &str, f: impl FnOnce(&mut Document, &mut Option<LayerId>) -> Result<R>) -> Result<R> {
+        let restrict = self.color_restrict;
         let st = self.active_mut().ok_or(EngineError::NoDocument)?;
         let before = st.doc.clone();
         let mut doc = (*before).clone();
         let mut active = st.active_layer;
         let r = f(&mut doc, &mut active)?;
+        if let (Some(k), Some(id)) = (restrict, active) {
+            channel_cmds::restrict_to_color(&before, &mut doc, id, k);
+        }
         st.doc = Arc::new(doc);
         st.active_layer = active;
+        fix_selection(st);
+        channel_cmds::fix_view(st);
         let key = self.coalesce_request.clone();
         let st = self.active_mut().ok_or(EngineError::NoDocument)?;
         if key.is_none() || st.coalesce != key || !st.history.can_undo() {
@@ -197,6 +290,8 @@ impl Session {
             return Err(EngineError::NoLayer(id));
         }
         st.active_layer = Some(id);
+        st.selected_layers = vec![id];
+        st.layer_anchor = Some(id);
         // Selecting a layer is not an edit: keep a clean document clean.
         let clean = st.saved_revision == st.revision;
         st.revision += 1;
@@ -241,6 +336,28 @@ impl Session {
 fn fix_active(st: &mut DocState) {
     if st.active_layer.is_none_or(|id| st.doc.layer(id).is_none()) {
         st.active_layer = st.doc.top_layer();
+    }
+    fix_selection(st);
+    channel_cmds::fix_view(st);
+}
+
+/// Keep the layer selection valid after the document or the active layer changed: drop deleted
+/// layers, and collapse to the active layer when a command made a non-member active.
+pub(crate) fn fix_selection(st: &mut DocState) {
+    let Some(active) = st.active_layer else {
+        st.selected_layers.clear();
+        return;
+    };
+    if !st.selected_layers.contains(&active) {
+        st.selected_layers = vec![active];
+    } else {
+        let live: std::collections::HashSet<LayerId> = st.doc.walk().into_iter().map(|(_, _, l)| l.id).collect();
+        st.selected_layers.retain(|id| live.contains(id));
+        let mut seen = std::collections::HashSet::new();
+        st.selected_layers.retain(|id| seen.insert(*id));
+    }
+    if st.layer_anchor.is_some_and(|a| !st.selected_layers.contains(&a)) {
+        st.layer_anchor = Some(active);
     }
 }
 

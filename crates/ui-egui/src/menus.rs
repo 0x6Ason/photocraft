@@ -15,11 +15,21 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("file.saveAs", "Save As…", &["File"], Some("Cmd+Shift+S")),
     ("edit.freeTransform", "Free Transform", &["Edit"], Some("Cmd+T")),
     ("file.export.exportAs", "Export As…", &["File", "Export"], Some("Cmd+Alt+Shift+W")),
+    ("file.export.quickExportAsPng", "Quick Export as PNG", &["File", "Export"], None),
+    ("edit.transform.scale", "Scale", &["Edit", "Transform"], None),
+    ("edit.transform.rotate", "Rotate", &["Edit", "Transform"], None),
+    ("edit.transform.skew", "Skew", &["Edit", "Transform"], None),
+    ("edit.transform.distort", "Distort", &["Edit", "Transform"], None),
+    ("edit.transform.perspective", "Perspective", &["Edit", "Transform"], None),
+    ("select.selectAndMask", "Select and Mask…", &["Select"], Some("Cmd+Alt+R")),
     ("view.rulers", "Rulers", &["View"], Some("Cmd+R")),
     ("view.show.grid", "Grid", &["View", "Show"], Some("Cmd+'")),
     ("view.show.guides", "Guides", &["View", "Show"], Some("Cmd+;")),
     ("view.snap", "Snap", &["View"], Some("Cmd+Shift+;")),
     ("view.lockGuides", "Lock Guides", &["View"], Some("Cmd+Alt+;")),
+    ("view.extras", "Extras", &["View"], Some("Cmd+H")),
+    ("view.show.targetPath", "Target Path", &["View", "Show"], Some("Cmd+Shift+H")),
+    ("view.screenMode.cycle", "Cycle Screen Mode", &[], Some("F")),
     ("view.zoomIn", "Zoom In", &["View"], Some("Cmd+=")),
     ("view.zoomOut", "Zoom Out", &["View"], Some("Cmd+-")),
     ("view.fitOnScreen", "Fit on Screen", &["View"], Some("Cmd+0")),
@@ -29,6 +39,7 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("window.toggle.history", "History", &["Window"], None),
     ("window.toggle.properties", "Properties", &["Window"], None),
     ("window.toggle.color", "Color", &["Window"], Some("F6")),
+    ("window.toggle.brushSettings", "Brush Settings", &["Window"], Some("F5")),
     ("window.toggle.navigator", "Navigator", &["Window"], None),
     ("window.toggle.toolbar", "Tools", &["Window"], None),
     ("window.toggle.options", "Options", &["Window"], None),
@@ -41,9 +52,92 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("help.about", "About Photocraft", &["Help"], None),
 ];
 
+/// Photoshop's Window › <panel> ids for the panels the shell already has, as `window.toggle.*`.
+fn panel_alias(id: &str) -> Option<&'static str> {
+    Some(match id.strip_prefix("window.panel.")? {
+        "layers" => "window.toggle.layers",
+        "history" => "window.toggle.history",
+        "properties" | "adjustments" => "window.toggle.properties",
+        "color" | "swatches" => "window.toggle.color",
+        "navigator" | "info" | "histogram" => "window.toggle.navigator",
+        "tools" => "window.toggle.toolbar",
+        "options" => "window.toggle.options",
+        "brushSettings" | "brushes" => "window.toggle.brushSettings",
+        _ => return None,
+    })
+}
+
+/// View › Proof Setup presets we can simulate, as `view.proofSetup` profiles.
+fn proof_preset(id: &str) -> Option<&'static str> {
+    Some(match id.strip_prefix("view.proofSetup.")? {
+        "workingCmyk" => "working-cmyk",
+        "internetStandardRgb" | "monitorRgb" => "srgb",
+        _ => return None,
+    })
+}
+
+/// Window › Workspace presets by id.
+fn workspace_name(id: &str) -> Option<&'static str> {
+    Some(match id.strip_prefix("window.workspace.")? {
+        "essentials" | "resetWorkspace" => "",
+        "photography" => "Photography",
+        "painting" => "Painting",
+        "graphicAndWeb" => "Graphic and Web",
+        "pixelArt" => "Pixel Art",
+        "motion" => "Motion",
+        _ => return None,
+    })
+}
+
 /// Run a command id from any source (menu, shortcut, palette, automation).
 pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+    if id == "view.proofSetup.custom" {
+        return Ok(json!({"dialog": crate::filter_dialog::open(app, "view.proofSetup")}));
+    }
+    if id == "window.panel.brushes" {
+        // Window › Brushes opens the Brush Settings window on its presets tab.
+        app.ui.panels.brush_settings = true;
+        app.ui.brush_tab = 1;
+        return Ok(Value::Null);
+    }
+    if id == "window.panel.brushSettings" {
+        app.ui.brush_tab = 0;
+    }
+    // View/Window/Type shell items, and dialogs/pickers in front of File commands.
+    // Edit › Preferences, Keyboard Shortcuts, Color Settings and other Edit dialogs.
+    if let Some(r) = crate::prefs_ui::invoke(app, ctx, id, &params) {
+        return r;
+    }
+    if let Some(r) = crate::view_cmds::invoke(app, ctx, id, &params) {
+        return r;
+    }
+    if let Some(profile) = proof_preset(id) {
+        // View › Proof Setup presets: set the proof profile and turn Proof Colors on.
+        app.run("view.proofSetup", json!({"profile": profile}))?;
+        return app.run("view.proofColors", json!({"on": true}));
+    }
+    if let Some(alias) = panel_alias(id) {
+        return invoke(app, ctx, alias, params);
+    }
+    if let Some(ws) = workspace_name(id) {
+        // Reset re-applies the current workspace; Essentials is the default layout.
+        match (ws, id) {
+            (_, "window.workspace.resetWorkspace") => {}
+            ("", _) => app.ui.workspace = "Essentials".into(),
+            (name, _) => app.ui.workspace = name.into(),
+        }
+        apply_workspace(app);
+        return Ok(json!({"workspace": app.ui.workspace}));
+    }
     match id {
+        // Layer › Rename Layer from a menu starts in-place renaming in the Layers panel.
+        "layer.renameLayer" if params.get("name").is_none() => {
+            let st = app.session.active().ok_or("no document")?;
+            let id = params.get("layer").and_then(Value::as_u64).or(st.active_layer.map(|l| l.0)).ok_or("no active layer")?;
+            let name = st.doc.layer(photocraft_doc::LayerId(id)).map(|l| l.name.clone()).ok_or("no such layer")?;
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new(("rename", id)), name));
+            Ok(Value::Null)
+        }
         "file.new" if params.as_object().is_none_or(|o| o.is_empty()) => {
             let d = app.ui.open_dialog(DialogKind::NewDocument, UiState::new_document_fields());
             Ok(json!({"dialog": d}))
@@ -96,6 +190,21 @@ pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: Va
         "help.about" => Ok(json!({"dialog": app.ui.open_dialog(DialogKind::About, Default::default())})),
         "file.export.exportAs" => Ok(json!({"dialog": crate::export_dialog::open(app)?})),
         "file.export.quickExportAsPng" => crate::export_dialog::quick_export_png(app),
+        // Layer › Export As… / Quick Export as PNG: the export pipeline on just the active layer.
+        l if matches!(l, "layer.exportAs" | "layer.quickExportAsPng") && params.as_object().is_none_or(|o| o.is_empty()) => {
+            let layer = app.session.active().and_then(|d| d.active_layer).ok_or("no active layer")?;
+            if l == "layer.exportAs" { Ok(json!({"dialog": crate::export_dialog::open_layer(app, layer)?})) } else { crate::export_dialog::quick_export_layer_png(app, layer) }
+        }
+        "layer.layerStyle.blendingOptions" if params.as_object().is_none_or(|o| o.is_empty()) => {
+            crate::layer_style::open(app, Some(crate::layer_style::BLENDING)).map(|d| json!({"dialog": d})).ok_or_else(|| "no active layer".to_string())
+        }
+        // Layer Content Options…: the adjustment / fill controls live in Properties.
+        "layer.layerContentOptions" => {
+            let r = app.run(id, params)?;
+            app.ui.panels.properties = true;
+            app.ui.dock_tabs.properties = 0;
+            Ok(r)
+        }
         // Photoshop's "Select and Mask…" is the engine's select.refineEdge.
         "select.selectAndMask" => Ok(json!({"dialog": crate::filter_dialog::open(app, "select.refineEdge")})),
         "edit.paste" if params.as_object().is_none_or(|o| o.is_empty()) => {
@@ -129,6 +238,17 @@ pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: Va
         "edit.freeTransform" | "edit.transform.scale" | "edit.transform.rotate" | "edit.transform.skew" | "edit.transform.distort" | "edit.transform.perspective" => {
             crate::transform_tool::begin(app, ctx).map(|_| json!({"transform": app.ui.transform}))
         }
+        // Edit › Transform › Warp from the menu: interactive Warp mode (with params: the engine).
+        "edit.transform.warp" | "layer.smartObjects.warp" if params.as_object().is_none_or(|o| o.is_empty()) => {
+            crate::transform_tool::begin_warp(app, ctx).map(|_| json!({"transform": app.ui.transform}))
+        }
+        // Split warps edit the mesh of an active Warp session.
+        "edit.transform.splitWarpCrosswise" | "edit.transform.splitWarpHorizontally" | "edit.transform.splitWarpVertically" | "edit.transform.removeWarpSplit"
+            if app.ui.transform.as_ref().is_some_and(|t| t.warp.is_some()) && params.get("warp").is_none() =>
+        {
+            let at = params.get("at").and_then(Value::as_array).and_then(|a| Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?]));
+            crate::transform_tool::split(app, id, at).map(|_| json!({"transform": app.ui.transform}))
+        }
         sz if crate::sizing::is_sizing(sz) && params.as_object().is_none_or(|o| o.is_empty()) => {
             Ok(json!({"dialog": crate::sizing::open(app, sz).ok_or("no document")?}))
         }
@@ -152,10 +272,18 @@ pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: Va
                 "navigator" => &mut p.navigator,
                 "toolbar" => &mut p.toolbar,
                 "options" => &mut p.options_bar,
+                "brushSettings" => &mut p.brush_settings,
                 _ => return Err(format!("unknown panel in {t}")),
             };
             *slot = !*slot;
             Ok(Value::Null)
+        }
+        // Layer › Layer Style › <effect>… opens the Layer Style dialog on that effect.
+        ls if params.as_object().is_none_or(|o| o.is_empty())
+            && ls.strip_prefix("layer.layerStyle.").is_some_and(|k| crate::layer_style::KINDS.iter().any(|(kind, _)| *kind == k)) =>
+        {
+            let kind = &ls["layer.layerStyle.".len()..];
+            crate::layer_style::open(app, Some(kind)).map(|d| json!({"dialog": d})).ok_or_else(|| "no active layer".to_string())
         }
         _ => app.run(id, params),
     }
@@ -178,11 +306,18 @@ fn open_path(_app: &mut PhotocraftApp, path: &str) -> Result<Value, String> {
 }
 
 pub fn is_enabled(app: &PhotocraftApp, id: &str) -> bool {
+    if let Some(e) = crate::view_cmds::is_enabled(app, id) {
+        return e;
+    }
     match id {
         "file.open" | "help.about" | "edit.search" => true,
         i if i.starts_with("window.theme.") => true,
         "file.save" | "file.saveAs" | "file.export.exportAs" | "file.export.quickExportAsPng" => app.session.active().is_some() && app.services.export.is_some(),
         i if i.starts_with("window.toggle.") => true,
+        i if panel_alias(i).is_some() || workspace_name(i).is_some() => true,
+        i if proof_preset(i).is_some() => app.session.active().is_some(),
+        // "Custom…" is the full Proof Setup dialog.
+        "view.proofSetup.custom" => app.session.active().is_some(),
         "view.rulers" | "view.show.grid" | "view.show.guides" | "view.snap" | "view.lockGuides" => true,
         "select.selectAndMask" => app.session.is_enabled("select.refineEdge"),
         i if (i.starts_with("view.zoom") || i == "view.fitOnScreen" || i == "view.actualPixels") || i == "window.newWindowForDocument" => app.session.active().is_some(),
@@ -196,6 +331,21 @@ pub fn is_enabled(app: &PhotocraftApp, id: &str) -> bool {
 /// Is a UI-level panel toggle currently on (for checkmarks)?
 fn checked(app: &PhotocraftApp, id: &str) -> Option<bool> {
     use photocraft_doc::{ColorMode, SampleType};
+    if let Some(c) = crate::view_cmds::checked(app, id) {
+        return Some(c);
+    }
+    if let Some(alias) = panel_alias(id) {
+        return checked(app, alias);
+    }
+    if id == "view.proofColors" || id == "view.gamutWarning" {
+        let d = app.session.active()?;
+        let pv = app.session.color.proof(d.doc.id);
+        return Some(if id == "view.proofColors" { pv.enabled } else { pv.gamut_warning });
+    }
+    if id.starts_with("window.workspace.") && id != "window.workspace.resetWorkspace" {
+        let want = workspace_name(id)?;
+        return Some(app.ui.workspace == if want.is_empty() { "Essentials" } else { want });
+    }
     if let Some(m) = id.strip_prefix("image.mode.") {
         let d = &app.session.active()?.doc;
         return match m {
@@ -227,6 +377,7 @@ fn checked(app: &PhotocraftApp, id: &str) -> Option<bool> {
         "window.toggle.navigator" => p.navigator,
         "window.toggle.toolbar" => p.toolbar,
         "window.toggle.options" => p.options_bar,
+        "window.toggle.brushSettings" => p.brush_settings,
         _ => return None,
     })
 }
@@ -240,11 +391,20 @@ pub struct MenuItem {
     pub shortcut: Option<String>,
     pub enabled: bool,
     pub checked: Option<bool>,
+    /// Edit › Menus colour (red, orange, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+/// Is `id` implemented by the engine or the shell (a live menu item)? Shared by the menus and
+/// the parity report ([`crate::parity`]).
+pub fn is_live(id: &str) -> bool {
+    photocraft_engine::commands::find(id).is_some() || UI_COMMANDS.iter().any(|c| c.0 == id) || panel_alias(id).is_some() || workspace_name(id).is_some() || proof_preset(id).is_some() || id == "view.proofSetup.custom" || crate::view_cmds::handles(id)
 }
 
 pub fn menu_items(app: &PhotocraftApp) -> Vec<MenuItem> {
     // 1) Photoshop's full menu tree, in Photoshop order; live where we implement the command.
-    let known = |id: &str| photocraft_engine::commands::find(id).is_some() || UI_COMMANDS.iter().any(|c| c.0 == id);
+    let known = is_live;
     let mut items: Vec<MenuItem> = crate::menu_catalog::CATALOG
         .iter()
         .map(|&(path, label, sc, id)| MenuItem {
@@ -254,15 +414,16 @@ pub fn menu_items(app: &PhotocraftApp) -> Vec<MenuItem> {
             shortcut: sc.map(Into::into),
             enabled: known(id) && is_enabled(app, id),
             checked: checked(app, id),
+            color: None,
         })
         .collect();
     // 2) Our commands that Photoshop's tree doesn't list (or lists under another id).
     let mut extra: Vec<MenuItem> = Vec::new();
     for &(id, label, path, sc) in UI_COMMANDS {
-        extra.push(MenuItem { id: id.into(), label: label.into(), path: path.iter().map(|s| s.to_string()).collect(), shortcut: sc.map(Into::into), enabled: is_enabled(app, id), checked: checked(app, id) });
+        extra.push(MenuItem { id: id.into(), label: label.into(), path: path.iter().map(|s| s.to_string()).collect(), shortcut: sc.map(Into::into), enabled: is_enabled(app, id), checked: checked(app, id), color: None });
     }
     for c in photocraft_engine::command_specs().iter().filter(|c| !c.menu.is_empty()) {
-        extra.push(MenuItem { id: c.id.into(), label: c.label.into(), path: c.menu.iter().map(|s| s.to_string()).collect(), shortcut: c.shortcut.map(Into::into), enabled: is_enabled(app, c.id), checked: None });
+        extra.push(MenuItem { id: c.id.into(), label: c.label.into(), path: c.menu.iter().map(|s| s.to_string()).collect(), shortcut: c.shortcut.map(Into::into), enabled: is_enabled(app, c.id), checked: None, color: None });
     }
     for e in extra {
         let dup = items.iter().any(|i| i.id == e.id || (i.path == e.path && i.label.trim_end_matches('…') == e.label.trim_end_matches('…')));
@@ -273,7 +434,38 @@ pub fn menu_items(app: &PhotocraftApp) -> Vec<MenuItem> {
             items.insert(at, e);
         }
     }
+    // Edit › Keyboard Shortcuts overrides, Edit › Menus hidden items and colours.
+    let prefs = app.session.prefs();
+    if !prefs.shortcuts.is_empty() {
+        for it in &mut items {
+            if prefs.shortcuts.contains_key(&it.id) {
+                it.shortcut = prefs.shortcut(&it.id, None).map(str::to_string);
+            }
+        }
+    }
+    if !prefs.menus.hidden.is_empty() {
+        items.retain(|i| !prefs.menus.hidden.contains(&i.id));
+    }
+    if prefs.interface.show_menu_colors {
+        for it in &mut items {
+            it.color = prefs.menus.colors.get(&it.id).cloned();
+        }
+    }
     items
+}
+
+/// Background tint of an Edit › Menus colour name.
+fn menu_tint(name: &str) -> Option<egui::Color32> {
+    Some(match name {
+        "red" => egui::Color32::from_rgb(190, 60, 60),
+        "orange" => egui::Color32::from_rgb(200, 120, 40),
+        "yellow" => egui::Color32::from_rgb(190, 170, 40),
+        "green" => egui::Color32::from_rgb(60, 150, 70),
+        "blue" => egui::Color32::from_rgb(50, 110, 200),
+        "violet" => egui::Color32::from_rgb(130, 80, 190),
+        "gray" => egui::Color32::from_rgb(120, 120, 120),
+        _ => return None,
+    })
 }
 
 pub fn menu_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
@@ -336,6 +528,9 @@ fn render_level(ui: &mut egui::Ui, items: &[&MenuItem], depth: usize, clicked: &
                 text = format!("{} {}", if c { "✔" } else { "  " }, text);
             }
             let mut b = egui::Button::new(text);
+            if let Some(tint) = it.color.as_deref().and_then(menu_tint) {
+                b = b.fill(tint.gamma_multiply(0.55));
+            }
             if let Some(sc) = &it.shortcut {
                 b = b.shortcut_text(crate::shortcuts::pretty(sc));
             }
@@ -374,4 +569,54 @@ pub fn apply_workspace(app: &mut PhotocraftApp) {
     p.layers = layers;
     p.history = history;
     p.properties = props;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_panel_and_workspace_ids_drive_the_shell() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let ctx = egui::Context::default();
+        assert!(!app.ui.panels.history);
+        invoke(&mut app, &ctx, "window.panel.history", Value::Null).unwrap();
+        assert!(app.ui.panels.history);
+        assert_eq!(checked(&app, "window.panel.history"), Some(true));
+        invoke(&mut app, &ctx, "window.workspace.painting", Value::Null).unwrap();
+        assert_eq!(app.ui.workspace, "Painting");
+        assert!(!app.ui.panels.properties);
+        assert_eq!(checked(&app, "window.workspace.painting"), Some(true));
+        invoke(&mut app, &ctx, "window.workspace.essentials", Value::Null).unwrap();
+        assert!(app.ui.panels.properties);
+        // Live in the menu, and no duplicate "Layers" entry from the window.toggle.* commands.
+        let items = menu_items(&app);
+        assert!(items.iter().any(|i| i.id == "window.panel.layers" && i.enabled));
+        assert_eq!(items.iter().filter(|i| i.path == ["Window"] && i.label == "Layers").count(), 1);
+        assert!(items.iter().any(|i| i.id == "edit.stroke"));
+    }
+
+    #[test]
+    fn proof_setup_presets_and_checkmarks() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let ctx = egui::Context::default();
+        app.run("file.new", json!({"width": 8, "height": 8})).unwrap();
+        app.sync_views();
+        assert_eq!(checked(&app, "view.proofColors"), Some(false));
+        invoke(&mut app, &ctx, "view.proofSetup.workingCmyk", Value::Null).unwrap();
+        assert_eq!(checked(&app, "view.proofColors"), Some(true));
+        invoke(&mut app, &ctx, "view.gamutWarning", json!({"on": true})).unwrap();
+        assert_eq!(checked(&app, "view.gamutWarning"), Some(true));
+        let doc = app.session.active().unwrap().doc.clone();
+        let lut = app.session.color.canvas_lut(&doc, 9).unwrap().unwrap();
+        assert_eq!(lut.len(), 9 * 9 * 9 * 4);
+        // Pure sRGB green is outside coated CMYK; mid grey is inside.
+        let at = |r: usize, g: usize, b: usize| lut[(r + g * 9 + b * 81) * 4 + 3];
+        assert_eq!((at(0, 8, 0), at(4, 4, 4)), (255, 0));
+        // Custom… opens the generated Proof Setup dialog with a profile choice.
+        assert!(invoke(&mut app, &ctx, "view.proofSetup.custom", Value::Null).unwrap()["dialog"].is_u64());
+        let spec = photocraft_engine::commands::find("edit.convertToProfile").unwrap();
+        let params = crate::filter_dialog::parse_spec(spec.params);
+        assert!(matches!(&params[0].kind, crate::filter_dialog::Kind::Choice(c) if c[0] == "srgb" && !c.iter().any(|v| v.contains('/'))));
+    }
 }

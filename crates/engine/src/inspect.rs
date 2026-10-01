@@ -24,6 +24,7 @@ pub fn session(s: &Session) -> Value {
 
 pub fn document(d: &DocState) -> Value {
     let doc = &d.doc;
+    let selected = d.selected_layers();
     json!({
         "name": doc.name,
         "width": doc.size.width,
@@ -32,18 +33,26 @@ pub fn document(d: &DocState) -> Value {
         "depth": doc.depth.bits(),
         "resolution": doc.resolution_dpi,
         "activeLayer": d.active_layer.map(|l| l.0),
+        "selectedLayers": selected.iter().map(|l| l.0).collect::<Vec<_>>(),
         "hasSelection": doc.selection.is_some(),
         "selectionBounds": doc.selection.as_ref().map(|s| { let r = s.content_bounds(); [r.x0, r.y0, r.width() as i32, r.height() as i32] }),
-        "layers": doc.layers.iter().rev().map(layer).collect::<Vec<_>>(),
+        "layers": doc.layers.iter().rev().map(|l| layer_sel(l, &selected)).collect::<Vec<_>>(),
         "history": d.history.entries(),
         "canUndo": d.history.can_undo(),
         "canRedo": d.history.can_redo(),
         "revision": d.revision,
+        "channels": crate::channel_cmds::channels_json(d),
+        "quickMask": doc.quick_mask.is_some(),
     })
 }
 
 /// Layer tree top-to-bottom (display order).
 pub fn layer(l: &Layer) -> Value {
+    layer_sel(l, &[])
+}
+
+/// [`layer`] with a `selected` flag on every node (Layers panel multi-selection).
+fn layer_sel(l: &Layer, selected: &[photocraft_doc::LayerId]) -> Value {
     let bounds = l.surface().map(|s| {
         let r = s.content_bounds();
         [r.x0, r.y0, r.width() as i32, r.height() as i32]
@@ -59,15 +68,31 @@ pub fn layer(l: &Layer) -> Value {
         "clipped": l.clipped,
         "hasMask": l.mask.is_some(),
         "bounds": bounds,
+        "selected": selected.contains(&l.id),
+        "linkGroup": l.link_group,
     });
     match &l.content {
         LayerContent::Group(g) => {
-            v["children"] = Value::Array(g.children.iter().rev().map(layer).collect());
+            v["children"] = Value::Array(g.children.iter().rev().map(|c| layer_sel(c, selected)).collect());
         }
         LayerContent::Adjustment(a) => {
             v["adjustment"] = serde_json::to_value(a).unwrap_or(Value::Null);
         }
+        LayerContent::Smart(sm) => {
+            v["smartFilters"] = Value::Array(sm.smart_filters.iter().map(|f| json!({"command": f.command, "params": f.params, "visible": f.visible, "opacity": f.opacity, "blend": f.blend.label()})).collect());
+            v["smartFiltersEnabled"] = json!(sm.filters_enabled);
+        }
+        LayerContent::Text(t) => {
+            v["text"] = json!({"text": t.text, "font": t.font_family, "sizePt": t.size_pt});
+        }
         _ => {}
+    }
+    // Layer styles, so agents can verify what they applied (full settings via the style commands).
+    if !l.effects.items.is_empty() {
+        v["effects"] = json!({
+            "enabled": l.effects.enabled,
+            "items": l.effects.items.iter().map(|e| json!({"kind": e.label(), "enabled": e.enabled()})).collect::<Vec<_>>(),
+        });
     }
     v
 }

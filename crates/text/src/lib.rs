@@ -19,6 +19,7 @@ pub mod layout;
 pub mod psd;
 pub mod raster;
 pub mod render;
+pub mod warp;
 
 use photocraft_color::PixelFormat;
 use photocraft_doc::TextLayer;
@@ -69,7 +70,9 @@ impl TextEngine {
         format: PixelFormat,
     ) -> (TextLayout, Rendered) {
         let l = self.layout(layer, dpi);
-        let r = render::rasterize(&l, &layer.transform, format, layer.antialias);
+        let warp = render::layout_warp(&l, layer.warp.as_ref());
+        let r =
+            render::rasterize_warped(&l, &layer.transform, format, layer.antialias, warp.as_ref());
         (l, r)
     }
 

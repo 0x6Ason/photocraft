@@ -420,11 +420,29 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     widgets::checkbox(ui, &mut tc, "Show Transform Controls");
                     widgets::vline(ui, 22.0);
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    for (icon, tip) in [("panels-top-left", "Align left edges"), ("app-window", "Align horizontal centers"), ("panel-right", "Align right edges")] {
-                        let _ = icons::button(ui, icon, 24.0, false, tip);
+                    for (icon, tip, cmd) in [("panels-top-left", "Align left edges", "layer.align.leftEdges"), ("app-window", "Align horizontal centers", "layer.align.horizontalCenters"), ("panel-right", "Align right edges", "layer.align.rightEdges")] {
+                        let on = app.session.is_enabled(cmd);
+                        if ui.add_enabled_ui(on, |ui| icons::button(ui, icon, 24.0, false, tip)).inner.clicked() {
+                            let _ = app.run(cmd, json!({}));
+                        }
                     }
                     ui.add_space(6.0);
-                    let _ = icons::button(ui, "ellipsis", 24.0, false, "Align and distribute");
+                    let more = icons::button(ui, "ellipsis", 24.0, false, "Align and distribute");
+                    egui::Popup::menu(&more).show(|ui| {
+                        ui.set_min_width(200.0);
+                        let mut section = |ui: &mut egui::Ui, title: &str, prefix: &str| {
+                            ui.label(egui::RichText::new(title).small().color(t.text_dim));
+                            for c in photocraft_engine::command_specs().iter().filter(|c| c.id.starts_with(prefix)) {
+                                if ui.add_enabled(app.session.is_enabled(c.id), egui::Button::new(c.label)).clicked() {
+                                    let _ = app.run(c.id, json!({}));
+                                    ui.close();
+                                }
+                            }
+                        };
+                        section(ui, "Align", "layer.align.");
+                        ui.separator();
+                        section(ui, "Distribute", "layer.distribute.");
+                    });
                 }
                 Tool::RectMarquee | Tool::EllipseMarquee => hint(ui, "Drag to select  ·  ⇧ add  ·  ⌥ subtract  ·  ⇧⌥ intersect  ·  click to deselect"),
                 Tool::Move => hint(ui, "Drag to move the active layer"),
@@ -627,6 +645,12 @@ fn info_panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         return;
     };
     let (rev, size) = (st.revision, st.doc.size);
+    // Positions and sizes in the ruler unit (Preferences › Units & Rulers).
+    let units = app.session.prefs().units_and_rulers.clone();
+    let dpi = st.doc.resolution_dpi as f64;
+    let fx = move |px: f64| units.format(px, dpi, size.width as f64);
+    let units_y = app.session.prefs().units_and_rulers.clone();
+    let fy = move |px: f64| units_y.format(px, dpi, size.height as f64);
     let sel = st.doc.selection.as_ref().map(|m| m.content_bounds());
     let pos = app.hover_doc.map(|p| (p[0].floor() as i32, p[1].floor() as i32)).filter(|(x, y)| *x >= 0 && *y >= 0 && *x < size.width as i32 && *y < size.height as i32);
     let rgba = pos.and_then(|(x, y)| {
@@ -666,10 +690,10 @@ fn info_panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     widgets::hairline(ui);
     ui.columns(2, |cols| {
         let dash = || "—".to_string();
-        row(&mut cols[0], "X:", pos.map_or_else(dash, |p| p.0.to_string()));
-        row(&mut cols[0], "Y:", pos.map_or_else(dash, |p| p.1.to_string()));
-        row(&mut cols[1], "W:", sel.map_or_else(dash, |r| r.width().to_string()));
-        row(&mut cols[1], "H:", sel.map_or_else(dash, |r| r.height().to_string()));
+        row(&mut cols[0], "X:", pos.map_or_else(dash, |p| fx(p.0 as f64)));
+        row(&mut cols[0], "Y:", pos.map_or_else(dash, |p| fy(p.1 as f64)));
+        row(&mut cols[1], "W:", sel.map_or_else(dash, |r| fx(r.width() as f64)));
+        row(&mut cols[1], "H:", sel.map_or_else(dash, |r| fy(r.height() as f64)));
     });
     widgets::hairline(ui);
     ui.label(RichText::new(format!("Doc: {} × {} px", size.width, size.height)).color(t.text_dim).size(11.5));
@@ -813,6 +837,7 @@ fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let doc = st.doc.clone();
     let active = st.active_layer;
     let active_layer = active.and_then(|id| doc.layer(id)).cloned();
+    let selection = st.selected_layers();
     let mut actions: Vec<(String, Value)> = Vec::new();
 
     let t = Tokens::get(ui.ctx());
@@ -908,10 +933,12 @@ fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     continue;
                 }
             }
-            layer_row(app, &ctx, ui, &doc, l, *depth, active == Some(l.id), &mut actions);
+            let row = RowSel { selected: selection.contains(&l.id), primary: active == Some(l.id), multi: selection.len() > 1 };
+            layer_row(app, &ctx, ui, &doc, l, *depth, row, &mut actions);
             if !l.effects.items.is_empty() {
                 effect_rows(app, ui, l, *depth);
             }
+            crate::smart_ui::filter_rows(app, ui, l, *depth, &mut actions);
         }
     });
     // End any layer drag after every row has had a chance to accept the drop.
@@ -987,8 +1014,30 @@ fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     }
 }
 
+/// How a Layers panel row is selected: in the (multi-)selection, the primary/active layer, and
+/// whether several layers are selected.
+#[derive(Clone, Copy)]
+struct RowSel {
+    selected: bool,
+    primary: bool,
+    multi: bool,
+}
+
+/// `layer.select` mode for a click with these modifiers (Photoshop: ⌘-click toggles, ⇧-click
+/// selects a range, a plain click selects one layer).
+fn select_mode(m: egui::Modifiers) -> &'static str {
+    if m.command {
+        "toggle"
+    } else if m.shift {
+        "range"
+    } else {
+        "replace"
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn layer_row(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &mut egui::Ui, doc: &photocraft_doc::Document, l: &Layer, depth: usize, selected: bool, actions: &mut Vec<(String, Value)>) {
+fn layer_row(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &mut egui::Ui, doc: &photocraft_doc::Document, l: &Layer, depth: usize, row: RowSel, actions: &mut Vec<(String, Value)>) {
+    let selected = row.selected;
     let t = Tokens::get(ctx);
     let row_h = if t.pro { 36.0 } else { 46.0 };
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
@@ -1023,7 +1072,7 @@ fn layer_row(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &mut egui::Ui, do
     }
     let ts = if t.pro { 28.0 } else { 34.0 };
     let thumb = Rect::from_min_size(pos2(x, rect.center().y - ts / 2.0), vec2(ts, ts));
-    draw_layer_thumb(app, ctx, ui, doc, l, thumb, selected);
+    draw_layer_thumb(app, ctx, ui, doc, l, thumb, row.primary);
     x += ts + 6.0;
     let mut mask_rect = None;
     if let Some(m) = &l.mask {
@@ -1034,8 +1083,8 @@ fn layer_row(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &mut egui::Ui, do
         mask_rect = Some(mr);
         x += ts + 6.0;
     }
-    // Photoshop frames the targeted thumbnail (pixels or mask) of the selected layer with corner brackets.
-    if selected {
+    // Photoshop frames the targeted thumbnail (pixels or mask) of the active layer with corner brackets.
+    if row.primary {
         let target = if app.ui.mask_target { mask_rect } else { Some(thumb) };
         if let Some(r) = target.filter(|_| l.mask.is_some() || !app.ui.mask_target) {
             let r = r.expand(3.0);
@@ -1071,11 +1120,26 @@ fn layer_row(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &mut egui::Ui, do
     if l.blend != BlendMode::Normal && l.blend != BlendMode::PassThrough {
         painter.text(pos2(rect.right() - 30.0, rect.center().y), Align2::RIGHT_CENTER, l.blend.label(), egui::FontId::proportional(10.5), t.text_faint);
     }
-    if l.locks.transparency || l.locks.position || l.locks.all {
+    let locked = l.locks.transparency || l.locks.position || l.locks.all;
+    if locked {
         icons::paint(ui, Rect::from_center_size(pos2(rect.right() - 14.0, rect.center().y), vec2(14.0, 14.0)), "lock", 12.0, t.text_faint);
     }
-    if resp.clicked() && !eye_resp.clicked() {
-        actions.push(("layer.select".into(), json!({"layer": l.id.0})));
+    if l.link_group.is_some() {
+        let x = rect.right() - if locked { 30.0 } else { 14.0 };
+        icons::paint(ui, Rect::from_center_size(pos2(x, rect.center().y), vec2(14.0, 14.0)), "link", 12.0, t.text_faint);
+    }
+    // ⌘-click a layer or mask thumbnail loads its transparency / mask as a selection (⇧ add,
+    // ⌥ subtract, ⇧⌥ intersect) instead of changing the layer selection.
+    let thumb_load = resp.clicked().then(|| (ui.input(|i| i.modifiers), resp.interact_pointer_pos())).and_then(|(m, pos)| {
+        let p = pos.filter(|_| m.command)?;
+        let on_mask = mask_rect.is_some_and(|r| r.expand(2.0).contains(p));
+        (on_mask || thumb.expand(2.0).contains(p)).then(|| json!({"channel": if on_mask { "mask" } else { "transparency" }, "layer": l.id.0, "operation": crate::channels_panel::load_operation(m)}))
+    });
+    if let Some(p) = thumb_load {
+        actions.push(("select.loadSelection".into(), p));
+    } else if resp.clicked() && !eye_resp.clicked() {
+        let mode = select_mode(ui.input(|i| i.modifiers));
+        actions.push(("layer.select".into(), json!({"layer": l.id.0, "mode": mode})));
         // Clicking a thumbnail picks what painting targets; adjustment/fill layers target their mask.
         let pos = resp.interact_pointer_pos();
         let on_mask = mask_rect.zip(pos).is_some_and(|(r, p)| r.expand(2.0).contains(p));
@@ -1083,7 +1147,7 @@ fn layer_row(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &mut egui::Ui, do
         let content_less = matches!(l.content, LayerContent::Adjustment(_) | LayerContent::Fill(_));
         if on_mask || (content_less && l.mask.is_some()) {
             actions.push(("ui.maskTarget".into(), json!(true)));
-        } else if on_thumb || !selected {
+        } else if on_thumb || !row.primary {
             actions.push(("ui.maskTarget".into(), json!(false)));
         }
     }
@@ -1112,15 +1176,21 @@ fn layer_row(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &mut egui::Ui, do
     resp.context_menu(|ui| {
         ui.set_min_width(200.0);
         let id = l.id.0;
+        // Right-clicking inside a multi-selection keeps it and acts on every selected layer.
+        let on_set = row.multi && selected;
         let mut item = |ui: &mut egui::Ui, label: &str, cmd: &str| {
             if ui.button(label).clicked() {
-                actions.push(("layer.select".into(), json!({"layer": id})));
-                actions.push((cmd.into(), json!({"layer": id})));
+                if on_set {
+                    actions.push((cmd.into(), json!({})));
+                } else {
+                    actions.push(("layer.select".into(), json!({"layer": id})));
+                    actions.push((cmd.into(), json!({"layer": id})));
+                }
                 ui.close();
             }
         };
-        item(ui, "Duplicate Layer", "layer.duplicate");
-        item(ui, "Delete Layer", "layer.delete");
+        item(ui, if on_set { "Duplicate Layers" } else { "Duplicate Layer" }, "layer.duplicate");
+        item(ui, if on_set { "Delete Layers" } else { "Delete Layer" }, "layer.delete");
         ui.separator();
         if l.clipped {
             item(ui, "Release Clipping Mask", "layer.releaseClippingMask");
@@ -1134,7 +1204,12 @@ fn layer_row(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &mut egui::Ui, do
         }
         ui.separator();
         item(ui, "Group Layers", "layer.groupLayers");
-        item(ui, "Merge Down", "layer.mergeDown");
+        if on_set {
+            item(ui, "Merge Layers", "layer.mergeLayers");
+            item(ui, "Link Layers", "layer.linkLayers");
+        } else {
+            item(ui, "Merge Down", "layer.mergeDown");
+        }
         if ui.button("Flatten Image").clicked() {
             actions.push(("layer.flattenImage".into(), json!({})));
             ui.close();
@@ -1177,40 +1252,11 @@ fn draw_layer_thumb(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &egui::Ui,
     }
     let stroke = if t.pro { Stroke::new(1.0, Color32::from_gray(20)) } else if selected { Stroke::new(1.5, t.text) } else { Stroke::new(1.0, t.field_border) };
     p.rect_stroke(rect, CornerRadius::same(if t.pro { 0 } else { 5 }), stroke, StrokeKind::Outside);
+    crate::smart_ui::thumb_badge(ui, l, rect);
 }
 
 fn channels(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
-    let Some(st) = app.session.active() else {
-        empty(ui, "No document");
-        return;
-    };
-    let doc = st.doc.clone();
-    let names: Vec<&str> = match doc.mode {
-        photocraft_doc::ColorMode::Cmyk => vec!["CMYK", "Cyan", "Magenta", "Yellow", "Black"],
-        photocraft_doc::ColorMode::Grayscale => vec!["Gray"],
-        photocraft_doc::ColorMode::Lab => vec!["Lab", "Lightness", "a", "b"],
-        _ => vec!["RGB", "Red", "Green", "Blue"],
-    };
-    let t = Tokens::get(ui.ctx());
-    let ctx = ui.ctx().clone();
-    let thumbs = app.channel_thumbs(&ctx);
-    for (i, n) in names.iter().enumerate() {
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
-        if i == 0 || resp.hovered() {
-            ui.painter().rect_filled(rect, 0.0, if i == 0 { t.row_selected.gamma_multiply(if t.pro { 1.0 } else { 0.0 }) } else { t.hover.gamma_multiply(0.4) });
-        }
-        icons::paint(ui, Rect::from_min_size(pos2(rect.left() + 6.0, rect.center().y - 9.0), vec2(18.0, 18.0)), "eye", 13.0, t.icon);
-        let thumb = Rect::from_min_size(pos2(rect.left() + 34.0, rect.center().y - 14.0), vec2(28.0, 28.0));
-        if let Some(tex) = thumbs.get(i.min(thumbs.len().saturating_sub(1))) {
-            ui.painter().image(*tex, thumb, Rect::from_min_max(egui::Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-        }
-        ui.painter().rect_stroke(thumb, 0.0, Stroke::new(1.0, t.separator), StrokeKind::Outside);
-        ui.painter().text(pos2(thumb.right() + 10.0, rect.center().y), Align2::LEFT_CENTER, *n, egui::FontId::proportional(12.0), t.text);
-        ui.painter().text(pos2(rect.right() - 8.0, rect.center().y), Align2::RIGHT_CENTER, format!("⌘{}", i + 2), theme::mono(11.0), t.text_faint);
-        if t.pro {
-            ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, t.separator));
-        }
-    }
+    crate::channels_panel::show(app, ui);
 }
 
 fn history(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
@@ -1439,7 +1485,11 @@ fn adjustment_controls(app: &mut PhotocraftApp, ui: &mut egui::Ui, id: LayerId, 
         }
         ui.add_space(4.0);
     }
-    if adjustment_sliders(kind).is_empty() && !tone && kind != "invert" {
+    if kind == "selectiveColor" {
+        crate::adjust_ui::selective_color_editor(app, ui, id, adj);
+    } else if kind == "colorLookup" {
+        crate::adjust_ui::color_lookup_editor(app, ui, id, adj);
+    } else if adjustment_sliders(kind).is_empty() && !tone && kind != "invert" {
         ui.label(RichText::new("Detailed controls for this adjustment arrive in milestone M7.").color(t.text_faint));
     }
     if live {
@@ -1547,7 +1597,7 @@ fn adjustments_grid(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     ui.label(RichText::new("Add an adjustment").color(t.text_dim));
     ui.add_space(4.0);
-    let items: [(&str, &str, &str); 14] = [
+    let items: [(&str, &str, &str); 16] = [
         ("brightnessContrast", "sun", "Brightness/Contrast"),
         ("levels", "gauge", "Levels"),
         ("curves", "pen-tool", "Curves"),
@@ -1562,6 +1612,8 @@ fn adjustments_grid(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         ("posterize", "layers", "Posterize"),
         ("threshold", "square", "Threshold"),
         ("gradientMap", "palette", "Gradient Map"),
+        ("selectiveColor", "swatch-book", "Selective Color"),
+        ("colorLookup", "grid-3x3", "Color Lookup"),
     ];
     let mut run = None;
     ui.horizontal_wrapped(|ui| {

@@ -353,11 +353,10 @@ fn guides_and_alpha_names_roundtrip() {
     d.guides.horizontal = vec![1.0, 2.5];
     d.guides.vertical = vec![7.03125];
     for name in ["Spot \u{e9}", "Alpha 2"] {
-        d.channels.push(photocraft_doc::AlphaChannel {
-            name: name.into(),
-            surface: photocraft_raster::Surface::new(photocraft_color::PixelFormat::new(photocraft_color::ColorMode::Grayscale, photocraft_color::SampleType::U8, false)),
-            spot: None,
-        });
+        d.channels.push(photocraft_doc::AlphaChannel::new(
+            name,
+            photocraft_raster::Surface::new(photocraft_color::PixelFormat::new(photocraft_color::ColorMode::Grayscale, photocraft_color::SampleType::U8, false)),
+        ));
     }
     let f = document_to_psd(&d);
     // RGB + merged transparency (the empty document is transparent) + 2 alpha channels.

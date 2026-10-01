@@ -11,7 +11,10 @@ use photocraft_doc::{
 };
 use photocraft_psd::descriptor::{Descriptor, Id, UnicodeString, Value, VersionedDescriptor};
 
-use crate::blocks::{bool_of, color_from_desc, color_to_desc, enum_of, get_desc, gradient_desc, gradient_style, gradient_style_value, num};
+use crate::blocks::{
+    bool_of, color_from_desc, color_to_desc, enum_of, get_desc, gradient_desc, gradient_style, gradient_style_value, num, pattern_placement, pattern_ref,
+    pattern_ref_desc, with_pattern_placement,
+};
 
 const BLEND_NAMES: [(BlendMode, &str); 28] = [
     (BlendMode::Normal, "Nrml"),
@@ -220,12 +223,9 @@ fn parse_one(key: &str, d: &Descriptor) -> Option<Effect> {
         "SoFi" => Effect::ColorOverlay { common: common(d, BlendMode::Normal, 1.0), color: color(d, "Clr ") },
         "GrFl" => Effect::GradientOverlay { common: common(d, BlendMode::Normal, 1.0), gradient: gradient_from(d), dither: bool_of(d, "Dthr") },
         "patternFill" => {
-            let p = get_desc(d, "Ptrn");
-            let text = |k: &str| match p.and_then(|p| p.get(k)) {
-                Some(Value::Text(t)) => t.to_string_lossy(),
-                _ => String::new(),
-            };
-            Effect::PatternOverlay { common: common(d, BlendMode::Normal, 1.0), name: text("Nm  "), id: text("Idnt"), scale: pct(d, "Scl ", 1.0) }
+            let (name, id) = pattern_ref(d);
+            let (angle, link, phase) = pattern_placement(d);
+            Effect::PatternOverlay { common: common(d, BlendMode::Normal, 1.0), name, id, scale: pct(d, "Scl ", 1.0), angle, link, phase }
         }
         "ChFX" => Effect::Satin(Satin {
             common: common(d, BlendMode::Multiply, 0.5),
@@ -393,16 +393,14 @@ fn write_one(e: &Effect) -> (&'static str, Descriptor) {
         Effect::GradientOverlay { common: c, gradient, dither } => {
             ("GrFl", gradient_keys(with_common(Descriptor::new("GrFl"), c), gradient).with("Dthr", Value::Boolean(*dither)))
         }
-        Effect::PatternOverlay { common: c, name, id, scale } => (
+        Effect::PatternOverlay { common: c, name, id, scale, angle, link, phase } => (
             "patternFill",
-            with_common(Descriptor::new("patternFill"), c)
-                .with(
-                    "Ptrn",
-                    Value::Descriptor(
-                        Descriptor::new("Ptrn").with("Nm  ", Value::Text(UnicodeString::new_nul(name))).with("Idnt", Value::Text(UnicodeString::new_nul(id))),
-                    ),
-                )
-                .with("Scl ", unit(b"#Prc", scale * 100.0)),
+            with_pattern_placement(
+                with_common(Descriptor::new("patternFill"), c).with("Ptrn", Value::Descriptor(pattern_ref_desc(name, id))).with("Scl ", unit(b"#Prc", scale * 100.0)),
+                *angle,
+                *link,
+                *phase,
+            ),
         ),
         Effect::Satin(s) => (
             "ChFX",
@@ -606,7 +604,7 @@ mod tests {
             Effect::Stroke(StrokeFx { common: FxCommon::new(BlendMode::Multiply, 0.5), size: 6.0, position: StrokePosition::Center, paint: FxPaint::Gradient(g.clone()) }),
             Effect::ColorOverlay { common: FxCommon::new(BlendMode::Overlay, 0.5), color: Color::rgb(0.0, 0.0, 1.0) },
             Effect::GradientOverlay { common: FxCommon::new(BlendMode::Normal, 1.0), gradient: g, dither: true },
-            Effect::PatternOverlay { common: FxCommon::new(BlendMode::Normal, 1.0), name: "Bubbles".into(), id: "abc".into(), scale: 1.0 },
+            Effect::PatternOverlay { common: FxCommon::new(BlendMode::Normal, 1.0), name: "Bubbles".into(), id: "abc".into(), scale: 1.0, angle: 15.0, link: false, phase: (4.0, 2.0) },
             Effect::Satin(Satin { common: FxCommon::new(BlendMode::Multiply, 0.5), color: Color::BLACK, angle: 19.0, distance: 11.0, size: 14.0, contour: Contour::Linear, anti_alias: true, invert: true }),
             Effect::BevelEmboss(Bevel {
                 enabled: true,

@@ -166,9 +166,70 @@ fn parse_any(key: &[u8; 4], data: &[u8], cged: Option<&[u8]>) -> Adjustment {
             Some(Adjustment::Levels { master: m, per_channel: [r, g, b] })
         })(),
         b"curv" => parse_curves(data),
+        b"selc" => parse_selective(data),
+        b"clrL" => parse_lookup(data),
         _ => None,
     };
     parsed.unwrap_or_else(|| unsupported(key, data))
+}
+
+/// `selc`: version, method (0 relative / 1 absolute), then 10 CMYK records of i16 percentages;
+/// record 0 is reserved, records 1..=9 are reds … blacks.
+fn parse_selective(d: &[u8]) -> Option<Adjustment> {
+    if be16(d, 0)? != 1 || d.len() < 84 {
+        return None;
+    }
+    let relative = be16(d, 2)? == 0;
+    let mut adjustments = [[0.0f32; 4]; 9];
+    for (r, rec) in adjustments.iter_mut().enumerate() {
+        for (k, v) in rec.iter_mut().enumerate() {
+            *v = f32::from(bei16(d, 4 + (r + 1) * 8 + k * 2)?);
+        }
+    }
+    Some(Adjustment::SelectiveColor { relative, adjustments })
+}
+
+fn desc_text(d: &Descriptor, key: &str) -> Option<String> {
+    match d.get(key)? {
+        Value::Text(t) => Some(t.to_string_lossy()),
+        _ => None,
+    }
+}
+
+fn desc_enum<'a>(d: &'a Descriptor, key: &str) -> Option<&'a [u8]> {
+    match d.get(key)? {
+        Value::Enumerated { value, .. } => Some(value.as_bytes()),
+        _ => None,
+    }
+}
+
+/// `clrL`: version 1 + a versioned descriptor carrying the LUT file itself (`LUT3DFileData`, in
+/// the format named by `LUTFormat`). Profile-based lookups (abstract / device link) have no
+/// table and stay [`Adjustment::Unsupported`].
+fn parse_lookup(d: &[u8]) -> Option<Adjustment> {
+    if be16(d, 0)? != 1 {
+        return None;
+    }
+    let (v, _) = VersionedDescriptor::parse_prefix(d.get(2..)?).ok()?;
+    let desc = v.descriptor;
+    let bytes = match desc.get("LUT3DFileData")? {
+        Value::RawData(b) if !b.is_empty() => b,
+        _ => return None,
+    };
+    let ext = match desc_enum(&desc, "LUTFormat") {
+        Some(b"LUTFormat3DL") => "x.3dl",
+        Some(b"LUTFormatLOOK") => "x.look",
+        _ => "x.cube",
+    };
+    let lut = photocraft_cms::lutfile::parse(ext, bytes).ok()?;
+    let name = desc_text(&desc, "LUT3DFileName").or_else(|| desc_text(&desc, "NM  ")).unwrap_or_default();
+    Some(Adjustment::ColorLookup {
+        name,
+        size: lut.size as u32,
+        lut: Some(std::sync::Arc::new(lut.data)),
+        tetrahedral: false,
+        dither: desc_bool(&desc, "Dthr").unwrap_or(false),
+    })
 }
 
 fn put16(v: &mut Vec<u8>, x: u16) {
@@ -278,6 +339,35 @@ pub fn write(adj: &Adjustment) -> Vec<([u8; 4], Vec<u8>)> {
             }
             return vec![(*b"curv", v)];
         }
+        Adjustment::SelectiveColor { relative, adjustments } => {
+            put16(&mut v, 1);
+            put16(&mut v, u16::from(!*relative));
+            v.extend_from_slice(&[0; 8]);
+            for rec in adjustments {
+                for x in rec {
+                    v.extend_from_slice(&clamp_i16(x.clamp(-100.0, 100.0)).to_be_bytes());
+                }
+            }
+            return vec![(*b"selc", v)];
+        }
+        Adjustment::ColorLookup { name, lut: Some(table), size, dither, .. } => {
+            let file = photocraft_cms::lutfile::LutFile { title: String::new(), size: *size as usize, data: table.to_vec() };
+            let en = |t: &str, val: &str| Value::Enumerated { type_id: photocraft_psd::descriptor::Id::new(t), value: photocraft_psd::descriptor::Id::new(val) };
+            let text = |t: &str| Value::Text(photocraft_psd::descriptor::UnicodeString::new_nul(t));
+            let d = Descriptor::new("null")
+                .with("lookupType", en("colorLookupType", "3DLUT"))
+                .with("NM  ", text(name))
+                .with("Dthr", Value::Boolean(*dither))
+                .with("profile", Value::RawData(Vec::new()))
+                .with("LUTFormat", en("LUTFormatType", "LUTFormatCUBE"))
+                .with("dataOrder", en("colorLookupOrder", "rgbOrder"))
+                .with("tableOrder", en("colorLookupOrder", "bgrOrder"))
+                .with("LUT3DFileData", Value::RawData(photocraft_cms::lutfile::write_cube(&file).into_bytes()))
+                .with("LUT3DFileName", text(name));
+            put16(&mut v, 1);
+            v.extend_from_slice(&VersionedDescriptor::new(d).to_bytes());
+            return vec![(*b"clrL", v)];
+        }
         Adjustment::Unsupported { psd_key, raw } => {
             let k = psd_key.as_bytes();
             if k.len() == 4 {
@@ -327,6 +417,58 @@ mod tests {
             per_channel: [pts(&[(0, 10), (255, 255)]), pts(&[(0, 0), (255, 245)]), pts(&[(0, 0), (64, 32), (255, 255)])],
         });
         rt(Adjustment::Unsupported { psd_key: "selc".into(), raw: vec![1, 2, 3] });
+        rt(Adjustment::SelectiveColor { relative: true, adjustments: std::array::from_fn(|r| [r as f32 * 10.0 - 40.0, 5.0, -100.0, 100.0]) });
+        rt(Adjustment::SelectiveColor { relative: false, adjustments: [[0.0; 4]; 9] });
+        let id = photocraft_cms::lutfile::LutFile::identity(5);
+        rt(Adjustment::ColorLookup { name: "Look.cube".into(), lut: Some(std::sync::Arc::new(id.data)), size: 5, tetrahedral: false, dither: true });
+    }
+
+    #[test]
+    fn selective_color_synthetic_block() {
+        // Absolute; reds = (+10, -20, +30, -40), blacks = (0, 0, 0, 25).
+        let mut d = vec![0, 1, 0, 1];
+        d.extend([0u8; 8]);
+        for r in 0..9 {
+            let rec: [i16; 4] = match r {
+                0 => [10, -20, 30, -40],
+                8 => [0, 0, 0, 25],
+                _ => [0; 4],
+            };
+            for x in rec {
+                d.extend(x.to_be_bytes());
+            }
+        }
+        let a = parse(b"selc", &d, None, Channels::Rgb);
+        let Adjustment::SelectiveColor { relative, adjustments } = &a else { panic!("{a:?}") };
+        assert!(!relative);
+        assert_eq!(adjustments[0], [10.0, -20.0, 30.0, -40.0]);
+        assert_eq!(adjustments[8], [0.0, 0.0, 0.0, 25.0]);
+        // Written back byte-exact.
+        assert_eq!(write(&a)[0].1, d);
+    }
+
+    #[test]
+    fn color_lookup_synthetic_block() {
+        let cube = b"TITLE \"t\"\nLUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+        let en = |t: &str, val: &str| Value::Enumerated { type_id: photocraft_psd::descriptor::Id::new(t), value: photocraft_psd::descriptor::Id::new(val) };
+        let desc = Descriptor::new("null")
+            .with("lookupType", en("colorLookupType", "3DLUT"))
+            .with("NM  ", Value::Text(photocraft_psd::descriptor::UnicodeString::new_nul("Id")))
+            .with("Dthr", Value::Boolean(true))
+            .with("LUTFormat", en("LUTFormatType", "LUTFormatCUBE"))
+            .with("LUT3DFileData", Value::RawData(cube.to_vec()));
+        let mut d = vec![0, 1];
+        d.extend(VersionedDescriptor::new(desc).to_bytes());
+        let a = parse(b"clrL", &d, None, Channels::Rgb);
+        let Adjustment::ColorLookup { name, lut: Some(t), size: 2, dither: true, .. } = &a else { panic!("{a:?}") };
+        assert_eq!(name, "Id");
+        assert_eq!(&t[..6], &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        // A profile-based lookup (no table) is preserved raw.
+        let mut p = vec![0, 1];
+        p.extend(VersionedDescriptor::new(Descriptor::new("null").with("lookupType", en("colorLookupType", "abstractProfile"))).to_bytes());
+        assert!(matches!(parse(b"clrL", &p, None, Channels::Rgb), Adjustment::Unsupported { .. }));
+        assert!(matches!(parse(b"clrL", &[0, 1, 9], None, Channels::Rgb), Adjustment::Unsupported { .. }));
+        assert!(matches!(parse(b"selc", &[0, 1, 0, 0], None, Channels::Rgb), Adjustment::Unsupported { .. }));
     }
 
     #[test]

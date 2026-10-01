@@ -2,7 +2,7 @@
 //! bit depth) conversions, Duplicate.
 
 use photocraft_algo::resample::{Resample, crop_surface, resize_surface, translate_surface};
-use photocraft_color::{ColorMode, PixelFormat, SampleType};
+use photocraft_color::{ColorMode, SampleType};
 use photocraft_doc::{Document, Effect, Effects, FxPaint, Layer, LayerContent, Size};
 use photocraft_geom::Rect;
 use photocraft_raster::Surface;
@@ -57,7 +57,7 @@ fn for_each_layer(layers: &mut [Layer], f: &mut dyn FnMut(&mut Layer)) {
     }
 }
 
-fn scale_effects(fx: &mut Effects, k: f32) {
+pub(crate) fn scale_effects(fx: &mut Effects, k: f32) {
     for e in &mut fx.items {
         match e {
             Effect::DropShadow(s) | Effect::InnerShadow(s) => {
@@ -130,7 +130,7 @@ fn image_size(s: &mut Session, p: &Value) -> Result<Value> {
         });
         let k = ((sx + sy) / 2.0) as f32;
         for_each_layer(&mut doc.layers, &mut |l| scale_effects(&mut l.effects, k));
-        for ch in &mut doc.channels {
+        for ch in doc.channels.iter_mut().chain(doc.quick_mask.as_mut()) {
             ch.surface = resize_surface(&ch.surface, sx, sy, Resample::Bilinear);
         }
         if let Some(sel) = &doc.selection {
@@ -154,7 +154,7 @@ fn translate_doc(doc: &mut Document, dx: i32, dy: i32) {
         return;
     }
     for_each_surface(&mut doc.layers, true, &mut |surf, _| *surf = translate_surface(surf, dx, dy));
-    for ch in &mut doc.channels {
+    for ch in doc.channels.iter_mut().chain(doc.quick_mask.as_mut()) {
         ch.surface = translate_surface(&ch.surface, dx, dy);
     }
     if let Some(sel) = &doc.selection {
@@ -297,22 +297,9 @@ fn trim(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "x": r.x0, "y": r.y0, "width": r.width(), "height": r.height() }))
 }
 
-/// Image → Mode → colour model.
-fn convert_mode(s: &mut Session, mode: ColorMode) -> Result<Value> {
-    s.edit("Mode Change", |doc, _| {
-        if doc.mode == mode {
-            return Ok(());
-        }
-        let fmt = PixelFormat::new(mode, doc.depth, true);
-        for_each_surface(&mut doc.layers, false, &mut |surf, _| {
-            if surf.format() != fmt {
-                *surf = surf.convert(fmt);
-            }
-        });
-        doc.mode = mode;
-        Ok(())
-    })?;
-    Ok(Value::Null)
+/// Image → Mode → colour model, through the CMS (see [`crate::color_cmds::convert_mode`]).
+fn convert_mode(s: &mut Session, mode: ColorMode, p: &Value) -> Result<Value> {
+    crate::color_cmds::convert_mode(s, mode, p)
 }
 
 /// Image → Mode → 8/16/32 Bits/Channel.
@@ -325,7 +312,7 @@ fn convert_depth(s: &mut Session, depth: SampleType) -> Result<Value> {
             let f = surf.format().with_sample(depth);
             *surf = surf.convert(f);
         });
-        for ch in &mut doc.channels {
+        for ch in doc.channels.iter_mut().chain(doc.quick_mask.as_mut()) {
             let f = ch.surface.format().with_sample(depth);
             ch.surface = ch.surface.convert(f);
         }
@@ -369,10 +356,10 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!("image.canvasSize", "Canvas Size…", ["Image"], r##"{"width":px,"height":px,"relative":bool=false,"anchor":"topLeft|top|topRight|left|center|right|bottomLeft|bottom|bottomRight"="center","extensionColor":"background|foreground|white|black|transparent|#rrggbb"="background"}"##, has_doc, canvas_size),
         spec!("image.crop", "Crop", ["Image"], r##"{"x":px,"y":px,"width":px,"height":px,"deleteCroppedPixels":bool=true}"##, has_doc, crop),
         spec!("image.trim", "Trim…", ["Image"], r##"{"basedOn":"transparent|topLeft|bottomRight"="transparent","top":bool=true,"bottom":bool=true,"left":bool=true,"right":bool=true}"##, has_doc, trim),
-        spec!("image.mode.rgb", "RGB Color", ["Image", "Mode"], "{}", has_doc, |s, _| convert_mode(s, ColorMode::Rgb)),
-        spec!("image.mode.grayscale", "Grayscale", ["Image", "Mode"], "{}", has_doc, |s, _| convert_mode(s, ColorMode::Grayscale)),
-        spec!("image.mode.cmyk", "CMYK Color", ["Image", "Mode"], "{}", has_doc, |s, _| convert_mode(s, ColorMode::Cmyk)),
-        spec!("image.mode.lab", "Lab Color", ["Image", "Mode"], "{}", has_doc, |s, _| convert_mode(s, ColorMode::Lab)),
+        spec!("image.mode.rgb", "RGB Color", ["Image", "Mode"], r##"{"profile":"<builtin id>|working|/path/to/profile.icc"=working,"intent":"perceptual|relative|saturation|absolute"="relative","bpc":bool=true}"##, has_doc, |s, p| convert_mode(s, ColorMode::Rgb, p)),
+        spec!("image.mode.grayscale", "Grayscale", ["Image", "Mode"], r##"{"profile":"<builtin id>|working|/path/to/profile.icc"=working,"intent":"perceptual|relative|saturation|absolute"="relative","bpc":bool=true}"##, has_doc, |s, p| convert_mode(s, ColorMode::Grayscale, p)),
+        spec!("image.mode.cmyk", "CMYK Color", ["Image", "Mode"], r##"{"profile":"<builtin id>|working|/path/to/profile.icc"=working,"intent":"perceptual|relative|saturation|absolute"="relative","bpc":bool=true}"##, has_doc, |s, p| convert_mode(s, ColorMode::Cmyk, p)),
+        spec!("image.mode.lab", "Lab Color", ["Image", "Mode"], r##"{"profile":"<builtin id>|working|/path/to/profile.icc"=working,"intent":"perceptual|relative|saturation|absolute"="relative","bpc":bool=true}"##, has_doc, |s, p| convert_mode(s, ColorMode::Lab, p)),
         spec!("image.mode.bits8", "8 Bits/Channel", ["Image", "Mode"], "{}", has_doc, |s, _| convert_depth(s, SampleType::U8)),
         spec!("image.mode.bits16", "16 Bits/Channel", ["Image", "Mode"], "{}", has_doc, |s, _| convert_depth(s, SampleType::U16)),
         spec!("image.mode.bits32", "32 Bits/Channel", ["Image", "Mode"], "{}", has_doc, |s, _| convert_depth(s, SampleType::F32)),

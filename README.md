@@ -1,26 +1,241 @@
-photocraft
-===========
+<h1 align="center">📷 Photocraft</h1>
 
-By the artcraft team
+<p align="center">
+  <b>The image editor you already know how to use.</b><br>
+  Layers, masks, adjustment layers, layer styles, type, vectors, brushes and real PSD files,<br>
+  in a native app written entirely in Rust. Open source, offline, and yours.
+</p>
 
-An open-source, native image editor written in Rust, aiming for Photoshop-level capability and ergonomics.
+<p align="center">
+  <img alt="100% Rust" src="https://img.shields.io/badge/100%25-Rust-b7410e?style=flat-square&logo=rust">
+  <img alt="macOS · Windows · Linux · Web" src="https://img.shields.io/badge/macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20Web-native-2b6cb0?style=flat-square">
+  <img alt="License: MIT or Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-3a3a3a?style=flat-square">
+  <img alt="Status: early alpha" src="https://img.shields.io/badge/status-early%20alpha-d69e2e?style=flat-square">
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> ·
+  <a href="#everything-in-the-box">Everything in the box</a> ·
+  <a href="#psd-without-compromise">PSD</a> ·
+  <a href="#built-for-agents">Agents</a> ·
+  <a href="#get-started">Get started</a> ·
+  <a href="#crafting-apps">Crafting Apps</a>
+</p>
 
 <p align="center">
   <img src="docs/images/photocraft-demo.jpg" alt="Photocraft editing Hokusai's The Great Wave: a caption card with a drop shadow, type layers, Vibrance and Curves adjustment layers, and the Curves editor with its histogram" width="100%">
   <br>
-  <sub>Artwork: <i>The Great Wave off Kanagawa</i>, Katsushika Hokusai, c. 1831 (public domain, via Wikimedia Commons).</sub>
+  <sub><i>The Great Wave off Kanagawa</i>, Katsushika Hokusai, c. 1831</sub>
 </p>
 
-- **Native and portable:** egui on wgpu (Metal/Vulkan/DX12/WebGPU), for macOS, Windows, Linux and the web. Mobile shells come later.
-- **Photoshop-grade formats:** a standalone PSD/PSB crate (byte-exact round trips on a real-file corpus), plus 13 raster formats with symmetric read/write at 8/16/32-bit.
-- **Engine first:** every action is a command, so the UI, CLI and automation (a JSON control channel and an MCP server) all drive the same core.
+<br>
+
+<table>
+  <tr>
+    <td width="25%" valign="top">
+      <h3>🎛️ Familiar by design</h3>
+      The menus, shortcuts, panels and tools are where your hands expect them, from ⌘J to ⇧⌘D. If you know Photoshop, you already know Photocraft.
+    </td>
+    <td width="25%" valign="top">
+      <h3>⚡ Native and fast</h3>
+      A GPU compositor on wgpu (Metal, Vulkan, DX12, WebGPU), copy-on-write tiles and multithreaded filters. No Electron, no web view, no waiting.
+    </td>
+    <td width="25%" valign="top">
+      <h3>🗂️ Real PSD files</h3>
+      Open, edit and save layered Photoshop documents. 134 of 135 real-world PSDs round-trip byte for byte.
+    </td>
+    <td width="25%" valign="top">
+      <h3>🤖 Agent-ready</h3>
+      Every action is a command, so you can drive the same engine from the UI, the CLI, a JSON control channel or an MCP server.
+    </td>
+  </tr>
+</table>
+
+<br>
+
+## Features
+
+<table>
+  <tr>
+    <td width="58%"><img src="docs/images/photocraft-adjustments.jpg" alt="Vibrance and Levels adjustment layers with the Histogram panel" width="100%"></td>
+    <td width="42%" valign="middle">
+      <h3>Edit without regret.</h3>
+      Adjustment layers keep every edit live. Stack Levels, Curves, Vibrance, Hue/Saturation and a dozen more, mask them to an area, reorder them, or turn them off, and your original pixels never change.
+      <br><br>
+      <b>16 adjustment layers</b> that also apply directly to pixels, including Curves with per-channel editing, Levels with a live histogram, Black &amp; White, Channel Mixer, Gradient Map, Photo Filter, Selective Color and Color Lookup (.cube, .3dl, .look). Plus Shadows/Highlights, Replace Color, Match Color, HDR Toning, Desaturate and Equalize.
+      <br><br>
+      <sub><i>Impression, Sunrise</i>, Claude Monet, 1872</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="42%" valign="middle">
+      <h3>Styles that sell the shot.</h3>
+      Drop Shadow, Inner Shadow, Outer and Inner Glow, Bevel &amp; Emboss, Satin, Stroke, and Color, Gradient and Pattern Overlay, live on any layer, including type. Patterns come from a library (built-ins, Edit › Define Pattern, <code>.pat</code> import/export) and PSD <code>Patt</code> blocks.
+      <br><br>
+      Copy and paste styles between layers, hide all effects at once, and open styles straight from your PSDs, rendered to match Photoshop.
+      <br><br>
+      <sub><i>Earthrise</i>, William Anders / NASA, 1968</sub>
+    </td>
+    <td width="58%"><img src="docs/images/photocraft-layer-styles.jpg" alt="Outer Glow and Stroke on live type, in the Layer Style dialog" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="58%"><img src="docs/images/photocraft-masks.jpg" alt="A feathered elliptical selection used as the mask of a Hue/Saturation layer" width="100%"></td>
+    <td width="42%" valign="middle">
+      <h3>Selections that understand your image.</h3>
+      Marquees, lassos and the Magic Wand for precision; Quick Selection, Object Selection and Select Subject when you want the computer to do the tracing; Select and Mask to refine hair-fine edges.
+      <br><br>
+      Feather, expand, contract, smooth, grow, reselect. Turn any selection into a layer mask, a vector path or a shape. Smart selection runs on your machine, with no cloud and no account.
+      <br><br>
+      <sub><i>Girl with a Pearl Earring</i>, Johannes Vermeer, c. 1665</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="42%" valign="middle">
+      <h3>Type that sets beautifully.</h3>
+      Point and paragraph text, edited right on the canvas, with full Character and Paragraph controls: font, weight, size, leading, tracking, alignment and colour.
+      <br><br>
+      Type layers stay editable, take layer styles, and round-trip through PSD.
+      <br><br>
+      <sub><i>Among the Sierra Nevada, California</i>, Albert Bierstadt, 1868</sub>
+    </td>
+    <td width="58%"><img src="docs/images/photocraft-type.jpg" alt="Point and paragraph type edited inline" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="58%"><img src="docs/images/photocraft-vector.jpg" alt="Shape layers with gradient fills and dashed strokes" width="100%"></td>
+    <td width="42%" valign="middle">
+      <h3>Pixel-perfect vectors.</h3>
+      Rectangle, Ellipse, Triangle, Polygon, Line and the Pen tool, with resolution-independent shape layers, gradient fills, and dashed, aligned strokes.
+      <br><br>
+      Combine shapes (unite, subtract, intersect, exclude), keep paths in the Paths panel, use them as vector masks, or stroke and fill them. 116 of 116 shape layers in our PSD corpus match Photoshop's pixels.
+      <br><br>
+      <sub><i>Water Lilies</i>, Claude Monet, 1906</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="42%" valign="middle">
+      <h3>See it before you commit.</h3>
+      Every filter dialog previews live on the canvas, through your selection. Blurs (Gaussian, Box, Motion, Radial, Surface, Smart, Lens, Shape, and the Blur Gallery: Tilt-Shift, Iris, Field, Spin, Path), sharpening, Reduce Noise, distortions (Twirl, Wave, Ripple, Displace, Shear, Zig Zag…), Pixelate, Stylize (Oil Paint, Wind, Extrude…), Render (Clouds, Fibers, Lens Flare, Lighting Effects) and more.
+      <br><br>
+      Run filters on a smart object and they stay editable: change, hide, reorder or mask them at any time.
+      <br><br>
+      Large-radius blurs use running-sum box passes across all cores: a radius-180 Gaussian on 3.6 MP takes under a second.
+      <br><br>
+      <sub><i>The Starry Night</i>, Vincent van Gogh, 1889</sub>
+    </td>
+    <td width="58%"><img src="docs/images/photocraft-filters.jpg" alt="The Twirl filter previewed live on the canvas" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="58%"><img src="docs/images/photocraft-transform.jpg" alt="Free Transform handles and the History panel" width="100%"></td>
+    <td width="42%" valign="middle">
+      <h3>Shape it any way you like.</h3>
+      Free Transform with scale, rotate, skew, distort and perspective; exact 90° and 180° rotations and flips; Transform Again. Layers, type, shapes, masks and selections all transform together.
+      <br><br>
+      Full history, Toggle Last State and the History Brush mean every step can be undone, even one brush stroke at a time.
+      <br><br>
+      <sub><i>The Tetons and the Snake River</i>, Ansel Adams, 1942</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="42%" valign="middle">
+      <h3>Ship it anywhere.</h3>
+      Export As with format, quality, transparency and scale, plus a preview and an instant file-size estimate. Quick Export to PNG in one click.
+      <br><br>
+      Choose a dark Pro theme, the airy Studio themes, or a Classic look.
+      <br><br>
+      <sub><i>The Kiss</i>, Gustav Klimt, 1907–1908</sub>
+    </td>
+    <td width="58%"><img src="docs/images/photocraft-export-light.jpg" alt="Export As in the light theme" width="100%"></td>
+  </tr>
+</table>
+
+<br>
+
+## Everything in the box
+
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <h4>🧰 34 tools</h4>
+      Move · Rectangular and Elliptical Marquee · Lasso · Polygonal Lasso · Magic Wand · Quick Selection · Object Selection · Crop · Eyedropper · Brush · Pencil · Mixer Brush · Color Replacement · Eraser · Clone Stamp · Healing Brush · Spot Healing · History Brush · Gradient · Paint Bucket · Blur · Sharpen · Smudge · Dodge · Burn · Sponge · Pen · Path Selection · Type · five Shape tools · Hand · Zoom
+    </td>
+    <td width="33%" valign="top">
+      <h4>🖌️ A real brush engine</h4>
+      Shape Dynamics, Scattering, Texture, Dual Brush, Color Dynamics, Transfer, Brush Pose, Wet Edges, Build-up and Smoothing (including Pulled String), driven by pen pressure, tilt, rotation and direction. Brush presets, Define Brush from Selection, and deterministic, replayable strokes.
+    </td>
+    <td width="33%" valign="top">
+      <h4>🗃️ Layers, done properly</h4>
+      Groups, clipping masks, pixel and vector masks, fill layers (solid, gradient and pattern), adjustment layers, live smart objects with smart filters and lossless transforms and warps, multi-layer selection with align, distribute and link, alpha channels and Quick Mask, 27 blend modes, opacity and fill, locks, colour labels, layer filters, merge, flatten, rasterize, Layer via Copy/Cut, Paste Into.
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <h4>🎨 Any colour, any depth</h4>
+      RGB, Grayscale, CMYK and Lab documents at 8, 16 and 32 bits per channel. Bit depth and colour model are runtime data, so every tool works at every depth.
+      <br><br>
+      Real ICC colour management in pure Rust: embedded profiles, Assign and Convert to Profile with all four rendering intents and black point compensation, soft proofing (⌘Y) and Gamut Warning (⇧⌘Y) on the GPU.
+    </td>
+    <td width="33%" valign="top">
+      <h4>🗂️ Formats</h4>
+      PSD and PSB, plus PNG, JPEG, TIFF, WebP, GIF, BMP, TGA, ICO, QOI, PNM, OpenEXR, Radiance HDR and AVIF, with symmetric read and write at 8, 16 and 32 bits, and the native <code>.pcraft</code> format.
+    </td>
+    <td width="33%" valign="top">
+      <h4>🪄 The everyday essentials</h4>
+      Auto Tone, Contrast and Color · Equalize · Image and Canvas Size · Crop and Trim · Reveal All · Edit › Fill and Stroke · Copy Merged · Paste in Place · guides, rulers, grid and snapping · Actions record and replay · a command palette (⌘K).
+    </td>
+  </tr>
+</table>
+
+<br>
+
+## PSD without compromise
+
+Photocraft's PSD support is a standalone crate written from Adobe's public specification and tested against a corpus of real-world files.
+
+- **Byte-exact round trips:** 134 of 135 corpus files are written back identical, and anything we don't model yet (raw blocks, descriptors, extras) is preserved verbatim instead of being dropped.
+- **Pixels that match:** a composite oracle compares our render with Photoshop's own merged image, covering gradient interpolation (Classic, Perceptual and Linear), layer effects, shape strokes, clipping and fill opacity.
+- **Large documents:** PSB, 16 and 32-bit files, and CMYK and Lab documents open natively.
+
+## Built for agents
+
+Every menu item, tool and dialog runs a command from one registry of 500+ commands. The UI, the CLI, the JSON control channel and the MCP server all call the same commands, so anything you can click, a script or an AI agent can do too.
 
 ```sh
-cargo run --release -p photocraft -- image.psd
-cargo test --workspace
+# Headless: open, edit, save
+photocraft-cli run wave.psd \
+  --cmd filter.sharpen.smartSharpen     --params '{"amount":80}' \
+  --cmd layer.newAdjustmentLayer.curves --params '{"points":[[0,0],[64,48],[192,212],[255,255]]}' \
+  --out wave-final.png
+
+# Apply one action list to a folder of images
+photocraft-cli batch --actions grade.json --in ./raw --out ./graded
+
+# Let an agent drive it over MCP (headless, or bridged to the running app)
+photocraft-cli mcp
 ```
 
-Start with [`AGENTS.md`](AGENTS.md), then [`docs/`](docs/).
+The desktop app also listens on a local control channel (`photocraft --control`) for inspecting UI state, driving tools with pointer events, and taking offscreen screenshots. Every image in this README was rendered that way. See [`docs/control-protocol.md`](docs/control-protocol.md).
+
+## Under the hood
+
+- **Engine first:** a pure-data document model and a command engine, with a thin egui UI on top. Layering is enforced at build time across 24 crates.
+- **Two compositors:** a CPU compositor serves as the reference oracle, and a wgpu compositor puts the canvas on the GPU. They are tested against each other.
+- **Copy-on-write tiles:** 256² sparse tiles make undo cheap and huge canvases light, and effect maps are cached per layer state.
+- **Runs in the browser:** the whole engine and UI compile to WebAssembly.
+- **Clean-room:** implemented from public specs and observed behaviour only. No proprietary code, shaders or assets.
+- **Tested:** more than 1,600 tests, including PSD round trips, synthetic generators, compositor oracles and multi-depth checks.
+
+## Get started
+
+```sh
+git clone https://github.com/storytold/photocraft
+cd photocraft
+cargo run --release -p photocraft -- image.psd   # the desktop app
+cargo test --workspace                           # the test suite
+```
+
+New contributors and AI agents: start with [`AGENTS.md`](AGENTS.md), then [`docs/`](docs/).
+
+> **Status:** Photocraft is in early alpha. The core editing workflow is here, and we're working toward full Photoshop parity milestone by milestone (see [`docs/roadmap.md`](docs/roadmap.md)). Progress is measured, not guessed: `cargo xtask parity` checks every item in Photoshop's menu tree against the live command registry and writes [`docs/parity.md`](docs/parity.md). Expect rough edges, and please file issues.
 
 ## Crafting Apps
 
@@ -50,3 +265,11 @@ Open-source, clean-room, pure-Rust creative apps that share the same conventions
     </td>
   </tr>
 </table>
+
+---
+
+<p align="center"><sub>
+  Built by the artcraft team. Licensed under MIT or Apache-2.0.<br>
+  Every artwork shown is in the public domain (Wikimedia Commons, NASA, U.S. National Archives); sources are listed in <a href="docs/images/SOURCES.md"><code>docs/images/SOURCES.md</code></a>.<br>
+  Photoshop is a trademark of Adobe Inc. Photocraft is an independent project, not affiliated with or endorsed by Adobe.
+</sub></p>

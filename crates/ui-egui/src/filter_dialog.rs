@@ -15,8 +15,16 @@ use crate::theme::Tokens;
 pub enum Kind {
     Range { min: f32, max: f32, default: f32 },
     Choice(Vec<String>),
-    Bool,
+    Bool(bool),
     Int { default: i64 },
+    /// Free text (e.g. a file path).
+    Text,
+    /// One of the open documents (stored as its index).
+    Document,
+    /// A row-major grid of integers (`int[25]` = 5×5).
+    Grid(usize),
+    /// Structured JSON (pins, curve points…): settable through the command, not shown in the dialog.
+    Json,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -30,15 +38,23 @@ pub struct Param {
 pub fn parse_spec(spec: &str) -> Vec<Param> {
     let inner = spec.trim().trim_start_matches('{').trim_end_matches('}');
     let mut out = Vec::new();
-    // Split on commas that start a new `"key":`.
+    // Split on commas that start a new `"key":` (not inside strings or brackets).
     let mut parts: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut in_str = false;
+    let mut depth = 0i32;
     for ch in inner.chars() {
         if ch == '"' {
             in_str = !in_str;
         }
-        if ch == ',' && !in_str {
+        if !in_str {
+            match ch {
+                '[' | '{' => depth += 1,
+                ']' | '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if ch == ',' && !in_str && depth == 0 {
             parts.push(std::mem::take(&mut cur));
         } else {
             cur.push(ch);
@@ -57,8 +73,16 @@ pub fn parse_spec(spec: &str) -> Vec<Param> {
         let kind = if let Some(choices) = v.strip_prefix('"') {
             let body = choices.split('"').next().unwrap_or("");
             Kind::Choice(body.split('|').map(str::to_string).collect())
-        } else if v.starts_with("bool") {
-            Kind::Bool
+        } else if let Some(rest) = v.strip_prefix("bool") {
+            Kind::Bool(rest.trim_start_matches('=').trim() == "true")
+        } else if v == "text" {
+            Kind::Text
+        } else if v == "doc" {
+            Kind::Document
+        } else if v == "json" || v.starts_with('[') || v.starts_with('{') {
+            Kind::Json
+        } else if let Some(n) = v.strip_prefix("int[").and_then(|r| r.strip_suffix(']')).and_then(|n| n.parse().ok()) {
+            Kind::Grid(n)
         } else if let Some((range, default)) = v.split_once('=').map(|(a, b)| (a, b.trim())).or(Some((v, ""))) {
             if let Some((lo, hi)) = range.split_once("..") {
                 let min = lo.trim().parse().unwrap_or(0.0);
@@ -78,11 +102,28 @@ pub fn parse_spec(spec: &str) -> Vec<Param> {
 
 /// Parameter keys measured in pixels (scaled for proxy previews).
 fn is_pixel_param(key: &str) -> bool {
-    matches!(key, "radius" | "distance" | "cellSize" | "horizontal" | "vertical" | "height" | "wavelengthMin" | "wavelengthMax" | "amplitudeMin" | "amplitudeMax")
+    matches!(key, "radius" | "distance" | "cellSize" | "horizontal" | "vertical" | "height" | "wavelengthMin" | "wavelengthMax" | "amplitudeMin" | "amplitudeMax" | "maxRadius" | "size" | "blur" | "speed")
 }
 
+/// Commands outside `filter.*` that get the schema dialog *with* live preview.
+pub const PREVIEWED: &[&str] = &[
+    "image.adjustments.selectiveColor",
+    "image.adjustments.colorLookup",
+    "image.adjustments.shadowsHighlights",
+    "image.adjustments.replaceColor",
+    "image.adjustments.matchColor",
+    "image.adjustments.hdrToning",
+    "image.rotation.arbitrary",
+    "image.mode.indexedColor",
+    "image.mode.bitmap",
+    "image.mode.duotone",
+    "layer.matting.defringe",
+    "layer.matting.colorDecontaminate",
+    "layer.layerStyle.scaleEffects",
+];
+
 pub fn has_dialog(command: &str) -> bool {
-    (command.starts_with("filter.") || command.starts_with("select.modify.") || matches!(command, "image.trim" | "view.newGuide" | "select.refineEdge")) && photocraft_engine::commands::find(command).is_some_and(|c| !parse_spec(c.params).is_empty())
+    (command.starts_with("filter.") || command.starts_with("select.modify.") || PREVIEWED.contains(&command) || matches!(command, "image.trim" | "view.newGuide" | "select.refineEdge" | "edit.assignProfile" | "edit.convertToProfile" | "view.proofSetup" | "layer.layerStyle.globalLight" | "image.mode.colorTable")) && photocraft_engine::commands::find(command).is_some_and(|c| !parse_spec(c.params).is_empty())
 }
 
 pub fn open(app: &mut PhotocraftApp, command: &str) -> Option<u64> {
@@ -91,17 +132,30 @@ pub fn open(app: &mut PhotocraftApp, command: &str) -> Option<u64> {
     fields.insert("__command".into(), json!(command));
     fields.insert("__label".into(), json!(spec.label));
     fields.insert("__filter".into(), json!(true));
-    if command.starts_with("filter.") {
+    if command.starts_with("filter.") || PREVIEWED.contains(&command) {
         fields.insert("__preview".into(), json!(true));
     }
     for p in parse_spec(spec.params) {
         let v = match &p.kind {
             Kind::Range { default, .. } => json!(default),
             Kind::Choice(c) => json!(c.first().cloned().unwrap_or_default()),
-            Kind::Bool => json!(false),
+            Kind::Bool(default) => json!(default),
             Kind::Int { default } => json!(default),
+            Kind::Text => json!(""),
+            Kind::Document => json!(-1),
+            // Identity kernel: 1 in the centre.
+            Kind::Grid(n) => json!((0..*n).map(|i| i64::from(i == *n / 2)).collect::<Vec<_>>()),
+            // Colour inputs come from the current swatches, so the proxy preview matches the result.
+            Kind::Json if p.key == "foreground" => json!(app.session.tools.foreground),
+            Kind::Json if p.key == "background" => json!(app.session.tools.background),
+            Kind::Json => continue,
         };
         fields.insert(p.key, v);
+    }
+    if parse_spec(spec.params).iter().any(|p| p.kind == Kind::Document) {
+        // The document picker lists every open document (params refer to them by index).
+        let names: Vec<String> = app.session.documents().iter().map(|d| d.doc.name.clone()).collect();
+        fields.insert("__docs".into(), json!(names));
     }
     let id = app.ui.open_dialog(crate::state::DialogKind::Command, fields);
     Some(id)
@@ -162,11 +216,54 @@ pub fn body(ui: &mut egui::Ui, f: &mut Map<String, Value>) {
                     f.insert(p.key.clone(), json!(cur));
                 });
             }
-            Kind::Bool => {
-                let mut b = f.get(&p.key).and_then(Value::as_bool).unwrap_or(false);
+            Kind::Bool(default) => {
+                let mut b = f.get(&p.key).and_then(Value::as_bool).unwrap_or(default);
                 crate::widgets::checkbox(ui, &mut b, &label(&p.key));
                 f.insert(p.key, json!(b));
             }
+            Kind::Text => {
+                let mut v = f.get(&p.key).and_then(Value::as_str).unwrap_or_default().to_string();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(label(&p.key)).color(t.text_dim));
+                    ui.add(egui::TextEdit::singleline(&mut v).desired_width(200.0));
+                });
+                if v.is_empty() {
+                    f.remove(&p.key);
+                } else {
+                    f.insert(p.key, json!(v));
+                }
+            }
+            Kind::Document => {
+                let names: Vec<String> = f.get("__docs").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                let cur = f.get(&p.key).and_then(Value::as_i64).unwrap_or(-1);
+                let mut sel = cur.to_string();
+                let mut opts: Vec<(String, &str)> = vec![("-1".to_string(), "None")];
+                opts.extend(names.iter().enumerate().map(|(i, n)| (i.to_string(), n.as_str())));
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(label(&p.key)).color(t.text_dim));
+                    crate::widgets::dropdown(ui, &format!("flt-{cmd}-{}", p.key), &mut sel, &opts, 170.0);
+                });
+                match sel.parse::<i64>() {
+                    Ok(i) if i >= 0 => f.insert(p.key, json!(i)),
+                    _ => f.insert(p.key, json!(-1)),
+                };
+            }
+            Kind::Grid(n) => {
+                let side = (n as f32).sqrt().round().max(1.0) as usize;
+                let mut vals: Vec<f32> = f.get(&p.key).and_then(Value::as_array).map(|a| a.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect()).unwrap_or_default();
+                vals.resize(n, 0.0);
+                ui.label(egui::RichText::new(label(&p.key)).color(t.text_dim));
+                egui::Grid::new(format!("flt-grid-{cmd}-{}", p.key)).spacing([4.0, 4.0]).show(ui, |ui| {
+                    for (i, v) in vals.iter_mut().enumerate() {
+                        crate::widgets::value_field(ui, v, -999.0..=999.0, "", 44.0);
+                        if (i + 1) % side == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+                f.insert(p.key, json!(vals.iter().map(|v| v.round() as i64).collect::<Vec<_>>()));
+            }
+            Kind::Json => {}
             Kind::Int { default } => {
                 let mut v = f.get(&p.key).and_then(Value::as_f64).unwrap_or(default as f64) as f32;
                 ui.horizontal(|ui| {
@@ -186,7 +283,9 @@ pub fn body(ui: &mut egui::Ui, f: &mut Map<String, Value>) {
 
 /// User-facing params (strip the dialog's private `__` keys).
 pub fn params_of(f: &Map<String, Value>) -> Value {
-    Value::Object(f.iter().filter(|(k, _)| !k.starts_with("__")).map(|(k, v)| (k.clone(), v.clone())).collect())
+    // A document picker left at "None" (-1) means "not given".
+    let unset = |k: &str, v: &Value| k == "mapDocument" && v.as_i64() == Some(-1);
+    Value::Object(f.iter().filter(|(k, v)| !k.starts_with("__") && !unset(k, v)).map(|(k, v)| (k.clone(), v.clone())).collect())
 }
 
 /// Compute a preview document: run `command` with `params` on the proxy (scaled) copy of `doc`.
@@ -231,10 +330,23 @@ mod tests {
         let p = parse_spec(r#"{"radius":0.1..1000=1,"method":"spin|zoom","monochromatic":bool,"seed":u32=0,"horizontal":px=0}"#);
         assert_eq!(p[0], Param { key: "radius".into(), kind: Kind::Range { min: 0.1, max: 1000.0, default: 1.0 } });
         assert_eq!(p[1].kind, Kind::Choice(vec!["spin".into(), "zoom".into()]));
-        assert_eq!(p[2].kind, Kind::Bool);
+        assert_eq!(p[2].kind, Kind::Bool(false));
         assert_eq!(p[3].kind, Kind::Int { default: 0 });
         assert_eq!(p[4].kind, Kind::Int { default: 0 });
         assert!(parse_spec("{}").is_empty());
+        let p = parse_spec(r#"{"lighting":bool=true,"kernel":int[25],"pins":json,"points":[[0,0],[1,0]],"mapPath":text,"mapDocument":doc,"scale":1..9999=1}"#);
+        let kinds: Vec<&Kind> = p.iter().map(|p| &p.kind).collect();
+        assert_eq!(kinds, [&Kind::Bool(true), &Kind::Grid(25), &Kind::Json, &Kind::Json, &Kind::Text, &Kind::Document, &Kind::Range { min: 1.0, max: 9999.0, default: 1.0 }]);
+    }
+
+    #[test]
+    fn new_filters_have_dialogs_or_run_directly() {
+        for id in ["filter.stylize.oilPaint", "filter.blur.lensBlur", "filter.blurGallery.irisBlur", "filter.other.custom", "filter.distort.displace", "filter.pixelate.mezzotint", "filter.render.lightingEffects"] {
+            assert!(has_dialog(id), "{id}");
+        }
+        for id in ["filter.pixelate.facet", "filter.pixelate.fragment", "filter.video.ntscColors"] {
+            assert!(!has_dialog(id), "{id}");
+        }
     }
 
     #[test]

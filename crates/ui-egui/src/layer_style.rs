@@ -16,9 +16,14 @@ enum P {
     Blend,
     Choice(&'static [(&'static str, &'static str)]),
     Check,
+    /// A pattern from the dialog's `patternList` field (`[[id, name], …]`).
+    Pattern,
 }
 
 /// Effect kinds in Photoshop's list order: (command kind, label, params).
+/// The Blending Options page id (not an effect).
+pub const BLENDING: &str = "blendingOptions";
+
 pub const KINDS: &[(&str, &str)] = &[
     ("bevelEmboss", "Bevel & Emboss"),
     ("stroke", "Stroke"),
@@ -27,6 +32,7 @@ pub const KINDS: &[(&str, &str)] = &[
     ("satin", "Satin"),
     ("colorOverlay", "Color Overlay"),
     ("gradientOverlay", "Gradient Overlay"),
+    ("patternOverlay", "Pattern Overlay"),
     ("outerGlow", "Outer Glow"),
     ("dropShadow", "Drop Shadow"),
 ];
@@ -45,8 +51,10 @@ fn spec(kind: &str) -> &'static [(&'static str, &'static str, P)] {
         "stroke" => &[("size", "Size", P::Slider(1.0, 250.0, "px")), ("position", "Position", P::Choice(POS)), ("blend", "Blend Mode", P::Blend), ("opacity", "Opacity", P::Slider(0.0, 100.0, "%")), ("color", "Color", P::Color)],
         "colorOverlay" => &[("blend", "Blend Mode", P::Blend), ("color", "Color", P::Color), ("opacity", "Opacity", P::Slider(0.0, 100.0, "%"))],
         "gradientOverlay" => &[("blend", "Blend Mode", P::Blend), ("opacity", "Opacity", P::Slider(0.0, 100.0, "%")), ("from", "From", P::Color), ("to", "To", P::Color), ("reverse", "Reverse", P::Check), ("style", "Style", P::Choice(GSTYLE)), ("angle", "Angle", P::Slider(-180.0, 180.0, "°")), ("scale", "Scale", P::Slider(10.0, 150.0, "%"))],
+        "patternOverlay" => &[("blend", "Blend Mode", P::Blend), ("opacity", "Opacity", P::Slider(0.0, 100.0, "%")), ("pattern", "Pattern", P::Pattern), ("angle", "Angle", P::Slider(-180.0, 180.0, "°")), ("scale", "Scale", P::Slider(1.0, 1000.0, "%")), ("link", "Link with Layer", P::Check)],
         "bevelEmboss" => &[("style", "Style", P::Choice(BSTYLE)), ("depth", "Depth", P::Slider(1.0, 1000.0, "%")), ("direction", "Direction", P::Choice(DIR)), ("size", "Size", P::Slider(0.0, 250.0, "px")), ("soften", "Soften", P::Slider(0.0, 16.0, "px")), ("angle", "Angle", P::Slider(-180.0, 180.0, "°")), ("altitude", "Altitude", P::Slider(0.0, 90.0, "°"))],
         "satin" => &[("blend", "Blend Mode", P::Blend), ("color", "Color", P::Color), ("opacity", "Opacity", P::Slider(0.0, 100.0, "%")), ("angle", "Angle", P::Slider(-180.0, 180.0, "°")), ("distance", "Distance", P::Slider(0.0, 250.0, "px")), ("size", "Size", P::Slider(0.0, 250.0, "px")), ("invert", "Invert", P::Check)],
+        BLENDING => &[("blend", "Blend Mode", P::Blend), ("opacity", "Opacity", P::Slider(0.0, 100.0, "%")), ("fillOpacity", "Fill Opacity", P::Slider(0.0, 100.0, "%"))],
         _ => &[],
     }
 }
@@ -60,6 +68,7 @@ fn defaults(kind: &str) -> Value {
         "stroke" => json!({"size": 3, "position": "outside", "blend": "Normal", "opacity": 100, "color": "#000000"}),
         "colorOverlay" => json!({"blend": "Normal", "color": "#ff0000", "opacity": 100}),
         "gradientOverlay" => json!({"blend": "Normal", "opacity": 100, "from": "#000000", "to": "#ffffff", "reverse": false, "style": "linear", "angle": 90, "scale": 100}),
+        "patternOverlay" => json!({"blend": "Normal", "opacity": 100, "pattern": "", "angle": 0, "scale": 100, "link": true}),
         "bevelEmboss" => json!({"style": "inner", "depth": 100, "direction": "up", "size": 5, "soften": 0, "angle": 120, "altitude": 30}),
         "satin" => json!({"blend": "Multiply", "color": "#000000", "opacity": 50, "angle": 19, "distance": 11, "size": 14, "invert": true}),
         _ => json!({}),
@@ -99,7 +108,7 @@ fn values_of(e: &Effect) -> Value {
             set(&mut v, "color", json!(hex(&s.color)));
             set(&mut v, "angle", json!(s.angle));
             set(&mut v, "distance", json!(s.distance));
-            set(&mut v, if matches!(e, Effect::DropShadow(_)) { "spread" } else { "choke" }, json!(s.spread));
+            set(&mut v, if matches!(e, Effect::DropShadow(_)) { "spread" } else { "choke" }, json!((s.spread * 100.0).round()));
             set(&mut v, "size", json!(s.size));
         }
         Effect::OuterGlow(g) | Effect::InnerGlow(g) => {
@@ -108,8 +117,9 @@ fn values_of(e: &Effect) -> Value {
             if let FxPaint::Color(c) = &g.paint {
                 set(&mut v, "color", json!(hex(c)));
             }
-            set(&mut v, if matches!(e, Effect::OuterGlow(_)) { "spread" } else { "choke" }, json!(g.spread));
+            set(&mut v, if matches!(e, Effect::OuterGlow(_)) { "spread" } else { "choke" }, json!((g.spread * 100.0).round()));
             set(&mut v, "size", json!(g.size));
+            set(&mut v, "range", json!((g.range * 100.0).round()));
         }
         Effect::Stroke(s) => {
             set(&mut v, "blend", json!(s.common.blend.label()));
@@ -146,7 +156,16 @@ fn values_of(e: &Effect) -> Value {
             set(&mut v, "altitude", json!(b.altitude));
             set(&mut v, "direction", json!(if b.up { "up" } else { "down" }));
         }
-        Effect::PatternOverlay { .. } => {}
+        Effect::PatternOverlay { common, name, id, scale, angle, link, phase } => {
+            set(&mut v, "blend", json!(common.blend.label()));
+            set(&mut v, "opacity", json!((common.opacity * 100.0).round()));
+            set(&mut v, "pattern", json!(if id.is_empty() { name } else { id }));
+            set(&mut v, "scale", json!((scale * 100.0).round()));
+            set(&mut v, "angle", json!(angle));
+            set(&mut v, "link", json!(link));
+            set(&mut v, "phaseX", json!(phase.0));
+            set(&mut v, "phaseY", json!(phase.1));
+        }
     }
     v
 }
@@ -155,6 +174,7 @@ fn values_of(e: &Effect) -> Value {
 pub fn initial_fields(layer: &Layer, select: Option<&str>) -> Map<String, Value> {
     let mut f = Map::new();
     f.insert("layer".into(), json!(layer.id.0));
+    f.insert(format!("p:{BLENDING}"), json!({"blend": layer.blend.label(), "opacity": (layer.opacity * 100.0).round(), "fillOpacity": (layer.fill_opacity * 100.0).round()}));
     let mut first = None;
     for &(kind, _) in KINDS {
         let existing = layer.effects.items.iter().find(|e| kind_of(e) == kind);
@@ -175,12 +195,32 @@ pub fn initial_fields(layer: &Layer, select: Option<&str>) -> Map<String, Value>
 pub fn open(app: &mut PhotocraftApp, select: Option<&str>) -> Option<u64> {
     let st = app.session.active()?;
     let layer = st.doc.layer(st.active_layer?)?.clone();
-    Some(app.ui.open_dialog(crate::state::DialogKind::LayerStyle, initial_fields(&layer, select)))
+    let mut f = initial_fields(&layer, select);
+    f.insert("patternList".into(), pattern_list(app));
+    Some(app.ui.open_dialog(crate::state::DialogKind::LayerStyle, f))
+}
+
+/// `[[id, name], …]` of the patterns a style can use (document's, then the library's).
+pub fn pattern_list(app: &PhotocraftApp) -> Value {
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let doc_pats = app.session.active().map(|d| d.doc.patterns.clone()).unwrap_or_default();
+    for p in doc_pats.iter().chain(app.session.patterns.items.iter()) {
+        if seen.insert(p.id.clone()) {
+            out.push(json!([p.id, p.display_name()]));
+        }
+    }
+    Value::Array(out)
 }
 
 /// Apply the dialog: replace the layer's effects with the enabled ones.
 pub fn confirm(app: &mut PhotocraftApp, f: &Map<String, Value>) -> Result<Value, String> {
     let layer = f.get("layer").cloned().unwrap_or(Value::Null);
+    if let Some(Value::Object(bo)) = f.get(&format!("p:{BLENDING}")) {
+        let mut p = Value::Object(bo.clone());
+        p["layer"] = layer.clone();
+        app.run("layer.layerStyle.blendingOptions", p)?;
+    }
     let _ = app.run("layer.layerStyle.clear", json!({"layer": layer}));
     for &(kind, _) in KINDS {
         if f.get(&format!("on:{kind}")).and_then(Value::as_bool) == Some(true) {
@@ -201,7 +241,11 @@ pub fn body(ui: &mut egui::Ui, f: &mut Map<String, Value>) {
         ui.vertical(|ui| {
             ui.set_width(190.0);
             ui.label(RichText::new("Styles").color(t.text_faint));
-            ui.label(RichText::new("Blending Options").color(t.text_dim));
+            // Blending Options page (layer blend mode, opacity and fill opacity).
+            let bo = ui.add(egui::Label::new(RichText::new("Blending Options").color(if selected == BLENDING { t.text } else { t.text_dim })).sense(Sense::click()));
+            if bo.clicked() {
+                f.insert("selected".into(), json!(BLENDING));
+            }
             ui.add_space(4.0);
             for &(kind, label) in KINDS {
                 let (rect, resp) = ui.allocate_exact_size(vec2(190.0, 26.0), Sense::click());
@@ -237,7 +281,7 @@ pub fn body(ui: &mut egui::Ui, f: &mut Map<String, Value>) {
         // Right: parameters of the selected effect.
         ui.vertical(|ui| {
             ui.set_width(330.0);
-            let label = KINDS.iter().find(|k| k.0 == selected).map(|k| k.1).unwrap_or("");
+            let label = KINDS.iter().find(|k| k.0 == selected).map(|k| k.1).unwrap_or(if selected == BLENDING { "Blending Options" } else { "" });
             ui.label(RichText::new(label).font(crate::theme::semibold(14.0)).color(t.text));
             ui.add_space(6.0);
             let pkey = format!("p:{selected}");
@@ -276,6 +320,21 @@ pub fn body(ui: &mut egui::Ui, f: &mut Map<String, Value>) {
                             let mut cur = p.get(key).and_then(Value::as_str).unwrap_or(options[0].0).to_string();
                             let opts: Vec<(String, &str)> = options.iter().map(|(v, l)| (v.to_string(), *l)).collect();
                             if widgets::dropdown(ui, &format!("fx-{selected}-{key}"), &mut cur, &opts, 150.0) {
+                                p[key] = json!(cur);
+                            }
+                        });
+                    }
+                    P::Pattern => {
+                        let list: Vec<(String, String)> = f
+                            .get("patternList")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().filter_map(|e| Some((e.get(0)?.as_str()?.to_string(), e.get(1)?.as_str()?.to_string()))).collect())
+                            .unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(label).color(t.text_dim));
+                            let mut cur = p.get(key).and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_string).or_else(|| list.first().map(|l| l.0.clone())).unwrap_or_default();
+                            let opts: Vec<(String, &str)> = list.iter().map(|(id, n)| (id.clone(), n.as_str())).collect();
+                            if widgets::dropdown(ui, &format!("fx-{selected}-{key}"), &mut cur, &opts, 180.0) || p.get(key).and_then(Value::as_str).is_none_or(str::is_empty) {
                                 p[key] = json!(cur);
                             }
                         });
@@ -333,5 +392,20 @@ mod tests {
         assert_eq!(f["selected"], "stroke");
         assert_eq!(f["on:stroke"], true);
         assert_eq!(f["on:dropShadow"], false);
+    }
+
+    #[test]
+    fn percent_fields_round_trip_through_the_engine() {
+        let mut s = photocraft_engine::Session::new();
+        s.execute("file.new", json!({"width": 64, "height": 64})).unwrap();
+        s.execute("layer.new.layer", json!({})).unwrap();
+        s.execute("layer.layerStyle.outerGlow", json!({"spread": 6, "range": 40})).unwrap();
+        s.execute("layer.layerStyle.dropShadow", json!({"spread": 12, "add": true})).unwrap();
+        let st = s.active().unwrap();
+        let l = st.doc.layer(st.active_layer.unwrap()).unwrap();
+        let f = initial_fields(l, None);
+        assert_eq!(f["p:outerGlow"]["spread"], json!(6.0));
+        assert_eq!(f["p:outerGlow"]["range"], json!(40.0));
+        assert_eq!(f["p:dropShadow"]["spread"], json!(12.0));
     }
 }

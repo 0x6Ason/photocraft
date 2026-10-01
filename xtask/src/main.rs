@@ -19,6 +19,7 @@ commands:
   corpus [--download]
                   show where test corpora live; --download fetches PngSuite into corpus/pngsuite
   stats [--exact] count tests and lines per crate (--exact: ask the test harness via `-- --list`)
+  parity          Photoshop menu parity; rewrites docs/parity.md
 ";
 
 fn main() -> ExitCode {
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
         Some("ci") => cmd_ci(),
         Some("corpus") => cmd_corpus(rest.contains(&"--download")),
         Some("stats") => stats::run(&root(), rest.contains(&"--exact")),
+        Some("parity") => cmd_parity(),
         Some("-h" | "--help" | "help") | None => {
             print!("{USAGE}");
             Ok(())
@@ -162,6 +164,12 @@ fn cmd_wasm() -> Result<(), String> {
     } else {
         Err(format!("{failed} crate(s) failed the wasm check"))
     }
+}
+
+fn cmd_parity() -> Result<(), String> {
+    let mut c = cargo();
+    c.args(["run", "-q", "-p", "photocraft-ui-egui", "--example", "parity", "--", "--write", "docs/parity.md"]);
+    run(c, "cargo run -p photocraft-ui-egui --example parity")
 }
 
 fn cmd_ci() -> Result<(), String> {

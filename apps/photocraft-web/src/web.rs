@@ -176,7 +176,22 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
             .map_err(|e| e.to_string())
         })),
         inbox: Some(inbox),
+        // Preferences live in the browser's localStorage.
+        load_prefs: Some(Box::new(|| local_storage()?.get_item(PREFS_KEY).ok().flatten())),
+        save_prefs: Some(Box::new(|text: &str| {
+            local_storage()
+                .ok_or("no localStorage")?
+                .set_item(PREFS_KEY, text)
+                .map_err(|e| format!("{e:?}"))
+        })),
+        ..Default::default()
     }
+}
+
+const PREFS_KEY: &str = "photocraft.preferences";
+
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok().flatten()
 }
 
 /// Trigger a browser download of `bytes` named after the last component of `path`.

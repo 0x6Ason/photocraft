@@ -121,6 +121,8 @@ pub fn value_field(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive
     }
     let suffix_w = if suffix.is_empty() { 0.0 } else { 16.0 };
     let field = Rect::from_min_max(rect.min + vec2(4.0, 2.0), rect.max - vec2(4.0 + suffix_w, 2.0));
+    // Small ranges (gamma 0.01–9.99, 0–1 centres) need two decimals and a finer drag, like Photoshop.
+    let fine = range.end() - range.start() <= 10.0;
     // new_child (not scope_builder): a scope would move the parent cursor back to the child rect.
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(field));
     let resp = {
@@ -133,7 +135,7 @@ pub fn value_field(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive
             ui.style_mut().visuals.widgets.hovered.weak_bg_fill = Color32::TRANSPARENT;
             ui.style_mut().override_font_id = Some(theme::mono(12.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_sized(field.size(), egui::DragValue::new(value).range(range).speed(0.5).custom_formatter(|v, _| fmt_num(v)))
+                ui.add_sized(field.size(), egui::DragValue::new(value).range(range).speed(if fine { 0.01 } else { 0.5 }).custom_formatter(|v, _| if fine { fmt_num2(v) } else { fmt_num(v) }))
             })
             .inner
         }
@@ -409,8 +411,22 @@ pub fn fmt_num(v: f64) -> String {
     if (r - r.round()).abs() < 1e-9 { format!("{}", r.round() as i64) } else { format!("{r:.1}") }
 }
 
+/// Two-decimal variant of [`fmt_num`] for small ranges: `1.05`, `0.78`, `2`.
+pub fn fmt_num2(v: f64) -> String {
+    let r = (v * 100.0).round() / 100.0;
+    format!("{r:.2}").trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn two_decimal_numbers_trim_zeros() {
+        assert_eq!(super::fmt_num2(1.05), "1.05");
+        assert_eq!(super::fmt_num2(0.78), "0.78");
+        assert_eq!(super::fmt_num2(0.5), "0.5");
+        assert_eq!(super::fmt_num2(2.0), "2");
+    }
+
     #[test]
     fn numbers_drop_trailing_zero() {
         assert_eq!(super::fmt_num(100.0), "100");

@@ -3246,6 +3246,7 @@ dependencies = [
  "photocraft-compose",
  "photocraft-doc",
  "photocraft-engine",
+ "photocraft-format",
  "photocraft-geom",
  "photocraft-io",
  "photocraft-raster",
@@ -3329,6 +3330,7 @@ dependencies = [
 name = "photocraft-color"
 version = "0.1.0"
 dependencies = [
+ "photocraft-cms",
  "serde",
 ]
 
@@ -3362,11 +3364,15 @@ dependencies = [
 name = "photocraft-engine"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "photocraft-algo",
+ "photocraft-cms",
  "photocraft-color",
  "photocraft-compose",
  "photocraft-doc",
+ "photocraft-format",
  "photocraft-geom",
+ "photocraft-io",
  "photocraft-ops",
  "photocraft-paint",
  "photocraft-raster",
@@ -3420,6 +3426,7 @@ dependencies = [
 name = "photocraft-io"
 version = "0.1.0"
 dependencies = [
+ "photocraft-cms",
  "photocraft-codecs",
  "photocraft-color",
  "photocraft-compose",
@@ -3449,6 +3456,7 @@ dependencies = [
  "photocraft-geom",
  "photocraft-raster",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

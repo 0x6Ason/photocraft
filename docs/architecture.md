@@ -79,7 +79,8 @@ photocraft/
 ├─ crates/
 │  │  ── foundation (no_std-friendly where practical, wasm-safe) ──
 │  ├─ geom/                    photocraft-geom      points, rects, affine/perspective, tile coords, bezier (kurbo)
-│  ├─ color/                   photocraft-color     pixel formats, color spaces, ICC (moxcms), blend-mode math (scalar reference)
+│  ├─ cms/                     photocraft-cms       pure-Rust ICC colour management: profiles, transforms, intents, BPC, soft proof, 3D LUTs
+│  ├─ color/                   photocraft-color     pixel formats, color spaces, blend-mode math (scalar reference); conversions via cms
 │  ├─ raster/                  photocraft-raster    tiled COW surfaces, masks, mip pyramids, damage regions, pixel iterators
 │  │  ── document ──
 │  ├─ doc/                     photocraft-doc       document model: layer tree, masks, effects, channels, paths, guides, metadata (pure data + serde)
@@ -120,6 +121,8 @@ photocraft/
 ├─ xtask/                      build tasks: layer-check, shader-gen, corpus fetch, release
 └─ plan/                       this directory
 ```
+
+**What exists today.** This layout is the target design. Built so far: `geom`, `cms`, `color`, `raster`, `psd`, `codecs`, `doc`, `ops`, `algo`, `paint`, `text`, `vector`, `compose`, `gpu`, `format`, `io`, `engine`, `ui-egui`, `automation`, `testkit`, and the three apps. Not yet split out: `viewport` and `tools` live inside `ui-egui` and `engine`; `platform` services are function hooks injected by each app (`ui_egui::Services`); `adobe-assets`, `raw` and `ml` are not started.
 
 **Crate granularity:** start with the crates above. Split `algo` into `-adjust`, `-filters`, `-select`, `-inpaint` and `-warp` once any module passes about 10k lines, or once compile times hurt. Its internal module boundaries should already follow those lines.
 
@@ -312,7 +315,7 @@ Both backends consume the same plan. This is the only place that encodes Photosh
 ### 7.3 Color
 
 - Blending happens in document space by default, which is Photoshop-compatible. A per-document "linear light blending" option is also available.
-- **Display transform:** compose the ICC transforms with moxcms, then bake them into a 1D + 3D LUT that the viewport's final pass applies.
+- **Display transform:** compose the ICC transforms with `photocraft-cms`, then bake them into a 3D LUT that the canvas shader's final pass applies (Proof Colors and Gamut Warning work this way today).
 - **HDR/EDR output** (an `rgba16float` surface with an extended-range colorspace) is a later-phase feature. The interfaces already carry `f32` pixels.
 
 ### 7.4 Oracle
@@ -478,7 +481,7 @@ schemars = "1"
 blake3 = "1"
 zstd = "*"           # native; ruzstd for wasm decode
 # color / codecs
-moxcms = "*"
+# ICC: our own photocraft-cms (pure Rust)
 image = { version = "*", default-features = false }
 jxl-oxide = "*"
 # gpu

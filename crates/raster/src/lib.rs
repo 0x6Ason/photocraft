@@ -465,7 +465,7 @@ impl Surface {
         out
     }
 
-    /// Convert to another pixel format (depth and/or model, naive colour conversion).
+    /// Convert to another pixel format (depth and/or model; colour models via [`convert_pixel`]).
     pub fn convert(&self, to: PixelFormat) -> Surface {
         let mut out = Surface::with_default(to, &convert_pixel(&self.format, &to, &self.default_pixel()));
         let from_n = self.channels();
@@ -504,7 +504,8 @@ pub fn decode_pixel(format: &PixelFormat, bytes: &[u8]) -> Vec<f32> {
     (0..format.channels()).map(|i| read_sample(bytes, format.sample, i)).collect()
 }
 
-/// Convert one pixel between formats via RGBA (naive colour conversion, no ICC).
+/// Convert one pixel between formats via sRGB RGBA (CMYK through the built-in CMYK profile;
+/// the engine's mode conversions use the document's profiles instead).
 pub fn convert_pixel(from: &PixelFormat, to: &PixelFormat, px: &[f32]) -> Vec<f32> {
     if from.mode == to.mode {
         let n = from.mode.color_channels();
@@ -523,7 +524,7 @@ pub fn to_rgba(format: &PixelFormat, px: &[f32]) -> [f32; 4] {
     let a = if format.alpha { px[n] } else { 1.0 };
     let rgb = match format.mode {
         ColorMode::Grayscale | ColorMode::Bitmap | ColorMode::Duotone => [px[0]; 3],
-        ColorMode::Cmyk => photocraft_color::convert::cmyk_to_rgb_naive([px[0], px[1], px[2], px[3]]),
+        ColorMode::Cmyk => photocraft_color::convert::cmyk_to_rgb([px[0], px[1], px[2], px[3]]),
         ColorMode::Lab => photocraft_color::convert::lab_to_srgb([px[0] * 100.0, px[1] * 255.0 - 128.0, px[2] * 255.0 - 128.0]),
         _ => [px[0], px[1], px[2]],
     };
@@ -534,7 +535,7 @@ pub fn from_rgba(format: &PixelFormat, rgba: [f32; 4]) -> Vec<f32> {
     let rgb = [rgba[0], rgba[1], rgba[2]];
     let mut out: Vec<f32> = match format.mode {
         ColorMode::Grayscale | ColorMode::Bitmap | ColorMode::Duotone => vec![photocraft_color::convert::rgb_to_gray(rgb)],
-        ColorMode::Cmyk => photocraft_color::convert::rgb_to_cmyk_naive(rgb).to_vec(),
+        ColorMode::Cmyk => photocraft_color::convert::rgb_to_cmyk(rgb).to_vec(),
         ColorMode::Lab => {
             let l = photocraft_color::convert::srgb_to_lab(rgb);
             vec![l[0] / 100.0, (l[1] + 128.0) / 255.0, (l[2] + 128.0) / 255.0]
@@ -558,7 +559,7 @@ pub fn from_rgba_into(format: &PixelFormat, rgba: [f32; 4], out: &mut [f32]) -> 
             1
         }
         ColorMode::Cmyk => {
-            out[..4].copy_from_slice(&photocraft_color::convert::rgb_to_cmyk_naive(rgb));
+            out[..4].copy_from_slice(&photocraft_color::convert::rgb_to_cmyk(rgb));
             4
         }
         ColorMode::Lab => {

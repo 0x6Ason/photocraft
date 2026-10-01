@@ -30,7 +30,8 @@ use eframe::wgpu::util::DeviceExt as _;
 /// Default tile side; documents up to this size (and the device limit) use a single texture.
 pub const DEFAULT_TILE: u32 = 8192;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-const VIEW_UNIFORM_SIZE: u64 = 64;
+const VIEW_UNIFORM_SIZE: u64 = 112;
+const VIEW_FLOATS: usize = 28;
 const TILE_UNIFORM_SIZE: u64 = 16;
 
 /// Parameters for drawing one document view. Positions are in egui points.
@@ -50,6 +51,9 @@ pub struct ViewParams {
     pub pixel_grid: bool,
     /// Distinguishes views painted in the same frame (main canvas, extra windows).
     pub view_key: u64,
+    /// Display transform: 0 none, 1 the document's display LUT (Proof Colors), 2 LUT plus the
+    /// gamut warning (see [`GpuCanvas::set_display_lut`]).
+    pub display: u8,
 }
 
 /// Uploads documents to the GPU and paints them. Cheap to clone.
@@ -62,13 +66,26 @@ pub struct GpuCanvas {
 impl GpuCanvas {
     /// Create pipelines and register resources with the egui renderer.
     pub fn new(rs: &RenderState) -> Self {
+        Self::with_tile(rs, None)
+    }
+
+    /// Like [`GpuCanvas::new`] with a preferred texture tile side (`PHOTOCRAFT_GPU_TILE` wins).
+    pub fn with_tile(rs: &RenderState, tile: Option<u32>) -> Self {
         let max = rs.device.limits().max_texture_dimension_2d;
         let env_tile = std::env::var("PHOTOCRAFT_GPU_TILE").ok().and_then(|v| v.parse::<u32>().ok());
-        let tile = env_tile.unwrap_or(DEFAULT_TILE).clamp(64, max);
-        let res = Resources::new(&rs.device, rs.target_format);
+        let tile = env_tile.or(tile).unwrap_or(DEFAULT_TILE).clamp(64, max);
+        let res = Resources::new(&rs.device, &rs.queue, rs.target_format);
         rs.renderer.write().callback_resources.insert(res);
         log::info!("gpu canvas: target {:?}, max texture {max}, tile {tile}", rs.target_format);
         Self { rs: rs.clone(), tile }
+    }
+
+    /// Set the checkerboard and gamut warning colours.
+    pub fn set_style(&self, style: CanvasStyle) {
+        let mut r = self.rs.renderer.write();
+        if let Some(res) = r.callback_resources.get_mut::<Resources>() {
+            res.style = style;
+        }
     }
 
     /// Whether document `doc` has been uploaded with this size.
@@ -214,6 +231,25 @@ impl GpuCanvas {
         }
     }
 
+    /// Set (or clear with `None`) the display LUT of document `doc`: `size`³ RGBA8 texels, red
+    /// fastest. RGB is the display colour for each lattice input; alpha 255 marks out-of-gamut
+    /// colours for the gamut warning.
+    pub fn set_display_lut(&self, doc: u64, size: u32, rgba: Option<&[u8]>) {
+        let (device, queue) = (&self.rs.device, &self.rs.queue);
+        let mut renderer = self.rs.renderer.write();
+        let Some(res) = renderer.callback_resources.get_mut::<Resources>() else { return };
+        match rgba {
+            None => {
+                res.luts.remove(&doc);
+            }
+            Some(bytes) => {
+                assert_eq!(bytes.len(), (size * size * size * 4) as usize, "set_display_lut: buffer size mismatch");
+                let bg = lut_bind_group(device, queue, &res.lut_bgl, size, bytes);
+                res.luts.insert(doc, bg);
+            }
+        }
+    }
+
     /// Add the paint callback drawing `params` into `rect` (clipped by the painter's clip rect).
     pub fn paint(painter: &egui::Painter, rect: egui::Rect, params: ViewParams) {
         painter.add(egui_wgpu::Callback::new_paint_callback(rect, CanvasCallback { rect, params }));
@@ -333,12 +369,64 @@ struct Resources {
     compositor: Option<photocraft_gpu::Compositor>,
     encode_bgl: wgpu::BindGroupLayout,
     encode_pipeline: wgpu::RenderPipeline,
+    lut_bgl: wgpu::BindGroupLayout,
+    /// Display LUTs per document (Proof Colors / Gamut Warning); `identity_lut` otherwise.
+    luts: HashMap<u64, wgpu::BindGroup>,
+    identity_lut: wgpu::BindGroup,
+    /// Transparency checkerboard and gamut warning colours (Preferences › Transparency & Gamut).
+    style: CanvasStyle,
+}
+
+/// Canvas colours from Preferences › Transparency & Gamut.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CanvasStyle {
+    /// Checker square side in points (0 = no checkerboard: transparency shows white).
+    pub checker_square: f32,
+    pub checker_light: [f32; 3],
+    pub checker_dark: [f32; 3],
+    pub gamut_color: [f32; 3],
+    /// Gamut warning opacity 0..1.
+    pub gamut_opacity: f32,
+}
+
+impl Default for CanvasStyle {
+    fn default() -> Self {
+        Self { checker_square: 8.0, checker_light: [1.0; 3], checker_dark: [0.8; 3], gamut_color: [0.5; 3], gamut_opacity: 1.0 }
+    }
+}
+
+/// A `size`³ RGBA8 3D texture bound for the canvas shader.
+fn lut_bind_group(device: &wgpu::Device, queue: &wgpu::Queue, bgl: &wgpu::BindGroupLayout, size: u32, bytes: &[u8]) -> wgpu::BindGroup {
+    let extent = wgpu::Extent3d { width: size, height: size, depth_or_array_layers: size };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("pc_display_lut"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        bytes,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * 4), rows_per_image: Some(size) },
+        extent,
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("pc_display_lut"), layout: bgl, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }] })
+}
+
+/// The 2³ identity LUT (unused unless a document has none and `display` is set).
+fn identity_lut_bytes() -> Vec<u8> {
+    (0..8).flat_map(|i| [if i & 1 != 0 { 255 } else { 0 }, if i & 2 != 0 { 255 } else { 0 }, if i & 4 != 0 { 255 } else { 0 }, 0]).collect()
 }
 
 struct ViewGpu {
     buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    frame_data: [f32; 16],
+    frame_data: [f32; VIEW_FLOATS],
 }
 
 struct DocTextures {
@@ -394,12 +482,19 @@ fn pipeline(device: &wgpu::Device, label: &str, layout: &wgpu::PipelineLayout, m
 }
 
 impl Resources {
-    fn new(device: &wgpu::Device, target: wgpu::TextureFormat) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: wgpu::TextureFormat) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("pc_canvas"), source: wgpu::ShaderSource::Wgsl(CANVAS_WGSL.into()) });
         let vis = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
         let view_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("pc_canvas_view"), entries: &[uniform_entry(0, VIEW_UNIFORM_SIZE, vis), sampler_entry(1)] });
         let tile_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("pc_canvas_tile"), entries: &[texture_entry(0), uniform_entry(1, TILE_UNIFORM_SIZE, vis)] });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("pc_canvas"), bind_group_layouts: &[Some(&view_bgl), Some(&tile_bgl)], immediate_size: 0 });
+        let lut_entry = wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { multisampled: false, sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D3 },
+            count: None,
+        };
+        let lut_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("pc_display_lut"), entries: &[lut_entry] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("pc_canvas"), bind_group_layouts: &[Some(&view_bgl), Some(&tile_bgl), Some(&lut_bgl)], immediate_size: 0 });
         let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("pc_canvas_shadow"), bind_group_layouts: &[Some(&view_bgl)], immediate_size: 0 });
         // Premultiplied "over", with egui's alpha rule (keeps a transparent window's alpha sane).
         let blend = wgpu::BlendState {
@@ -432,7 +527,12 @@ impl Resources {
         let encode_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("pc_encode"), entries: &[unfilterable, uniform_entry(1, 16, wgpu::ShaderStages::FRAGMENT)] });
         let encode_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("pc_encode"), bind_group_layouts: &[Some(&encode_bgl)], immediate_size: 0 });
         let encode_pipeline = pipeline(device, "pc_encode", &encode_layout, &encode_module, ("vs", "fs"), FORMAT, None);
+        let identity_lut = lut_bind_group(device, queue, &lut_bgl, 2, &identity_lut_bytes());
         Self {
+            lut_bgl,
+            luts: HashMap::new(),
+            identity_lut,
+            style: CanvasStyle::default(),
             view_bgl,
             tile_bgl,
             shadow_pipeline,
@@ -574,16 +674,21 @@ impl CanvasCallback {
         ([ox, oy], scale)
     }
 
-    fn uniforms(&self, screen: [u32; 2], ppp: f32, out_linear: bool) -> [f32; 16] {
+    fn uniforms(&self, screen: [u32; 2], ppp: f32, out_linear: bool, style: &CanvasStyle) -> [f32; VIEW_FLOATS] {
         let p = &self.params;
         let (origin, scale) = self.placement(ppp);
         let (mode, lod) = filter_mode(scale);
         let grid = if p.pixel_grid && p.zoom >= 8.0 { 0.16 } else { 0.0 };
+        let square = if style.checker_square > 0.0 { (style.checker_square * ppp).round().max(1.0) } else { 0.0 };
+        let (l, d, g) = (style.checker_light, style.checker_dark, style.gamut_color);
         [
             screen[0] as f32, screen[1] as f32, scale, ppp,
             origin[0], origin[1], p.doc_size[0] as f32, p.doc_size[1] as f32,
-            mode, lod, grid, (8.0 * ppp).round().max(1.0),
-            (self.rect.min.x * ppp).round(), (self.rect.min.y * ppp).round(), 0.0, if out_linear { 1.0 } else { 0.0 },
+            mode, lod, grid, square,
+            (self.rect.min.x * ppp).round(), (self.rect.min.y * ppp).round(), p.display as f32, if out_linear { 1.0 } else { 0.0 },
+            l[0], l[1], l[2], style.gamut_opacity,
+            d[0], d[1], d[2], 0.0,
+            g[0], g[1], g[2], 0.0,
         ]
     }
 }
@@ -591,7 +696,7 @@ impl CanvasCallback {
 impl CallbackTrait for CanvasCallback {
     fn prepare(&self, device: &wgpu::Device, queue: &wgpu::Queue, screen: &ScreenDescriptor, _encoder: &mut wgpu::CommandEncoder, resources: &mut CallbackResources) -> Vec<wgpu::CommandBuffer> {
         let Some(res) = resources.get_mut::<Resources>() else { return Vec::new() };
-        let data = self.uniforms(screen.size_in_pixels, screen.pixels_per_point, res.out_linear);
+        let data = self.uniforms(screen.size_in_pixels, screen.pixels_per_point, res.out_linear, &res.style);
         let (bgl, sampler) = (&res.view_bgl, &res.sampler);
         let v = res.views.entry(self.params.view_key).or_insert_with(|| {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: Some("pc_canvas_view"), size: VIEW_UNIFORM_SIZE, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -600,7 +705,7 @@ impl CallbackTrait for CanvasCallback {
                 layout: bgl,
                 entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) }],
             });
-            ViewGpu { buffer, bind_group, frame_data: [f32::NAN; 16] }
+            ViewGpu { buffer, bind_group, frame_data: [f32::NAN; VIEW_FLOATS] }
         });
         if v.frame_data != data {
             queue.write_buffer(&v.buffer, 0, &f32_bytes(&data));
@@ -633,6 +738,7 @@ impl CallbackTrait for CanvasCallback {
         let (cx0, cy0) = (clip.left_px as f32, clip.top_px as f32);
         let (cx1, cy1) = (cx0 + clip.width_px as f32, cy0 + clip.height_px as f32);
         pass.set_pipeline(&res.tile_pipeline);
+        pass.set_bind_group(2, res.luts.get(&self.params.doc).unwrap_or(&res.identity_lut), &[]);
         for t in &doc.tiles {
             let [tx, ty, tw, th] = t.rect.map(|v| v as f32);
             let (x0, y0) = (origin[0] + tx * scale, origin[1] + ty * scale);
@@ -651,7 +757,10 @@ struct View {
     a: vec4<f32>, // screen_w, screen_h, scale (device px per doc px), pixels_per_point
     b: vec4<f32>, // doc origin x, y (device px), doc w, h (doc px)
     c: vec4<f32>, // filter mode, lod, grid alpha, checker square (device px)
-    d: vec4<f32>, // checker anchor x, y (device px), unused, output linear (sRGB target)
+    d: vec4<f32>, // checker anchor x, y (device px), display (0 none, 1 LUT, 2 LUT + gamut), output linear
+    e: vec4<f32>, // checker light rgb, gamut warning opacity
+    f: vec4<f32>, // checker dark rgb
+    g: vec4<f32>, // gamut warning rgb
 };
 struct Tile { r: vec4<f32> }; // x, y, w, h in doc px
 
@@ -659,6 +768,7 @@ struct Tile { r: vec4<f32> }; // x, y, w, h in doc px
 @group(0) @binding(1) var samp: sampler;
 @group(1) @binding(0) var tex: texture_2d<f32>;
 @group(1) @binding(1) var<uniform> tile: Tile;
+@group(2) @binding(0) var lut: texture_3d<f32>;
 
 struct VOut { @builtin(position) pos: vec4<f32> };
 
@@ -729,9 +839,12 @@ fn vs_tile(@builtin(vertex_index) vi: u32) -> VOut {
 }
 
 fn checker(p: vec2<f32>) -> vec3<f32> {
+    if (view.c.w <= 0.0) {
+        return vec3(1.0);
+    }
     let c = floor((p - view.d.xy) / view.c.w);
     let odd = fract((c.x + c.y) * 0.5) > 0.25;
-    return select(vec3(1.0), vec3(0.8), odd);
+    return select(view.e.xyz, view.f.xyz, odd);
 }
 
 @fragment
@@ -754,6 +867,14 @@ fn fs_tile(in: VOut) -> @location(0) vec4<f32> {
         let i = floor(tt);
         let f = clamp((tt - i - 0.5) * scale + 0.5, vec2(0.0), vec2(1.0));
         col = textureSampleLevel(tex, samp, (i + 0.5 + f) / size, 0.0);
+    }
+    if (view.d.z > 0.5 && col.a > 0.0) {
+        // Proof Colors / Gamut Warning: the document's display LUT (alpha flags out-of-gamut).
+        let n = f32(textureDimensions(lut).x);
+        let c = clamp(col.rgb / col.a, vec3(0.0), vec3(1.0));
+        let l = textureSampleLevel(lut, samp, (c * (n - 1.0) + 0.5) / n, 0.0);
+        let shown = select(l.rgb, mix(l.rgb, view.g.xyz, view.e.w), view.d.z > 1.5 && l.a > 0.5);
+        col = vec4(shown * col.a, col.a);
     }
     var rgb = col.rgb + checker(p) * (1.0 - col.a);
     let grid = view.c.z;

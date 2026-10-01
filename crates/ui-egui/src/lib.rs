@@ -7,7 +7,11 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod adjust_ui;
+pub mod brush_panel;
 pub mod canvas;
+pub mod channel_view;
+pub mod channels_panel;
 pub mod control;
 pub mod dialogs;
 pub mod export_dialog;
@@ -22,8 +26,12 @@ pub mod palette;
 pub mod proxy;
 pub mod retouch_ui;
 pub mod rulers;
+pub mod smart_ui;
 pub mod panels;
+pub mod parity;
 pub mod shortcuts;
+pub mod prefs_ui;
+pub mod snap_ui;
 mod sizing;
 pub mod state;
 pub mod theme;
@@ -31,6 +39,7 @@ pub mod tone;
 pub mod transform_tool;
 pub mod type_tool;
 pub mod vector_ui;
+pub mod view_cmds;
 pub mod widgets;
 mod icon_data;
 
@@ -63,6 +72,18 @@ pub type ClipboardSetFn = Box<dyn FnMut(u32, u32, &[u8]) -> Result<(), String>>;
 pub type ClipboardGetFn = Box<dyn FnMut() -> Option<(u32, u32, Vec<u8>)>>;
 /// Shared queue of (file name, bytes) delivered asynchronously.
 pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+/// Read the saved preferences text (`None` when there is none yet).
+pub type LoadTextFn = Box<dyn FnMut() -> Option<String>>;
+/// Persist the preferences text.
+pub type SaveTextFn = Box<dyn FnMut(&str) -> Result<(), String>>;
+/// Autosave a document snapshot for crash recovery: (snapshot, revision, original path).
+pub type AutosaveFn = Box<dyn FnMut(&std::sync::Arc<Document>, u64, Option<&str>) -> Result<(), String>>;
+/// Drop the recovery data of a document (by `DocId` value) once it is saved or closed.
+pub type DiscardAutosaveFn = Box<dyn FnMut(u64)>;
+/// Load recoverable documents left by a previous session: (original path, document).
+pub type RecoverFn = Box<dyn FnMut() -> Vec<(Option<String>, Document)>>;
+/// Append text to a file (History Log).
+pub type AppendTextFn = Box<dyn FnMut(&str, &str) -> Result<(), String>>;
 
 /// Platform services injected by the app binary (file dialogs, codecs), keeping this crate free of
 /// I/O dependencies.
@@ -85,6 +106,16 @@ pub struct Services {
     /// OS clipboard images: copies go out, screenshots and images from other apps come in.
     pub clipboard_set_image: Option<ClipboardSetFn>,
     pub clipboard_get_image: Option<ClipboardGetFn>,
+    /// Preferences persistence: the platform config directory on native, browser storage on
+    /// the web (see `prefs_ui`).
+    pub load_prefs: Option<LoadTextFn>,
+    pub save_prefs: Option<SaveTextFn>,
+    /// Crash-recovery autosave (Preferences › File Handling) and recovery at launch.
+    pub autosave: Option<AutosaveFn>,
+    pub discard_autosave: Option<DiscardAutosaveFn>,
+    pub recover: Option<RecoverFn>,
+    /// History Log text file output.
+    pub append_text: Option<AppendTextFn>,
 }
 
 pub struct PhotocraftApp {
@@ -143,19 +174,23 @@ pub struct PhotocraftApp {
     pub(crate) type_layout: Option<((u64, u64, u64), std::sync::Arc<photocraft_text::TextLayout>)>,
     /// Channel thumbnails (composite + per channel) cached per (doc, revision).
     channel_thumbs: Option<(DocId, u64, Vec<egui::TextureHandle>)>,
+    /// Channels panel overlays / channel views drawn over the canvas, per document id.
+    pub(crate) channel_views: HashMap<u64, channel_view::Cache>,
     /// Selection outline keyed by (document, mask identity × step × visible region).
     pub(crate) outline_cache: Option<(DocId, u64, std::sync::Arc<Vec<outline::Segment>>)>,
     /// GPU canvas renderer, when running on the wgpu backend (see [`Self::set_wgpu`]).
     gpu: Option<gpu_canvas::GpuCanvas>,
     /// Frame and canvas-upload timings (exposed via `ui.inspect`).
     pub perf: gpu_canvas::Perf,
+    /// Preferences, autosave and snapping runtime state (see `prefs_ui`, `snap_ui`).
+    pub(crate) prefs_rt: prefs_ui::Runtime,
     #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
     live_tokens: theme::live::LiveTokens,
 }
 
 impl PhotocraftApp {
     pub fn new(session: Session, services: Services) -> Self {
-        Self {
+        let mut app = Self {
             session,
             ui: UiState::default(),
             services,
@@ -182,6 +217,7 @@ impl PhotocraftApp {
             filter_preview: None,
             synthetic: Vec::new(),
             channel_thumbs: None,
+            channel_views: HashMap::new(),
             type_layout: None,
             guide_drag: None,
             hover_doc: None,
@@ -192,15 +228,22 @@ impl PhotocraftApp {
             doc_hist: None,
             gpu: None,
             perf: Default::default(),
+            prefs_rt: Default::default(),
             #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
             live_tokens: theme::live::LiveTokens::from_env(),
-        }
+        };
+        // Saved preferences (and recovered documents) are in place before the first frame.
+        prefs_ui::load(&mut app);
+        app
     }
 
     /// Draw the document canvas on the GPU (custom WGSL shader) instead of via egui textures.
     /// Call from the app creator with `cc.wgpu_render_state`; without it the CPU path is used.
     pub fn set_wgpu(&mut self, rs: eframe::egui_wgpu::RenderState) {
-        self.gpu = Some(gpu_canvas::GpuCanvas::new(&rs));
+        // Preferences › Performance › cache tile size (PHOTOCRAFT_GPU_TILE still overrides).
+        let tile = self.session.prefs().performance.cache_tile_size;
+        self.gpu = Some(gpu_canvas::GpuCanvas::with_tile(&rs, Some(tile)));
+        self.prefs_rt.gpu_style = None;
     }
 
     /// Attach a control channel (requests arrive from a transport thread: TCP, stdin, tests).
@@ -247,9 +290,14 @@ impl PhotocraftApp {
     pub fn open_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<(), String> {
         let import = self.services.import.as_ref().ok_or("no importer configured")?;
         let doc = import(name, bytes)?;
-        self.session.add_document(doc, Some(name.to_string()));
+        // Edit › Color Settings policies apply on open; mismatches can ask what to do.
+        let (_, color) = self.session.open_document(doc, Some(name.to_string()));
         self.sync_views();
         self.ui.status = format!("Opened {name}");
+        let ask = color.get("ask").and_then(Value::as_bool) == Some(true);
+        if ask && (color.get("mismatch").and_then(Value::as_bool) == Some(true) || color.get("missing").is_some()) {
+            prefs_ui::open_mismatch(self, &color);
+        }
         Ok(())
     }
 
@@ -263,6 +311,11 @@ impl PhotocraftApp {
     }
 
     pub fn save_as(&mut self, path: Option<String>) -> Result<String, String> {
+        // Edit Contents documents save back into their smart object.
+        if path.is_none() && self.session.is_enabled("layer.smartObjects.saveContents") {
+            self.run("layer.smartObjects.saveContents", serde_json::json!({}))?;
+            return Ok("smart object".into());
+        }
         let st = self.session.active().ok_or("no document")?;
         let suggested = st.path.clone().unwrap_or_else(|| format!("{}.psd", st.doc.name));
         let path = match path {
@@ -376,6 +429,7 @@ impl eframe::App for PhotocraftApp {
         }
         self.collect_screenshots(ctx);
         self.issue_screenshots(ctx);
+        prefs_ui::tick(self, ctx);
         shortcuts::handle(self, ctx);
         let arrived: Vec<(String, Vec<u8>)> = self.services.inbox.as_ref().map(|q| std::mem::take(&mut *q.lock().unwrap_or_else(|e| e.into_inner()))).unwrap_or_default();
         for (name, bytes) in arrived {
@@ -416,22 +470,33 @@ impl eframe::App for PhotocraftApp {
             return;
         }
         let t0 = gpu_canvas::now_ms();
-        panels::title_bar(self, ui);
-        if self.ui.panels.options_bar {
+        // View › Screen Mode › Full Screen Mode: only the image, on black (F or Esc returns).
+        let chrome = !self.ui.view.hides_chrome();
+        if !chrome && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            let _ = menus::invoke(self, &ctx, "view.screenMode.standard", serde_json::json!({}));
+        }
+        if chrome {
+            panels::title_bar(self, ui);
+        }
+        if chrome && self.ui.panels.options_bar {
             panels::options_bar(self, ui);
         }
-        if self.ui.panels.status_bar {
+        if chrome && self.ui.panels.status_bar {
             panels::status_bar(self, ui);
         }
-        if self.ui.panels.toolbar {
+        if chrome && self.ui.panels.toolbar {
             panels::toolbar(self, ui);
         }
-        panels::right_dock(self, ui);
+        if chrome {
+            panels::right_dock(self, ui);
+        }
         let t = theme::Tokens::get(&ctx);
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.canvas)).show(ui, |ui| {
+        let backdrop = if chrome { prefs_ui::pasteboard_color(self).unwrap_or(t.canvas) } else { egui::Color32::BLACK };
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(backdrop)).show(ui, |ui| {
             canvas::document_area(self, ui);
         });
         panels::properties_window(self, &ctx);
+        brush_panel::window(self, &ctx);
         palette::show(self, &ctx);
         dialogs::show(self, &ctx);
         canvas::extra_windows(self, &ctx);
@@ -595,7 +660,8 @@ impl PhotocraftApp {
 }
 
 impl PhotocraftApp {
-    /// Composite + per-channel grayscale thumbnails of the active document (cached per revision).
+    /// Channels panel thumbnails of the active document (cached per revision): the composite,
+    /// each colour channel (when there is more than one), each alpha channel, then the Quick Mask.
     pub fn channel_thumbs(&mut self, ctx: &egui::Context) -> Vec<egui::TextureId> {
         let Some(st) = self.session.active() else { return Vec::new() };
         let (id, rev, doc) = (st.doc.id, st.revision, st.doc.clone());
@@ -614,12 +680,38 @@ impl PhotocraftApp {
                 }
                 ctx.load_texture(format!("chan-{name}"), egui::ColorImage::new([side, side], px), egui::TextureOptions::LINEAR)
             };
-            let texs = vec![
-                make(&|p| egui::Color32::from_rgb(p[0], p[1], p[2]), "rgb"),
-                make(&|p| egui::Color32::from_gray(p[0]), "r"),
-                make(&|p| egui::Color32::from_gray(p[1]), "g"),
-                make(&|p| egui::Color32::from_gray(p[2]), "b"),
-            ];
+            let fmt = doc.pixel_format();
+            let colors = fmt.mode.color_channels();
+            let mut texs = vec![make(&|p| egui::Color32::from_rgb(p[0], p[1], p[2]), "composite")];
+            if colors > 1 {
+                for k in 0..colors {
+                    let cmyk = fmt.mode == photocraft_doc::ColorMode::Cmyk;
+                    texs.push(make(
+                        &|p| {
+                            let rgba = [p[0], p[1], p[2], 255].map(|v| f32::from(v) / 255.0);
+                            let x = photocraft_raster::from_rgba(&fmt, rgba)[k];
+                            let g = if cmyk { 1.0 - x } else { x };
+                            egui::Color32::from_gray((g.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+                        },
+                        &format!("c{k}"),
+                    ));
+                }
+            }
+            // Alpha channels and the Quick Mask, sampled at thumbnail resolution.
+            let (dw, dh) = (doc.size.width.max(1) as f32, doc.size.height.max(1) as f32);
+            for (i, ch) in doc.channels.iter().chain(doc.quick_mask.as_ref()).enumerate() {
+                let mut px = vec![egui::Color32::TRANSPARENT; side * side];
+                let (ox, oy) = ((side - w) / 2, (side - h) / 2);
+                for y in 0..h {
+                    for x in 0..w {
+                        let sx = ((x as f32 + 0.5) * dw / w as f32) as i32;
+                        let sy = ((y as f32 + 0.5) * dh / h as f32) as i32;
+                        let v = ch.surface.sample_channel(sx, sy, 0);
+                        px[(y + oy) * side + x + ox] = egui::Color32::from_gray((v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+                    }
+                }
+                texs.push(ctx.load_texture(format!("chan-a{i}"), egui::ColorImage::new([side, side], px), egui::TextureOptions::LINEAR));
+            }
             self.channel_thumbs = Some((id, rev, texs));
         }
         self.channel_thumbs.as_ref().map(|(_, _, t)| t.iter().map(|t| t.id()).collect()).unwrap_or_default()

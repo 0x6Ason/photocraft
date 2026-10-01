@@ -179,11 +179,19 @@ impl<'a> Planner<'a> {
     }
 
     fn check(&self, layer: &Layer) -> Result<(), Unsupported> {
+        if layer.artboard().is_some() {
+            return Err(Unsupported(format!("artboard `{}` (clipped and rendered on the CPU)", layer.name)));
+        }
         if has_effects(layer) {
             return Err(Unsupported(format!("layer effects on `{}`", layer.name)));
         }
         if layer.vector_mask.is_some() {
             return Err(Unsupported(format!("vector mask on `{}`", layer.name)));
+        }
+        if let LayerContent::Fill(f @ Fill::Pattern { .. }) = &layer.content
+            && layer.fill_cache.as_ref().is_none_or(|c| c.fill != *f)
+        {
+            return Err(Unsupported(format!("pattern fill `{}` (rendered on the CPU)", layer.name)));
         }
         Ok(())
     }
@@ -325,7 +333,7 @@ impl<'a> Planner<'a> {
                 }
                 p.lut = Some(rows);
             }
-            // Patterns render once the pattern library lands; transparent until then (as on CPU).
+            // Pattern fills fall back to the CPU compositor (see `check`).
             Fill::Pattern { .. } => {}
         }
     }
@@ -496,8 +504,32 @@ pub fn adjustment_program(adj: &Adjustment, transfer: Transfer) -> Program {
             p[3][0] = if *preserve_luminosity { 1.0 } else { 0.0 };
             (14, p, None)
         }
-        // Identity on the CPU too (not yet evaluated there).
-        Adjustment::SelectiveColor { .. } | Adjustment::ColorLookup { .. } | Adjustment::Unsupported { .. } => (0, p, None),
+        Adjustment::SelectiveColor { relative, adjustments } => {
+            // 9 ranges × CMYK don't fit the 16 params: they go in LUT row 0 (read texel-exact).
+            p[0][0] = if *relative { 1.0 } else { 0.0 };
+            let mut row = [0.0f32; 4096];
+            for (i, v) in adjustments.iter().flatten().enumerate() {
+                row[i] = *v;
+            }
+            (15, p, Some(vec![row]))
+        }
+        Adjustment::ColorLookup { lut: Some(table), size, tetrahedral, dither, .. } if *size >= 2 && table.len() >= (*size as usize).pow(3) * 3 => {
+            // The flattened table (n³ RGB triplets) spans as many 4096-wide rows as it needs.
+            let n = *size as usize;
+            let len = n * n * n * 3;
+            let rows = table[..len]
+                .chunks(4096)
+                .map(|c| {
+                    let mut row = [0.0f32; 4096];
+                    row[..c.len()].copy_from_slice(c);
+                    row
+                })
+                .collect();
+            p[0] = [n as f32, if *tetrahedral { 1.0 } else { 0.0 }, if *dither { 1.0 } else { 0.0 }, 0.0];
+            (16, p, Some(rows))
+        }
+        // Identity on the CPU too (not evaluated there).
+        Adjustment::ColorLookup { .. } | Adjustment::Unsupported { .. } => (0, p, None),
     }
 }
 

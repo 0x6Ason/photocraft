@@ -1,5 +1,41 @@
-//! Colour conversions that don't need ICC profiles.
-//! Full ICC colour management (moxcms) comes in milestone M8; these are the building blocks.
+//! Colour conversions between the document colour models.
+//!
+//! CMYK ↔ RGB goes through the ICC colour management module (`photocraft-cms`) with the
+//! built-in coated CMYK profile and sRGB (relative colorimetric with black point
+//! compensation, Photoshop's default), so CMYK pixels display and accept painted colours the
+//! way a colour-managed editor does. Document-specific profiles are applied by the engine's
+//! mode/profile conversions; these per-pixel helpers always assume the built-in profiles.
+//! Lab uses the exact D50 formulas; gray is treated as sGray (gray `v` = sRGB `(v, v, v)`).
+
+use std::sync::OnceLock;
+
+use photocraft_cms::{Builtin, Intent, Transform};
+
+fn cmyk_to_srgb_transform() -> &'static Transform {
+    static T: OnceLock<Transform> = OnceLock::new();
+    T.get_or_init(|| Transform::new(Builtin::CoatedCmyk.profile(), Builtin::Srgb.profile(), Intent::RelativeColorimetric, true).expect("built-in profiles link"))
+}
+
+fn srgb_to_cmyk_transform() -> &'static Transform {
+    static T: OnceLock<Transform> = OnceLock::new();
+    T.get_or_init(|| Transform::new(Builtin::Srgb.profile(), Builtin::CoatedCmyk.profile(), Intent::RelativeColorimetric, true).expect("built-in profiles link"))
+}
+
+/// Colour-managed CMYK → sRGB (built-in coated CMYK profile, relative colorimetric + BPC).
+#[inline]
+pub fn cmyk_to_rgb(c: [f32; 4]) -> [f32; 3] {
+    let mut o = [0.0f32; 3];
+    cmyk_to_srgb_transform().eval_fast(&c, &mut o);
+    o
+}
+
+/// Colour-managed sRGB → CMYK (built-in coated CMYK profile, relative colorimetric + BPC).
+#[inline]
+pub fn rgb_to_cmyk(rgb: [f32; 3]) -> [f32; 4] {
+    let mut o = [0.0f32; 4];
+    srgb_to_cmyk_transform().eval_fast(&[rgb[0].clamp(0.0, 1.0), rgb[1].clamp(0.0, 1.0), rgb[2].clamp(0.0, 1.0)], &mut o);
+    o
+}
 
 /// sRGB transfer function: encoded → linear.
 #[inline]
@@ -13,7 +49,7 @@ pub fn linear_to_srgb(v: f32) -> f32 {
     if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
 }
 
-/// Naive CMYK → RGB (no profile). Used only for previews until ICC is wired in.
+/// Naive CMYK → RGB (no profile): `(1 − c)(1 − k)`. Kept for reference and tests.
 pub fn cmyk_to_rgb_naive(c: [f32; 4]) -> [f32; 3] {
     let k = 1.0 - c[3];
     [(1.0 - c[0]) * k, (1.0 - c[1]) * k, (1.0 - c[2]) * k]
@@ -93,6 +129,22 @@ mod tests {
             let back = cmyk_to_rgb_naive(rgb_to_cmyk_naive(rgb));
             for i in 0..3 {
                 assert!((back[i] - rgb[i]).abs() < 1e-5, "{rgb:?} -> {back:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn managed_cmyk() {
+        let white = cmyk_to_rgb([0.0; 4]);
+        assert!(white.iter().all(|v| *v > 0.99), "{white:?}");
+        // 100 % K alone is a dark neutral, not pure black (as in any real CMYK profile).
+        let k = cmyk_to_rgb([0.0, 0.0, 0.0, 1.0]);
+        assert!(k[0] < 0.3 && (k[0] - k[2]).abs() < 0.05, "{k:?}");
+        // Round trip of in-gamut colours.
+        for rgb in [[0.5, 0.5, 0.5], [0.6, 0.4, 0.3], [0.3, 0.5, 0.6]] {
+            let back = cmyk_to_rgb(rgb_to_cmyk(rgb));
+            for i in 0..3 {
+                assert!((back[i] - rgb[i]).abs() < 0.03, "{rgb:?} -> {back:?}");
             }
         }
     }

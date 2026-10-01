@@ -8,7 +8,10 @@
 #![forbid(unsafe_code)]
 
 pub mod adjust;
+pub mod comps;
 pub mod effects;
+pub mod mode;
+pub mod pattern;
 pub mod text;
 pub mod vector;
 
@@ -16,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use adjust::Adjustment;
+pub use comps::{Artboard, ArtboardBackground, CompAppearance, CompLayerState, LayerComp};
 pub use effects::{
     Bevel, BevelStyle, BevelTechnique, Contour, Effect, FxCommon, FxPaint, GlobalLight, Glow, GlowSource, GlowTechnique, Gradient,
     GradientStyle, Satin, Shadow, StrokeFx, StrokePosition,
@@ -23,6 +27,8 @@ pub use effects::{
 pub use photocraft_color::{BlendMode, Color, ColorMode, PixelFormat, SampleType};
 pub use photocraft_geom::{Affine, Rect, Size};
 pub use photocraft_raster::Surface;
+pub use mode::{ColorTable, Duotone, DuotoneInk, StackMode};
+pub use pattern::Pattern;
 pub use vector::{
     ClippingPath, FillRule, Knot, LineCap, LineJoin, LiveShape, NamedPath, Path, PathOp, ShapeLayer, ShapeStroke, StrokeAlign, Subpath,
     VectorMask,
@@ -145,6 +151,8 @@ pub struct Effects {
 pub struct Group {
     pub children: Vec<Layer>,
     pub expanded: bool,
+    /// Set when this (top-level) group is an artboard: children are clipped to its rect.
+    pub artboard: Option<Artboard>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -152,7 +160,22 @@ pub enum Fill {
     Solid(Color),
     /// Gradient between stops at `angle` degrees (`style` geometry, optionally reversed).
     Gradient { stops: Vec<(f32, Color)>, angle: f32, scale: f32, style: GradientStyle, reverse: bool },
-    Pattern { name: String, scale: f32 },
+    /// A pattern from [`Document::patterns`] (looked up by `id`, then `name`).
+    Pattern {
+        name: String,
+        scale: f32,
+        #[serde(default)]
+        id: String,
+        /// Rotation in degrees (counter-clockwise).
+        #[serde(default)]
+        angle: f32,
+        /// "Link with Layer": the pattern origin follows the layer's frame (else the canvas).
+        #[serde(default = "effects::yes")]
+        link: bool,
+        /// Phase (origin offset) in pixels.
+        #[serde(default)]
+        phase: (f32, f32),
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -176,7 +199,7 @@ pub struct TextLayer {
     pub shape: text::TextShape,
     pub orientation: text::Orientation,
     pub antialias: text::AntiAlias,
-    /// Warp settings (stored; not rendered yet).
+    /// Warp Text settings (applied to the glyph outlines when rendering).
     pub warp: Option<text::TextWarp>,
 }
 
@@ -271,6 +294,25 @@ pub struct SmartObject {
     /// Data of the PSD placed-layer block (`SoLd`, `PlLd` or `SoLE`). On export
     /// it replaces that entry in [`Layer::psd_blocks`].
     pub psd_raw: Option<Arc<Vec<u8>>>,
+    /// Layer › Smart Filter › Disable Smart Filters turns the whole stack off
+    /// without touching each filter's own visibility.
+    pub filters_enabled: bool,
+    /// The smart filter mask (one per smart object, as in Photoshop): where the
+    /// filter stack's result shows over the unfiltered content.
+    pub filter_mask: Option<LayerMask>,
+    /// Edit › Transform › Warp on the smart object, in source-image coordinates; applied before
+    /// `transform` when re-rendering from the source, so warping stays lossless.
+    pub warp: Option<photocraft_geom::warp::Warp>,
+    /// Layer › Smart Objects › Stack Mode: when set, the source's top-level layers are combined
+    /// per pixel with this statistic instead of composited.
+    pub stack_mode: Option<StackMode>,
+}
+
+impl SmartObject {
+    /// A smart object with no filters and no PSD data.
+    pub fn new(source: SmartSource, transform: Affine, cache: Option<Surface>) -> Self {
+        Self { source, transform, smart_filters: Vec::new(), cache, psd_raw: None, filters_enabled: true, filter_mask: None, warp: None, stack_mode: None }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -360,6 +402,8 @@ pub struct Layer {
     pub psd_id: Option<u32>,
     /// Photoshop-rendered pixels for fill layers (see [`FillCache`]).
     pub fill_cache: Option<FillCache>,
+    /// Layer › Link Layers: layers sharing a link group move together. `None` = not linked.
+    pub link_group: Option<u64>,
 }
 
 impl Layer {
@@ -381,13 +425,14 @@ impl Layer {
             psd_blocks: Vec::new(),
             psd_id: None,
             fill_cache: None,
+            link_group: None,
         }
     }
     pub fn raster(name: impl Into<String>, format: PixelFormat) -> Self {
         Self::new(name, LayerContent::Raster(Surface::new(format)))
     }
     pub fn group(name: impl Into<String>, children: Vec<Layer>) -> Self {
-        let mut l = Self::new(name, LayerContent::Group(Group { children, expanded: true }));
+        let mut l = Self::new(name, LayerContent::Group(Group { children, expanded: true, artboard: None }));
         l.blend = BlendMode::PassThrough;
         l
     }
@@ -444,12 +489,46 @@ pub struct Guides {
     pub vertical: Vec<f32>,
 }
 
+/// Which areas an alpha channel's overlay colour marks (Channel Options › Color Indicates).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ColorIndicates {
+    /// Colour shows over black (unselected) pixels: Photoshop's default.
+    #[default]
+    MaskedAreas,
+    /// Colour shows over white (selected) pixels.
+    SelectedAreas,
+}
+
+/// An extra (alpha or spot) channel, also used for the temporary Quick Mask channel.
+///
+/// The surface is grayscale at the document depth; white = selected (1.0), black = masked.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlphaChannel {
     pub name: String,
     pub surface: Surface,
     /// Spot colour channels carry their ink colour and solidity.
     pub spot: Option<(Color, f32)>,
+    /// Overlay colour shown when the channel is viewed together with the composite.
+    pub color: Color,
+    /// Overlay opacity (0..1).
+    pub opacity: f32,
+    pub indicates: ColorIndicates,
+}
+
+impl AlphaChannel {
+    /// Photoshop's default overlay: red at 50% over masked areas.
+    pub const DEFAULT_COLOR: Color = Color::rgb(1.0, 0.0, 0.0);
+
+    pub fn new(name: impl Into<String>, surface: Surface) -> Self {
+        Self { name: name.into(), surface, spot: None, color: Self::DEFAULT_COLOR, opacity: 0.5, indicates: ColorIndicates::MaskedAreas }
+    }
+
+    /// Overlay coverage (0..1, before opacity) for channel value `v`: spot channels show ink
+    /// where the channel is white, alpha channels follow [`ColorIndicates`].
+    pub fn overlay_coverage(&self, v: f32) -> f32 {
+        if self.spot.is_some() || self.indicates == ColorIndicates::SelectedAreas { v } else { 1.0 - v }
+    }
 }
 
 /// A raw PSD global tagged block: (signature, key, data).
@@ -490,6 +569,23 @@ pub struct Document {
     pub work_path: Option<Path>,
     /// Clipping path used on export (names one of `paths`).
     pub clipping_path: Option<ClippingPath>,
+    /// Select › Edit in Quick Mask Mode: the temporary "Quick Mask" channel while the mode is on.
+    /// Part of the document so entering and leaving are history steps (as in Photoshop).
+    pub quick_mask: Option<AlphaChannel>,
+    /// Patterns stored with the document (PSD `Patt`/`Pat2`/`Pat3`): those its layers use, plus
+    /// any imported with it.
+    pub patterns: Vec<Pattern>,
+    /// Indexed Color palette (Image › Mode › Color Table). Set while `mode` is Indexed.
+    pub color_table: Option<ColorTable>,
+    /// Duotone inks. Set while `mode` is Duotone.
+    pub duotone: Option<Duotone>,
+    /// Window › Layer Comps, top to bottom as listed in the panel.
+    pub layer_comps: Vec<LayerComp>,
+    /// Id of the comp applied last (PSD `lastAppliedComp`); None = the document's own state.
+    pub last_applied_comp: Option<u32>,
+    /// "Last Document State": layer state saved when a comp is applied over the document's own
+    /// state, restored by `layerComp.restoreLastDocumentState`. Its id is 0.
+    pub last_document_state: Option<LayerComp>,
 }
 
 /// Where a layer lives in the tree: indices from the root down.
@@ -514,6 +610,13 @@ impl Document {
             paths: Vec::new(),
             work_path: None,
             clipping_path: None,
+            quick_mask: None,
+            patterns: Vec::new(),
+            color_table: None,
+            duotone: None,
+            layer_comps: Vec::new(),
+            last_applied_comp: None,
+            last_document_state: None,
         }
     }
 

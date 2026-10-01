@@ -39,11 +39,25 @@ pub enum Adjustment {
     BlackWhite { weights: [f32; 6], tint: Option<[f32; 3]> },
     PhotoFilter { color: [f32; 3], density: f32, preserve_luminosity: bool },
     ChannelMixer { matrix: [[f32; 4]; 3], monochrome: bool },
-    ColorLookup { name: String, lut: Option<Arc<Vec<f32>>>, size: u32 },
+    /// A 3D LUT: `size`³ RGB triplets, red varying fastest (`((b·size + g)·size + r)·3`), in 0..=1.
+    /// `lut` is None for a lookup Photoshop stores as an ICC profile (identity here).
+    ColorLookup {
+        name: String,
+        lut: Option<Arc<Vec<f32>>>,
+        size: u32,
+        /// Tetrahedral instead of trilinear interpolation.
+        #[serde(default)]
+        tetrahedral: bool,
+        /// Ordered dither of ±½ an 8-bit step to hide banding (Photoshop's "Dither").
+        #[serde(default)]
+        dither: bool,
+    },
     Invert,
     Posterize { levels: u32 },
     Threshold { level: f32 },
     GradientMap { stops: Vec<(f32, [f32; 3])>, reverse: bool },
+    /// Per range (reds, yellows, greens, cyans, blues, magentas, whites, neutrals, blacks) the
+    /// cyan, magenta, yellow and black change in percent (-100..=100), as in Photoshop.
     SelectiveColor { relative: bool, adjustments: [[f32; 4]; 9] },
     /// A PSD adjustment we can't evaluate yet; preserved raw for round-trip.
     Unsupported { psd_key: String, raw: Vec<u8> },

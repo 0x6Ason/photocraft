@@ -209,7 +209,21 @@ pub enum Effect {
     Stroke(StrokeFx),
     ColorOverlay { common: FxCommon, color: Color },
     GradientOverlay { common: FxCommon, gradient: Gradient, dither: bool },
-    PatternOverlay { common: FxCommon, name: String, id: String, scale: f32 },
+    PatternOverlay {
+        common: FxCommon,
+        name: String,
+        id: String,
+        scale: f32,
+        /// Rotation in degrees (counter-clockwise).
+        #[serde(default)]
+        angle: f32,
+        /// "Link with Layer": the pattern origin follows the layer (else the canvas).
+        #[serde(default = "yes")]
+        link: bool,
+        /// Phase (origin offset) in pixels.
+        #[serde(default)]
+        phase: (f32, f32),
+    },
     Satin(Satin),
     BevelEmboss(Bevel),
 }
@@ -261,6 +275,11 @@ impl Effect {
             knocks_out: true,
         })
     }
+}
+
+/// Serde default for flags that start on.
+pub fn yes() -> bool {
+    true
 }
 
 /// Document-wide light used by effects with `use_global_light`.

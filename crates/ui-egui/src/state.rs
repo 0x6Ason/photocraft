@@ -185,11 +185,14 @@ pub struct Panels {
     pub toolbar: bool,
     pub options_bar: bool,
     pub status_bar: bool,
+    /// Window › Brush Settings (F5): floating, like Photoshop's.
+    #[serde(default)]
+    pub brush_settings: bool,
 }
 
 impl Default for Panels {
     fn default() -> Self {
-        Self { layers: true, history: false, properties: true, color: true, navigator: false, toolbar: true, options_bar: true, status_bar: true }
+        Self { layers: true, history: false, properties: true, color: true, navigator: false, toolbar: true, options_bar: true, status_bar: true, brush_settings: false }
     }
 }
 
@@ -340,6 +343,9 @@ pub struct TransformSession {
     /// Reference point (rotation / ⌥-scale centre).
     pub pivot: [f64; 2],
     pub interpolation: String,
+    /// Warp mode (Edit › Transform › Warp): the warp being edited over `rect`, in document px.
+    #[serde(default)]
+    pub warp: Option<photocraft_geom::warp::Warp>,
 }
 
 /// In-progress inline type editing (Type tool). Offsets are character indices.
@@ -418,6 +424,9 @@ pub struct UiState {
     /// View extras: rulers (⌘R), grid (⌘'), guides (⌘;), snapping (⇧⌘;), locked guides (⌥⌘;).
     #[serde(default)]
     pub extras: Extras,
+    /// View / Window / Type preferences: screen mode, Extras, Show and Snap To, flip, arrangement.
+    #[serde(default)]
+    pub view: crate::view_cmds::ViewOptions,
     pub panels: Panels,
     /// Views per open document (index-aligned with the session's documents).
     pub views: Vec<View>,
@@ -427,6 +436,11 @@ pub struct UiState {
     pub workspace: String,
     pub palette_open: bool,
     pub dock_tabs: DockTabs,
+    /// Brush Settings: selected section (0 = Brush Tip Shape) and tab (0 settings, 1 Brushes).
+    #[serde(default)]
+    pub brush_section: usize,
+    #[serde(default)]
+    pub brush_tab: usize,
     /// Marquee options-bar mode: 0 new, 1 add, 2 subtract, 3 intersect (modifier keys override).
     #[serde(default)]
     pub selection_mode: u8,
@@ -456,6 +470,7 @@ impl Default for UiState {
             clone_source: None,
             clone_offset: None,
             extras: Extras::default(),
+            view: Default::default(),
             actions: Default::default(),
             layer_filter: Vec::new(),
             pen: None,
@@ -468,6 +483,8 @@ impl Default for UiState {
             workspace: "Essentials".into(),
             palette_open: false,
             dock_tabs: DockTabs::default(),
+            brush_section: 0,
+            brush_tab: 0,
             selection_mode: 0,
             tool_options: ToolOptions::default(),
             polygon: Vec::new(),

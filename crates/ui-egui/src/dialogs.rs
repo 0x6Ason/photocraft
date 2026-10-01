@@ -12,9 +12,14 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         let mut fields = d.fields.clone();
         let mut outcome: Option<bool> = None; // Some(true)=OK, Some(false)=Cancel
         let title = title(&d);
-        let modal = egui::Modal::new(egui::Id::new(("dialog", d.id))).show(ctx, |ui| {
+        // Photoshop doesn't dim the window behind dialogs: previews must be judged at true contrast.
+        let modal = egui::Modal::new(egui::Id::new(("dialog", d.id))).backdrop_color(egui::Color32::TRANSPARENT).show(ctx, |ui| {
             ui.set_min_width(380.0);
-            ui.set_max_width(if d.kind == DialogKind::LayerStyle || d.fields.contains_key("__export") { 600.0 } else { 440.0 });
+            let wide = crate::prefs_ui::width(&d.fields);
+            if let Some(w) = wide {
+                ui.set_min_width(w.min(460.0));
+            }
+            ui.set_max_width(wide.unwrap_or(if d.kind == DialogKind::LayerStyle || d.fields.contains_key("__export") { 600.0 } else { 440.0 }));
             ui.label(egui::RichText::new(&title).font(crate::theme::semibold(15.0)));
             ui.add_space(4.0);
             crate::widgets::hairline(ui);
@@ -26,9 +31,11 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                     ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                     ui.weak("egui · wgpu · photocraft-engine");
                 }
+                DialogKind::Command if crate::prefs_ui::owns(&fields) => crate::prefs_ui::body(app, ui, &mut fields),
                 DialogKind::Command if fields.contains_key("__export") => crate::export_dialog::body(app, ui, &mut fields),
                 DialogKind::Command if fields.contains_key("__sizing") => crate::sizing::body(ui, &mut fields),
                 DialogKind::Command if fields.contains_key("__filter") => crate::filter_dialog::body(ui, &mut fields),
+                DialogKind::Command if fields.contains_key("__form") => crate::view_cmds::form_body(ui, &mut fields),
                 DialogKind::Command => command_fields(ui, &mut fields),
                 DialogKind::LayerStyle => crate::layer_style::body(ui, &mut fields),
                 DialogKind::Error => {
@@ -99,11 +106,13 @@ pub fn confirm(app: &mut PhotocraftApp, id: u64) -> Result<Value, String> {
             }
             r
         }
+        DialogKind::Command if crate::prefs_ui::owns(&d.fields) => crate::prefs_ui::confirm(app, &d.fields),
         DialogKind::Command if d.fields.contains_key("__export") => crate::export_dialog::confirm(app, &d.fields),
         DialogKind::Command => {
             app.filter_preview = None;
             let cmd = d.fields.get("__command").and_then(|v| v.as_str().map(str::to_string)).ok_or("dialog has no command")?;
-            app.run(&cmd, crate::filter_dialog::params_of(&d.fields))
+            let (cmd, params) = crate::smart_ui::confirm_command(&d.fields, cmd, crate::filter_dialog::params_of(&d.fields));
+            app.run(&cmd, params)
         }
         DialogKind::LayerStyle => crate::layer_style::confirm(app, &d.fields),
         DialogKind::About | DialogKind::Error => Ok(Value::Null),

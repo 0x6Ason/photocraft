@@ -37,7 +37,7 @@ fn fbm(x: f32, y: f32, size: f32, cells: i32, octaves: u32, salt: u64) -> f32 {
 pub fn pattern(style: PatternStyle, size: u32, seed: u32) -> PatternImage {
     let n = size.clamp(8, 1024) as usize;
     let s = n as f32;
-    let salt = u64::from(seed) * 0x1000_0000_1B3 + 17;
+    let salt = u64::from(seed) * 0x0100_0000_01B3 + 17;
     let mut data = vec![0.0f32; n * n];
     for y in 0..n {
         for x in 0..n {

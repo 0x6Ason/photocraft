@@ -73,6 +73,12 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
         "engine.execute" | "ui.menu.invoke" => {
             let Some(id) = s("command").or(s("id")) else { return err("missing `command`") };
             let params = p.get("params").cloned().unwrap_or(json!({}));
+            // `engine.execute` is programmatic: engine commands run directly with their default
+            // params and never open a dialog (an agent would otherwise get a modal instead of a
+            // result). `ui.menu.invoke` behaves like a menu click, so it may open the dialog.
+            if req.method == "engine.execute" && photocraft_engine::commands::find(id).is_some() {
+                return wrap(app.run(id, params));
+            }
             wrap(crate::menus::invoke(app, ctx, id, params))
         }
         "engine.commands" => wrap(app.run("command.list", json!({}))),
@@ -132,6 +138,12 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
                     Some(k) => app.set_theme(ctx, k),
                     None => return err(format!("unknown theme `{name}` (studio, studioLight, classic)")),
                 }
+            }
+            if let Some(i) = u("brushSection") {
+                app.ui.brush_section = (i as usize).min(crate::brush_panel::SECTIONS.len() - 1);
+            }
+            if let Some(i) = u("brushTab") {
+                app.ui.brush_tab = (i as usize).min(1);
             }
             if let Some(size) = p.get("brushSize").and_then(Value::as_f64) {
                 app.session.tools.brush.size = size as f32;
@@ -333,5 +345,34 @@ pub fn save_screenshot(app: &mut PhotocraftApp, image: &egui::ColorImage, path: 
     match r {
         Ok(()) => json!({"ok": true, "result": {"path": path, "width": w, "height": h}}),
         Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(app: &mut PhotocraftApp, ctx: &egui::Context, method: &str, params: Value) -> Value {
+        let (req, _rx) = ControlRequest::new(method, params);
+        match handle(app, ctx, &req) {
+            Outcome::Done(v) => v,
+            _ => panic!("{method}: expected an immediate reply"),
+        }
+    }
+
+    #[test]
+    fn engine_execute_runs_with_defaults_but_menu_invoke_opens_the_dialog() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let ctx = egui::Context::default();
+        app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+        app.run("edit.fill", json!({"color": "#808080"})).unwrap();
+        let rev = app.session.active().unwrap().revision;
+        let r = call(&mut app, &ctx, "engine.execute", json!({"command": "filter.blur.gaussianBlur"}));
+        assert!(!r.to_string().contains("\"dialog\""), "engine.execute opened a dialog: {r}");
+        assert!(app.session.active().unwrap().revision > rev, "engine.execute didn't run the filter");
+        let rev = app.session.active().unwrap().revision;
+        let r = call(&mut app, &ctx, "ui.menu.invoke", json!({"id": "filter.blur.gaussianBlur"}));
+        assert!(r.to_string().contains("dialog"), "ui.menu.invoke should open the dialog: {r}");
+        assert_eq!(app.session.active().unwrap().revision, rev, "opening a dialog must not edit the document");
     }
 }

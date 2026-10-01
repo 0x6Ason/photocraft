@@ -37,8 +37,10 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let mut app = PhotocraftApp::new(Session::new(), services::native());
             app.integrated_titlebar = cfg!(target_os = "macos");
+            // Preferences › Performance › Use Graphics Processor.
             if let Some(rs) = cc.wgpu_render_state.clone()
                 && std::env::var_os("PHOTOCRAFT_CPU_CANVAS").is_none()
+                && app.session.prefs().performance.use_gpu
             {
                 app.set_wgpu(rs);
             }

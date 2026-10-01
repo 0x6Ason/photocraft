@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod warp;
+
 /// Edge length of a raster tile in pixels.
 pub const TILE_SIZE: i32 = 256;
 

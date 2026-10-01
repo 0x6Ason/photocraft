@@ -104,7 +104,10 @@ fn disabled_mask_is_ignored() {
     m.enabled = false;
     l.mask = Some(m);
     d.layers.push(l);
-    assert!(close4(px(&d, 0, 0), [0.0, 0.0, 0.0, 1.0]));
+    // CMYK displays through the built-in CMYK profile: 100 % K alone is a dark neutral
+    // (as in any real CMYK profile), not pure black.
+    let p = px(&d, 0, 0);
+    assert!(p[0] < 0.3 && (p[0] - p[1]).abs() < 0.05 && (p[1] - p[2]).abs() < 0.05 && p[3] == 1.0, "{p:?}");
 }
 
 #[test]
@@ -258,9 +261,9 @@ fn solid_and_gradient_fill_layers() {
     assert!(close4(px(&d, 5, 0), [0.0, 0.0, 1.0, 1.0]));
 
     let g = Fill::Gradient { stops: vec![(0.0, Color::BLACK), (1.0, Color::WHITE)], angle: 0.0, scale: 1.0, style: photocraft_doc::GradientStyle::Linear, reverse: false };
-    let buf = render_fill(&g, Rect::new(0, 0, 10, 1), Rect::new(0, 0, 10, 1));
+    let buf = render_fill(&g, Rect::new(0, 0, 10, 1), Rect::new(0, 0, 10, 1), &[]);
     // tile independence: a 1px render of the right edge equals the full render
-    let one = render_fill(&g, Rect::new(9, 0, 10, 1), Rect::new(0, 0, 10, 1));
+    let one = render_fill(&g, Rect::new(9, 0, 10, 1), Rect::new(0, 0, 10, 1), &[]);
     assert_eq!(one.px[0], buf.px[9]);
     assert!(buf.px[0][0] < buf.px[9][0], "left dark, right light");
 }
@@ -301,7 +304,10 @@ fn cmyk_document_renders_via_rgb() {
     let mut l = Layer::raster("k", d.pixel_format());
     l.surface_mut().unwrap().fill_rect(Rect::new(0, 0, 2, 2), &[0.0, 0.0, 0.0, 1.0, 1.0]);
     d.layers.push(l);
-    assert!(close4(px(&d, 0, 0), [0.0, 0.0, 0.0, 1.0]));
+    // CMYK displays through the built-in CMYK profile: 100 % K alone is a dark neutral
+    // (as in any real CMYK profile), not pure black.
+    let p = px(&d, 0, 0);
+    assert!(p[0] < 0.3 && (p[0] - p[1]).abs() < 0.05 && (p[1] - p[2]).abs() < 0.05 && p[3] == 1.0, "{p:?}");
 }
 
 #[test]
@@ -636,7 +642,7 @@ fn effect_maps_are_cached_and_invalidated_by_pixel_changes() {
     let mut l = solid_layer("fx", Rect::new(16, 16, 48, 48), [1.0, 0.0, 0.0, 1.0]);
     l.effects.items.push(photocraft_doc::Effect::default_drop_shadow());
     doc.layers.push(l);
-    let cx = Ctx { canvas: doc.bounds(), transfer: adjust::Transfer::Srgb, light: doc.global_light };
+    let cx = Ctx { canvas: doc.bounds(), transfer: adjust::Transfer::Srgb, light: doc.global_light, patterns: &doc.patterns };
     let a = effect_maps(&doc.layers[1], &cx);
     let b = effect_maps(&doc.layers[1], &cx);
     assert!(std::sync::Arc::ptr_eq(&a, &b), "second request hits the cache");

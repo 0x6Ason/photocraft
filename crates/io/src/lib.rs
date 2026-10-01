@@ -18,10 +18,14 @@
 #![forbid(unsafe_code)]
 
 mod adjust_map;
+mod channel_map;
+pub mod comps_map;
 pub mod effects_map;
 pub mod blocks;
 mod gradient_bake;
 mod flat;
+pub mod linked;
+pub mod pattern_map;
 mod pixels;
 mod psd_export;
 mod psd_import;
@@ -134,7 +138,9 @@ pub fn export(doc: &Document, name_or_ext: &str, opts: &ExportOptions) -> Result
 pub fn merged_composite(file: &PsdFile) -> Result<Vec<[f32; 4]>, IoError> {
     let img = file.composite_rgba8().ok();
     let h = &file.header;
-    if let (Some(img), false) = (img, matches!(h.color_mode, photocraft_psd::ColorMode::Lab)) {
+    // CMYK goes through the colour-managed model conversion (the PSD crate's RGBA preview is a
+    // naive, profile-free conversion).
+    if let (Some(img), false) = (img, matches!(h.color_mode, photocraft_psd::ColorMode::Lab | photocraft_psd::ColorMode::Cmyk)) {
         let unmatte = file.merged_has_alpha();
         return Ok(img
             .data
@@ -150,7 +156,7 @@ pub fn merged_composite(file: &PsdFile) -> Result<Vec<[f32; 4]>, IoError> {
             })
             .collect());
     }
-    // Generic path (Lab and others) via the raster model conversion.
+    // Generic path (Lab, CMYK and others) via the raster model conversion.
     let (doc, _) = psd_to_document(&PsdFile { layer_info: None, ..file.clone() });
     let l = doc.layers.first().ok_or_else(|| IoError::Unsupported("no merged image".into()))?;
     let s = l.surface().ok_or_else(|| IoError::Unsupported("no merged image".into()))?;

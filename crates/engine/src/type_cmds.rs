@@ -549,11 +549,12 @@ pub fn specs() -> Vec<CommandSpec> {
             journal: true,
             run: |s, p| {
                 let text = norm_text(p.get("text").and_then(Value::as_str).unwrap_or(""));
-                let mut style = CharStyle { font_family: photocraft_text::fonts::DEFAULT_FAMILY.into(), ..Default::default() };
+                // Type › Save Default Type Styles sets the starting styles; the colour is always
+                // the foreground colour, as in Photoshop.
+                let (mut style, mut para) = s.type_defaults.clone().unwrap_or_else(|| (CharStyle { font_family: photocraft_text::fonts::DEFAULT_FAMILY.into(), ..Default::default() }, ParagraphStyle::default()));
                 let fg = s.tools.foreground;
                 style.color = Color::rgba(fg[0], fg[1], fg[2], fg[3]);
                 apply_char_props(&mut style, p);
-                let mut para = ParagraphStyle::default();
                 apply_para_props(&mut para, p);
                 let (shape, transform) = match p.get("box").and_then(Value::as_array) {
                     Some(b) if b.len() == 4 => {

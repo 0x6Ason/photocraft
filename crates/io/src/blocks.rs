@@ -239,14 +239,10 @@ pub fn fill_from_desc(key: &[u8; 4], d: &Descriptor) -> Option<Fill> {
             Some(Fill::Gradient { stops, angle, scale, style: gradient_style(d), reverse: bool_of(d, "Rvrs") })
         }
         b"PtFl" => {
-            let name = get_desc(d, "Ptrn")
-                .and_then(|p| match p.get("Nm  ") {
-                    Some(Value::Text(t)) => Some(t.to_string_lossy()),
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let (name, id) = pattern_ref(d);
             let scale = num(d.get("Scl ")).map_or(1.0, |v| v as f32 / 100.0);
-            Some(Fill::Pattern { name, scale })
+            let (angle, link, phase) = pattern_placement(d);
+            Some(Fill::Pattern { name, scale, id, angle, link, phase })
         }
         _ => None,
     }
@@ -273,16 +269,83 @@ pub fn fill_to_desc(f: &Fill) -> ([u8; 4], Descriptor) {
             }
             (*b"GdFl", d)
         }
-        Fill::Pattern { name, scale } => {
-            let p = Descriptor::new("Ptrn").with("Nm  ", Value::Text(UnicodeString::new_nul(name)));
-            (
-                *b"PtFl",
-                Descriptor::new("null")
-                    .with("Scl ", Value::UnitFloat { unit: *b"#Prc", value: f64::from(scale * 100.0) })
-                    .with("Ptrn", Value::Descriptor(p)),
-            )
+        Fill::Pattern { name, scale, id, angle, link, phase } => {
+            let d = Descriptor::new("null")
+                .with("Scl ", Value::UnitFloat { unit: *b"#Prc", value: f64::from(scale * 100.0) })
+                .with("Ptrn", Value::Descriptor(pattern_ref_desc(name, id)));
+            (*b"PtFl", with_pattern_placement(d, *angle, *link, *phase))
         }
     }
+}
+
+/// Pattern name and id (`Ptrn` → `Nm  `, `Idnt`) of a pattern fill / overlay descriptor.
+pub(crate) fn pattern_ref(d: &Descriptor) -> (String, String) {
+    let p = get_desc(d, "Ptrn");
+    let text = |k: &str| match p.and_then(|p| p.get(k)) {
+        Some(Value::Text(t)) => t.to_string_lossy(),
+        _ => String::new(),
+    };
+    (text("Nm  "), text("Idnt"))
+}
+
+/// The `Ptrn` reference descriptor (the id is omitted when unknown).
+pub(crate) fn pattern_ref_desc(name: &str, id: &str) -> Descriptor {
+    let p = Descriptor::new("Ptrn").with("Nm  ", Value::Text(UnicodeString::new_nul(name)));
+    if id.is_empty() { p } else { p.with("Idnt", Value::Text(UnicodeString::new_nul(id))) }
+}
+
+/// Angle (`Angl`, degrees), link with layer (`Algn`, default on) and phase (`phase` point) of a
+/// pattern fill / overlay descriptor.
+pub(crate) fn pattern_placement(d: &Descriptor) -> (f32, bool, (f32, f32)) {
+    let angle = num(d.get("Angl")).unwrap_or(0.0) as f32;
+    let link = !matches!(d.get("Algn"), Some(Value::Boolean(false)));
+    let phase = get_desc(d, "phase").map_or((0.0, 0.0), |p| (num(p.get("Hrzn")).unwrap_or(0.0) as f32, num(p.get("Vrtc")).unwrap_or(0.0) as f32));
+    (angle, link, phase)
+}
+
+/// Adds the keys read by [`pattern_placement`] (angle only when non-zero).
+pub(crate) fn with_pattern_placement(mut d: Descriptor, angle: f32, link: bool, phase: (f32, f32)) -> Descriptor {
+    if angle != 0.0 {
+        d = d.with("Angl", Value::UnitFloat { unit: *b"#Ang", value: f64::from(angle) });
+    }
+    d.with("Algn", Value::Boolean(link))
+        .with("phase", Value::Descriptor(Descriptor::new("Pnt ").with("Hrzn", Value::Double(f64::from(phase.0))).with("Vrtc", Value::Double(f64::from(phase.1)))))
+}
+
+/// The warp of a placed layer (`SoLd`/`SoLE` `warp` descriptor): style, bend, distortions,
+/// axis, bounds and, for `warpCustom`, the 4 × 4 `customEnvelopeWarp` mesh. Read-only: the raw
+/// block is what gets written back. `None` when absent or `warpNone` with no mesh.
+pub fn parse_placed_warp(key: &[u8; 4], data: &[u8]) -> Option<photocraft_geom::warp::Warp> {
+    use photocraft_geom::warp::{BezierMesh, Warp, WarpStyle};
+    if key != b"SoLd" && key != b"SoLE" {
+        return None;
+    }
+    let d = data.get(8..).and_then(parse_prefix_versioned)?;
+    let w = get_desc(&d, "warp")?;
+    let style = enum_of(w, "warpStyle").and_then(|v| WarpStyle::parse(&String::from_utf8_lossy(v)))?;
+    let b = get_desc(w, "bounds")?;
+    let g = |k: &str| num(b.get(k));
+    let bounds = [g("Left")?, g("Top ")?, g("Rght")?, g("Btom")?];
+    let mut warp = Warp::preset(style, num(w.get("warpValue")).unwrap_or(0.0), bounds);
+    warp.h_distort = num(w.get("warpPerspective")).unwrap_or(0.0);
+    warp.v_distort = num(w.get("warpPerspectiveOther")).unwrap_or(0.0);
+    warp.vertical = enum_of(w, "warpRotate") == Some(b"Vrtc");
+    if style == WarpStyle::Custom {
+        let env = get_desc(w, "customEnvelopeWarp")?;
+        let Some(Value::ObjectArray(arr)) = env.get("meshPoints") else { return None };
+        let vals = |k: &str| match arr.body.get(k) {
+            Some(Value::UnitFloats { values, .. }) => Some(values.clone()),
+            _ => None,
+        };
+        let (xs, ys) = (vals("Hrzn")?, vals("Vrtc")?);
+        if xs.len() != 16 || ys.len() != 16 {
+            return None;
+        }
+        let mesh = BezierMesh { us: vec![0.0, 1.0], vs: vec![0.0, 1.0], points: xs.iter().zip(&ys).map(|(x, y)| [*x, *y]).collect() };
+        warp.mesh = mesh.is_valid().then_some(mesh);
+        warp.mesh.as_ref()?;
+    }
+    (!warp.is_identity()).then_some(warp)
 }
 
 /// Text content and transform from a `TySh` block (best effort).
@@ -346,6 +409,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn placed_layer_warp_is_read() {
+        use photocraft_geom::warp::WarpStyle;
+        use photocraft_psd::descriptor::ObjectArray;
+        let e = |t: &str, v: &str| Value::Enumerated { type_id: Id::new(t), value: Id::new(v) };
+        let bounds = Descriptor::new("Rctn")
+            .with("Top ", Value::UnitFloat { unit: *b"#Pxl", value: 0.0 })
+            .with("Left", Value::UnitFloat { unit: *b"#Pxl", value: 0.0 })
+            .with("Btom", Value::UnitFloat { unit: *b"#Pxl", value: 30.0 })
+            .with("Rght", Value::UnitFloat { unit: *b"#Pxl", value: 60.0 });
+        let sold = |warp: Descriptor| {
+            let mut v = b"soLD".to_vec();
+            v.extend_from_slice(&4u32.to_be_bytes());
+            v.extend(VersionedDescriptor::new(Descriptor::new("null").with("warp", Value::Descriptor(warp))).to_bytes());
+            v
+        };
+        let arc = Descriptor::new("warp")
+            .with("warpStyle", e("warpStyle", "warpArc"))
+            .with("warpValue", Value::Double(40.0))
+            .with("warpPerspective", Value::Double(0.0))
+            .with("warpPerspectiveOther", Value::Double(0.0))
+            .with("warpRotate", e("Ornt", "Hrzn"))
+            .with("bounds", Value::Descriptor(bounds.clone()));
+        let w = parse_placed_warp(b"SoLd", &sold(arc)).unwrap();
+        assert_eq!((w.style, w.bend, w.bounds), (WarpStyle::Arc, 40.0, [0.0, 0.0, 60.0, 30.0]));
+        let (mut xs, mut ys) = (Vec::new(), Vec::new());
+        for j in 0..4 {
+            for i in 0..4 {
+                xs.push(f64::from(i) * 20.0 + if i == 3 && j == 3 { 7.0 } else { 0.0 });
+                ys.push(f64::from(j) * 10.0);
+            }
+        }
+        let mesh = Descriptor::new("null")
+            .with("Hrzn", Value::UnitFloats { unit: *b"#Pxl", values: xs })
+            .with("Vrtc", Value::UnitFloats { unit: *b"#Pxl", values: ys });
+        let custom = Descriptor::new("warp")
+            .with("warpStyle", e("warpStyle", "warpCustom"))
+            .with("bounds", Value::Descriptor(bounds))
+            .with("customEnvelopeWarp", Value::Descriptor(Descriptor::new("customEnvelopeWarp").with("meshPoints", Value::ObjectArray(ObjectArray { prefix: 16, body: mesh }))));
+        let w = parse_placed_warp(b"SoLd", &sold(custom)).unwrap();
+        assert_eq!(w.style, WarpStyle::Custom);
+        assert_eq!(w.mesh.as_ref().unwrap().points[15], [67.0, 30.0]);
+        assert!(parse_placed_warp(b"PlLd", &[0; 20]).is_none());
+    }
+
+    #[test]
     fn locks_and_labels() {
         for bits in [0u32, 1, 2, 4, 0x10, 0x8000_0000, 0x8000_0017] {
             assert_eq!(lspf_from_locks(&locks_from_lspf(bits)), bits);
@@ -362,7 +470,7 @@ mod tests {
             Fill::Solid(Color { mode: ColorMode::Cmyk, c: [0.1, 0.2, 0.3, 0.4], alpha: 1.0 }),
             Fill::Solid(Color::gray(0.25)),
             Fill::Gradient { stops: vec![(0.0, Color::rgb(1.0, 0.0, 0.0)), (1.0, Color::rgb(0.0, 0.0, 1.0))], angle: 45.0, scale: 1.0, style: GradientStyle::Reflected, reverse: true },
-            Fill::Pattern { name: "Bubbles".into(), scale: 0.5 },
+            Fill::Pattern { name: "Bubbles".into(), scale: 0.5, id: "abc".into(), angle: 30.0, link: false, phase: (3.0, -2.0) },
         ] {
             let (k, d) = write_fill(&f);
             let back = parse_fill(&k, &d).unwrap();

@@ -78,8 +78,8 @@ fn every_filter_is_tile_independent() {
     let s = pattern(SampleType::U8, R);
     for p in all_filters() {
         let area = output_area(&p, s.content_bounds(), R, None);
-        let a = apply_tiled(&s, &p, area, R, None, 256);
-        let b = apply_tiled(&s, &p, area, R, None, 7);
+        let a = apply_tiled(&s, &p, area, R, None, 256, None);
+        let b = apply_tiled(&s, &p, area, R, None, 7, None);
         let big = area.union(&R);
         assert!(a.to_interleaved(big) == b.to_interleaved(big), "{} differs between tile sizes", p.label());
     }
@@ -332,5 +332,26 @@ fn other_colour_modes_work() {
             let out = run(&s, &p);
             assert_eq!(out.format(), f);
         }
+    }
+}
+
+#[test]
+fn layer_filters_repeat_the_canvas_edge() {
+    // A fully opaque layer covering the canvas stays opaque at the edge (no transparent fade-in)
+    // and doesn't grow past the canvas; without an extent, samples beyond the data are transparent.
+    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+        let canvas = Rect::new(0, 0, 40, 30);
+        let s = flat(depth, canvas, [0.2, 0.6, 0.4, 1.0]);
+        let p = FilterParams::GaussianBlur { radius: 6.0 };
+        let area = output_area(&p, s.content_bounds(), canvas, None);
+        let clamped = apply_in(&s, &p, area, canvas, None, canvas);
+        assert_eq!(clamped.content_bounds(), canvas, "{depth:?}: grew past the canvas");
+        for (x, y) in [(0, 0), (39, 0), (0, 29), (39, 29), (20, 0)] {
+            let px = clamped.pixel(x, y);
+            assert!((px[3] - 1.0).abs() < 1e-3, "{depth:?}: alpha faded at ({x},{y}): {}", px[3]);
+            assert!((px[1] - 0.6).abs() < 2e-3, "{depth:?}: colour changed at ({x},{y})");
+        }
+        let faded = apply(&s, &p, area, canvas, None);
+        assert!(faded.pixel(0, 0)[3] < 0.9, "{depth:?}: unclamped path should read transparency");
     }
 }

@@ -57,6 +57,67 @@ pub struct DocM {
     pub work_path: Option<Path>,
     #[serde(default)]
     pub clipping_path: Option<ClippingPath>,
+    /// The temporary Quick Mask channel (saved while Quick Mask mode is on).
+    #[serde(default)]
+    pub quick_mask: Option<ChannelM>,
+    /// Patterns stored with the document.
+    #[serde(default)]
+    pub patterns: Vec<PatternM>,
+    /// Indexed Color palette.
+    #[serde(default)]
+    pub color_table: Option<photocraft_doc::ColorTable>,
+    /// Duotone inks.
+    #[serde(default)]
+    pub duotone: Option<photocraft_doc::Duotone>,
+    /// Window › Layer Comps.
+    #[serde(default)]
+    pub layer_comps: Vec<LayerCompM>,
+    #[serde(default)]
+    pub last_applied_comp: Option<u32>,
+    #[serde(default)]
+    pub last_document_state: Option<LayerCompM>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayerCompM {
+    pub id: u32,
+    pub name: String,
+    #[serde(default)]
+    pub comment: String,
+    pub apply_visibility: bool,
+    pub apply_position: bool,
+    pub apply_appearance: bool,
+    #[serde(default)]
+    pub states: Vec<CompStateM>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompStateM {
+    /// Layer id (as in `LayerM::id`).
+    pub layer: u64,
+    #[serde(default)]
+    pub visible: Option<bool>,
+    #[serde(default)]
+    pub position: Option<(i32, i32)>,
+    #[serde(default)]
+    pub appearance: Option<CompAppearanceM>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompAppearanceM {
+    pub blend: BlendMode,
+    pub opacity: f32,
+    pub fill_opacity: f32,
+    pub effects: EffectsM,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PatternM {
+    pub id: String,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub surface: SurfaceM,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -125,6 +186,9 @@ pub struct LayerM {
     pub psd_blocks: Vec<(String, Hash)>,
     pub psd_id: Option<u32>,
     pub fill_cache: Option<FillCacheM>,
+    /// Link Layers group (`None` = not linked).
+    #[serde(default)]
+    pub link_group: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,6 +200,9 @@ pub enum ContentM {
     Group {
         children: Vec<LayerM>,
         expanded: bool,
+        /// Artboard (Layer › New › Artboard).
+        #[serde(default)]
+        artboard: Option<photocraft_doc::Artboard>,
     },
     Adjustment {
         adjustment: Adjustment,
@@ -181,7 +248,19 @@ pub enum ContentM {
         smart_filters: Vec<SmartFilter>,
         cache: Option<SurfaceM>,
         psd_raw: Option<Hash>,
+        #[serde(default = "yes")]
+        filters_enabled: bool,
+        #[serde(default)]
+        filter_mask: Option<MaskM>,
+        #[serde(default)]
+        warp: Option<photocraft_geom::warp::Warp>,
+        #[serde(default)]
+        stack_mode: Option<photocraft_doc::StackMode>,
     },
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -196,6 +275,21 @@ pub struct ChannelM {
     pub name: String,
     pub surface: SurfaceM,
     pub spot: Option<(Color, f32)>,
+    /// Channel Options overlay colour (older files: Photoshop's red).
+    #[serde(default = "default_channel_color")]
+    pub color: Color,
+    #[serde(default = "default_channel_opacity")]
+    pub opacity: f32,
+    #[serde(default)]
+    pub indicates: photocraft_doc::ColorIndicates,
+}
+
+fn default_channel_color() -> Color {
+    photocraft_doc::AlphaChannel::DEFAULT_COLOR
+}
+
+fn default_channel_opacity() -> f32 {
+    0.5
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -206,4 +300,23 @@ pub struct MetadataM {
     pub psd_resources: Vec<(u16, String, Hash)>,
     /// (signature hex, key hex, blob)
     pub psd_global_blocks: Vec<(String, String, Hash)>,
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    #[test]
+    fn older_channels_load_with_default_options() {
+        let fmt = serde_json::to_value(PixelFormat::GRAY8).unwrap();
+        let old = serde_json::json!({
+            "name": "Alpha 1",
+            "surface": { "format": fmt, "default": "00", "tiles": [] },
+            "spot": null
+        });
+        let c: ChannelM = serde_json::from_value(old).unwrap();
+        assert_eq!(c.color, photocraft_doc::AlphaChannel::DEFAULT_COLOR);
+        assert_eq!(c.opacity, 0.5);
+        assert_eq!(c.indicates, photocraft_doc::ColorIndicates::MaskedAreas);
+    }
 }

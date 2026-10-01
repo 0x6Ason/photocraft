@@ -33,7 +33,7 @@ pub fn transform_bounds(doc: &Document, layer: &Layer) -> Rect {
 
 /// Warp a surface whose pixels outside the content read as `default` (masks, selections):
 /// warp the content with alpha, then flatten back onto the default value.
-fn warp_gray(s: &Surface, h: &Homography, interp: Interp) -> Surface {
+pub(crate) fn warp_gray(s: &Surface, h: &Homography, interp: Interp) -> Surface {
     let default = s.default_pixel().first().copied().unwrap_or(0.0);
     let fmt = s.format();
     let src = s.content_bounds();
@@ -61,7 +61,7 @@ fn warp_gray(s: &Surface, h: &Homography, interp: Interp) -> Surface {
     out
 }
 
-fn transform_layer(doc_sel: Option<&Surface>, l: &mut Layer, h: &Homography, affine: Option<Affine>, interp: Interp) -> Result<()> {
+pub(crate) fn transform_layer(doc_sel: Option<&Surface>, l: &mut Layer, h: &Homography, affine: Option<Affine>, interp: Interp) -> Result<()> {
     // Photoshop turns the Background into a normal layer before transforming it.
     if l.locks.position && l.name == "Background" {
         l.locks.position = false;
@@ -88,6 +88,22 @@ fn transform_layer(doc_sel: Option<&Surface>, l: &mut Layer, h: &Homography, aff
                 return Err(EngineError::Other("Distort and Perspective need a rasterized shape (Layer › Rasterize › Shape)".into()));
             };
             crate::vector_cmds::transform_shape(sh, &a);
+        }
+        LayerContent::Smart(sm) => {
+            // Smart objects keep the transform and re-render from their source afterwards
+            // (`refresh_text`), so repeated transforms don't degrade the pixels.
+            let Some(a) = affine else {
+                return Err(EngineError::Other("Distort and Perspective on smart objects aren't supported yet".into()));
+            };
+            sm.transform = crate::smart_cmds::snap_affine(a.mul(&sm.transform));
+            // Fallback appearance for sources that can't be re-rendered.
+            if let Some(c) = &mut sm.cache {
+                let src = c.content_bounds();
+                *c = warp_surface(c, src, h, interp);
+            }
+            if let Some(m) = &mut sm.filter_mask {
+                m.surface = warp_gray(&m.surface, h, interp);
+            }
         }
         _ => {
             if let Some(surf) = l.surface_mut() {
@@ -147,17 +163,21 @@ pub fn split_selected(surf: &Surface, sel: &Surface) -> (Surface, Surface) {
     (lifted, rest)
 }
 
-fn refresh_text(doc: &Document, l: &mut Layer) {
+pub(crate) fn refresh_text(doc: &Document, l: &mut Layer) {
     match &mut l.content {
         LayerContent::Text(t) => crate::type_cmds::refresh(doc, t),
         LayerContent::Shape(sh) => crate::vector_cmds::refresh_shape(doc, sh),
+        LayerContent::Smart(_) => {
+            // Unavailable sources keep the warped cache.
+            let _ = crate::smart_cmds::refresh_layer(doc, l);
+        }
         LayerContent::Group(g) => g.children.iter_mut().for_each(|c| refresh_text(doc, c)),
         _ => {}
     }
 }
 
 /// Normal-blend `top` over `dst` (both straight alpha, same format).
-fn composite_over(dst: &mut Surface, top: &Surface) {
+pub(crate) fn composite_over(dst: &mut Surface, top: &Surface) {
     let b = top.content_bounds();
     if b.is_empty() {
         return;

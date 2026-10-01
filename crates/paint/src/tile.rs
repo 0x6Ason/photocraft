@@ -125,7 +125,7 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
         } as u32)
     };
     let s: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
-    if s.len() % 4 != 0 {
+    if !s.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 4 * 3);

@@ -4,11 +4,54 @@ use photocraft_codecs::{ChannelLayout, EncodeOptions, Image, SampleType as CS};
 use photocraft_color::{ColorMode, SampleType};
 use photocraft_doc::{Document, Layer, Size};
 use photocraft_geom::Rect;
+use photocraft_format::Autosaver;
 use photocraft_ui_egui::Services;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
 
 const IMAGE_EXTS: &[&str] = &["psd", "psb", "png", "jpg", "jpeg", "tif", "tiff", "webp", "gif", "bmp", "tga", "ico", "qoi", "exr", "hdr", "pbm", "pgm", "ppm", "pam", "pfm"];
 
+/// Per-user settings directory: `PHOTOCRAFT_CONFIG_DIR`, else the platform convention
+/// (macOS `~/Library/Application Support/Photocraft`, Windows `%APPDATA%\Photocraft`, Linux
+/// `$XDG_CONFIG_HOME/photocraft` or `~/.config/photocraft`).
+pub fn config_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("PHOTOCRAFT_CONFIG_DIR") {
+        return Some(PathBuf::from(d));
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if cfg!(target_os = "macos") {
+        return home.map(|h| h.join("Library/Application Support/Photocraft"));
+    }
+    if cfg!(windows) {
+        return std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Photocraft"));
+    }
+    std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| home.map(|h| h.join(".config"))).map(|c| c.join("photocraft"))
+}
+
+fn prefs_file() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("preferences.json"))
+}
+
+fn recovery_dir() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("Recovery"))
+}
+
+/// Write `bytes` atomically (temp file + rename) so a crash never leaves half a preferences file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
 pub fn native() -> Services {
+    let savers: Rc<RefCell<HashMap<u64, Autosaver>>> = Rc::default();
+    let savers2 = savers.clone();
     Services {
         import: Some(Box::new(|name: &str, bytes: &[u8]| photocraft_io::import(name, bytes).map(|r| r.document).map_err(|e| e.to_string()))),
         export: Some(Box::new(|doc: &Document, path: &str, settings: &photocraft_ui_egui::ExportSettings| {
@@ -44,6 +87,38 @@ pub fn native() -> Services {
         clipboard_get_image: Some(Box::new(|| {
             let img = arboard::Clipboard::new().ok()?.get_image().ok()?;
             Some((img.width as u32, img.height as u32, img.bytes.into_owned()))
+        })),
+        load_prefs: Some(Box::new(|| std::fs::read_to_string(prefs_file()?).ok())),
+        save_prefs: Some(Box::new(|text: &str| write_atomic(&prefs_file().ok_or("no config directory")?, text.as_bytes()))),
+        // Crash recovery: background incremental .pcraft saves into the recovery directory.
+        autosave: Some(Box::new(move |doc: &Arc<Document>, revision: u64, path: Option<&str>| {
+            let dir = recovery_dir().ok_or("no config directory")?;
+            let mut map = savers.borrow_mut();
+            let saver = map.entry(doc.id.0).or_insert_with(|| Autosaver::new(&dir, &format!("doc-{}", doc.id.0)));
+            saver.request(doc.clone(), revision, path.map(str::to_string), Default::default());
+            Ok(())
+        })),
+        discard_autosave: Some(Box::new(move |id: u64| {
+            if let Some(s) = savers2.borrow_mut().remove(&id) {
+                let _ = s.discard();
+            }
+        })),
+        recover: Some(Box::new(|| {
+            let Some(dir) = recovery_dir() else { return Vec::new() };
+            let mut out = Vec::new();
+            for entry in photocraft_format::list_recovery(&dir) {
+                if let Ok(doc) = photocraft_format::recover(&entry) {
+                    out.push((entry.info.original_path.clone(), doc));
+                }
+                // Recovered documents autosave again under their new ids.
+                let _ = photocraft_format::discard_recovery(&dir, &entry);
+            }
+            out
+        })),
+        append_text: Some(Box::new(|path: &str, text: &str| {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| e.to_string())?;
+            f.write_all(text.as_bytes()).map_err(|e| e.to_string())
         })),
     }
 }

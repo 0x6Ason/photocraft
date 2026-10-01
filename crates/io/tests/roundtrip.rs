@@ -104,6 +104,10 @@ fn text_shape_smart_raw_blocks_survive() {
             smart_filters: vec![],
             cache: Some(cache.clone()),
             psd_raw: Some(placed.clone()),
+            filters_enabled: true,
+            filter_mask: None,
+            warp: None,
+            stack_mode: None,
         }),
     );
     smart.psd_blocks = vec![(*b"PlLd", Arc::new(vec![0; 4])), (*b"vmsk", Arc::new(vec![5; 8])), (*b"luni", Arc::new(vec![0; 8]))];
@@ -259,7 +263,7 @@ fn gradient_and_pattern_fills_roundtrip() {
             reverse: true,
         }),
     ));
-    d.layers.push(Layer::new("pat", LayerContent::Fill(Fill::Pattern { name: "Dots".into(), scale: 0.5 })));
+    d.layers.push(Layer::new("pat", LayerContent::Fill(Fill::Pattern { name: "Dots".into(), scale: 0.5, id: String::new(), angle: 0.0, link: true, phase: (0.0, 0.0) })));
     let back = roundtrip(&d);
     assert_docs_eq(&d, &back);
 }

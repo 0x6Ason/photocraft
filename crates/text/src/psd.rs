@@ -140,10 +140,12 @@ pub fn text_layer_from_tysh(data: &[u8], dpi: f32) -> Option<TextLayer> {
         Orientation::Horizontal
     };
     layer.antialias = match enum_value(&t.text, "AntA").as_deref() {
-        Some("Anno") => AntiAlias::None,
+        Some("Anno" | "antiAliasNone") => AntiAlias::None,
         Some("antiAliasSharp" | "AnSh") => AntiAlias::Sharp,
-        Some("AnCr") => AntiAlias::Crisp,
-        Some("AnSt") => AntiAlias::Strong,
+        Some("AnCr" | "antiAliasCrisp") => AntiAlias::Crisp,
+        Some("AnSt" | "antiAliasStrong") => AntiAlias::Strong,
+        Some("antiAliasPlatformGray") => AntiAlias::Windows,
+        Some("antiAliasPlatformLCD") => AntiAlias::WindowsLcd,
         _ => AntiAlias::Smooth,
     };
     if let Some(w) = &t.warp {
@@ -334,6 +336,14 @@ fn char_style(base: Option<&E>, d: &E, fonts: &[String], k: f32) -> CharStyle {
     s.strikethrough = flag("Strikethrough").unwrap_or(false);
     s.ligatures = flag("Ligatures").unwrap_or(true);
     s.discretionary_ligatures = flag("DLigatures").unwrap_or(false);
+    for (key, tag) in OPENTYPE_KEYS {
+        if flag(key) == Some(true) {
+            s.features.push(photocraft_doc::text::FontFeature {
+                tag: tag.to_string(),
+                value: 1,
+            });
+        }
+    }
     s.kerning = if flag("AutoKerning") == Some(false) {
         Kerning::Off
     } else {
@@ -425,6 +435,19 @@ fn postscript_for(s: &CharStyle) -> String {
     format!("{}-{style}", fam.replace(' ', ""))
 }
 
+/// EngineData style keys for the Type › OpenType toggles and the OpenType feature each one turns
+/// on (the standard and discretionary ligature keys map to dedicated [`CharStyle`] fields).
+pub const OPENTYPE_KEYS: [(&str, &str); 8] = [
+    ("ContextualLigatures", "calt"),
+    ("Swash", "swsh"),
+    ("OldStyle", "onum"),
+    ("StylisticAlternates", "salt"),
+    ("Titling", "titl"),
+    ("Ornaments", "ornm"),
+    ("Ordinals", "ordn"),
+    ("Fractions", "frac"),
+];
+
 fn style_sheet_data(s: &CharStyle, font: usize, k: f32) -> E {
     let c = &s.color;
     let values = match c.mode {
@@ -446,7 +469,12 @@ fn style_sheet_data(s: &CharStyle, font: usize, k: f32) -> E {
         ColorMode::Grayscale => 0,
         _ => 1,
     };
-    E::Dict(vec![
+    let mut opentype: Vec<(String, E)> = OPENTYPE_KEYS
+        .iter()
+        .filter(|(_, tag)| s.features.iter().any(|f| f.tag == *tag && f.value > 0))
+        .map(|(key, _)| (key.to_string(), E::Bool(true)))
+        .collect();
+    let mut dict = vec![
         ("Font".into(), E::Int(font as i64)),
         ("FontSize".into(), real(s.size_pt / k)),
         ("FauxBold".into(), E::Bool(s.faux_bold)),
@@ -478,7 +506,9 @@ fn style_sheet_data(s: &CharStyle, font: usize, k: f32) -> E {
                 ("Values".into(), E::Array(values)),
             ]),
         ),
-    ])
+    ];
+    dict.append(&mut opentype);
+    E::Dict(dict)
 }
 
 fn paragraph_properties(p: &ParagraphStyle, k: f32) -> E {
@@ -615,6 +645,8 @@ pub fn build_engine_data(layer: &TextLayer, template: Option<E>, dpi: f32) -> E 
             AntiAlias::Crisp => 2,
             AntiAlias::Strong => 3,
             AntiAlias::Smooth => 4,
+            // EngineData has no platform modes; the `AntA` descriptor carries the exact value.
+            AntiAlias::Windows | AntiAlias::WindowsLcd => 1,
         }),
     );
     if dict.get("UseFractionalGlyphWidths").is_none() {
@@ -767,6 +799,8 @@ pub fn build_tysh(layer: &TextLayer, dpi: f32, ink: Option<[f32; 4]>) -> Vec<u8>
                 AntiAlias::Crisp => "AnCr",
                 AntiAlias::Strong => "AnSt",
                 AntiAlias::Smooth => "AnSm",
+                AntiAlias::Windows => "antiAliasPlatformGray",
+                AntiAlias::WindowsLcd => "antiAliasPlatformLCD",
             },
         ),
     );

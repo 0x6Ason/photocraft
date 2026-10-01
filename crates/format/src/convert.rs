@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use photocraft_color::{PixelFormat, SampleType};
 use photocraft_doc::{
-    AlphaChannel, DocId, Document, Effects, FillCache, Group, Layer, LayerContent, LayerId,
-    LayerMask, Metadata, NamedPath, ShapeLayer, SmartObject, SmartSource, TextLayer,
+    AlphaChannel, CompAppearance, CompLayerState, DocId, Document, Effects, LayerComp, FillCache, Group, Layer, LayerContent, LayerId,
+    LayerMask, Metadata, NamedPath, Pattern, ShapeLayer, SmartObject, SmartSource, TextLayer,
 };
 use photocraft_geom::{TILE_SIZE, TileCoord};
 use photocraft_raster::{Surface, Tile, decode_pixel, encode_pixel};
@@ -112,6 +112,7 @@ fn layer_m(l: &Layer, sink: &mut dyn Sink) -> LayerM {
         LayerContent::Group(g) => ContentM::Group {
             children: g.children.iter().map(|c| layer_m(c, sink)).collect(),
             expanded: g.expanded,
+            artboard: g.artboard.clone(),
         },
         LayerContent::Adjustment(a) => ContentM::Adjustment {
             adjustment: a.clone(),
@@ -152,6 +153,16 @@ fn layer_m(l: &Layer, sink: &mut dyn Sink) -> LayerM {
             smart_filters: s.smart_filters.clone(),
             cache: s.cache.as_ref().map(|c| surface_m(c, sink)),
             psd_raw: opt_blob(&s.psd_raw, sink),
+            filters_enabled: s.filters_enabled,
+            filter_mask: s.filter_mask.as_ref().map(|m| MaskM {
+                surface: surface_m(&m.surface, sink),
+                enabled: m.enabled,
+                linked: m.linked,
+                density: m.density,
+                feather: m.feather,
+            }),
+            warp: s.warp.clone(),
+            stack_mode: s.stack_mode,
         },
     };
     LayerM {
@@ -188,6 +199,20 @@ fn layer_m(l: &Layer, sink: &mut dyn Sink) -> LayerM {
             fill: fc.fill.clone(),
             surface: surface_m(&fc.surface, sink),
         }),
+        link_group: l.link_group,
+    }
+}
+
+fn channel_m(c: &AlphaChannel, sink: &mut dyn Sink) -> ChannelM {
+    // Destructured so a new `AlphaChannel` field fails to compile here until it is saved.
+    let AlphaChannel { name, surface, spot, color, opacity, indicates } = c;
+    ChannelM {
+        name: name.clone(),
+        surface: surface_m(surface, sink),
+        spot: *spot,
+        color: *color,
+        opacity: *opacity,
+        indicates: *indicates,
     }
 }
 
@@ -201,15 +226,7 @@ pub(crate) fn doc_m(d: &Document, sink: &mut dyn Sink) -> DocM {
         depth: d.depth,
         icc_profile: opt_blob(&d.icc_profile, sink),
         layers: d.layers.iter().map(|l| layer_m(l, sink)).collect(),
-        channels: d
-            .channels
-            .iter()
-            .map(|c| ChannelM {
-                name: c.name.clone(),
-                surface: surface_m(&c.surface, sink),
-                spot: c.spot,
-            })
-            .collect(),
+        channels: d.channels.iter().map(|c| channel_m(c, sink)).collect(),
         guides: d.guides.clone(),
         selection: d.selection.as_ref().map(|s| surface_m(s, sink)),
         metadata: MetadataM {
@@ -240,6 +257,55 @@ pub(crate) fn doc_m(d: &Document, sink: &mut dyn Sink) -> DocM {
             .collect(),
         work_path: d.work_path.clone(),
         clipping_path: d.clipping_path.clone(),
+        quick_mask: d.quick_mask.as_ref().map(|c| channel_m(c, sink)),
+        patterns: d
+            .patterns
+            .iter()
+            .map(|p| PatternM {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                width: p.width,
+                height: p.height,
+                surface: surface_m(&p.surface, sink),
+            })
+            .collect(),
+        color_table: d.color_table.clone(),
+        duotone: d.duotone.clone(),
+        layer_comps: d.layer_comps.iter().map(|c| comp_m(c, sink)).collect(),
+        last_applied_comp: d.last_applied_comp,
+        last_document_state: d.last_document_state.as_ref().map(|c| comp_m(c, sink)),
+    }
+}
+
+fn effects_m(e: &Effects, sink: &mut dyn Sink) -> EffectsM {
+    EffectsM { enabled: e.enabled, items: e.items.clone(), psd_raw: opt_blob(&e.psd_raw, sink) }
+}
+
+fn comp_m(c: &LayerComp, sink: &mut dyn Sink) -> LayerCompM {
+    // Destructured so a new `LayerComp` field fails to compile here until it is saved.
+    let LayerComp { id, name, comment, apply_visibility, apply_position, apply_appearance, states } = c;
+    LayerCompM {
+        id: *id,
+        name: name.clone(),
+        comment: comment.clone(),
+        apply_visibility: *apply_visibility,
+        apply_position: *apply_position,
+        apply_appearance: *apply_appearance,
+        states: states
+            .iter()
+            .map(|s| {
+                let CompLayerState { layer, visible, position, appearance } = s;
+                CompStateM {
+                    layer: layer.0,
+                    visible: *visible,
+                    position: *position,
+                    appearance: appearance.as_ref().map(|a| {
+                        let CompAppearance { blend, opacity, fill_opacity, effects } = a;
+                        CompAppearanceM { blend: *blend, opacity: *opacity, fill_opacity: *fill_opacity, effects: effects_m(effects, sink) }
+                    }),
+                }
+            })
+            .collect(),
     }
 }
 
@@ -251,6 +317,8 @@ pub(crate) struct Loader<'a> {
     pub fetch: &'a mut dyn Fetch,
     pub preserve_ids: bool,
     pub max_id: u64,
+    /// Stored layer id → loaded id (differs when ids are remapped), for layer comp states.
+    pub id_map: std::collections::HashMap<u64, LayerId>,
 }
 
 impl Loader<'_> {
@@ -289,12 +357,42 @@ impl Loader<'_> {
     }
 
     fn id(&mut self, raw: u64) -> LayerId {
-        if self.preserve_ids {
+        let id = if self.preserve_ids {
             self.max_id = self.max_id.max(raw);
             LayerId(raw)
         } else {
             LayerId::fresh()
+        };
+        self.id_map.insert(raw, id);
+        id
+    }
+
+    fn comp(&mut self, m: &LayerCompM) -> Result<LayerComp> {
+        let mut states = Vec::with_capacity(m.states.len());
+        for s in &m.states {
+            let appearance = match &s.appearance {
+                Some(a) => Some(CompAppearance {
+                    blend: a.blend,
+                    opacity: a.opacity,
+                    fill_opacity: a.fill_opacity,
+                    effects: Effects { enabled: a.effects.enabled, items: a.effects.items.clone(), psd_raw: self.opt_blob(&a.effects.psd_raw)? },
+                }),
+                None => None,
+            };
+            // States of layers deleted before the save keep their (now dangling) id, which
+            // `layerComp.updateWarnings` reports; it must not collide with a live layer.
+            let layer = self.id_map.get(&s.layer).copied().unwrap_or(LayerId(u64::MAX - s.layer.min(u64::MAX / 2)));
+            states.push(CompLayerState { layer, visible: s.visible, position: s.position, appearance });
         }
+        Ok(LayerComp {
+            id: m.id,
+            name: m.name.clone(),
+            comment: m.comment.clone(),
+            apply_visibility: m.apply_visibility,
+            apply_position: m.apply_position,
+            apply_appearance: m.apply_appearance,
+            states,
+        })
     }
 
     fn layer(&mut self, m: &LayerM, depth: usize) -> Result<Layer> {
@@ -305,7 +403,8 @@ impl Loader<'_> {
         }
         let content = match &m.content {
             ContentM::Raster { surface } => LayerContent::Raster(self.surface(surface)?),
-            ContentM::Group { children, expanded } => LayerContent::Group(Group {
+            ContentM::Group { children, expanded, artboard } => LayerContent::Group(Group {
+                artboard: artboard.clone(),
                 children: children
                     .iter()
                     .map(|c| self.layer(c, depth + 1))
@@ -364,6 +463,10 @@ impl Loader<'_> {
                 smart_filters,
                 cache,
                 psd_raw,
+                filters_enabled,
+                filter_mask,
+                warp,
+                stack_mode,
             } => LayerContent::Smart(SmartObject {
                 source: match source {
                     SmartSourceM::Embedded { file_name, blob } => SmartSource::Embedded {
@@ -376,6 +479,19 @@ impl Loader<'_> {
                 smart_filters: smart_filters.clone(),
                 cache: self.opt_surface(cache)?,
                 psd_raw: self.opt_blob(psd_raw)?,
+                filters_enabled: *filters_enabled,
+                filter_mask: match filter_mask {
+                    Some(mm) => Some(LayerMask {
+                        surface: self.surface(&mm.surface)?,
+                        enabled: mm.enabled,
+                        linked: mm.linked,
+                        density: mm.density,
+                        feather: mm.feather,
+                    }),
+                    None => None,
+                },
+                warp: warp.clone().filter(|w| w.mesh.as_ref().is_none_or(|m| m.is_valid())),
+                stack_mode: *stack_mode,
             }),
         };
         let mask = match &m.mask {
@@ -420,6 +536,7 @@ impl Loader<'_> {
             psd_blocks,
             psd_id: m.psd_id,
             fill_cache,
+            link_group: m.link_group,
         })
     }
 
@@ -431,12 +548,9 @@ impl Loader<'_> {
             .collect::<Result<Vec<_>>>()?;
         let mut channels = Vec::with_capacity(m.channels.len());
         for c in &m.channels {
-            channels.push(AlphaChannel {
-                name: c.name.clone(),
-                surface: self.surface(&c.surface)?,
-                spot: c.spot,
-            });
+            channels.push(self.channel(c)?);
         }
+        let quick_mask = m.quick_mask.as_ref().map(|c| self.channel(c)).transpose()?;
         let mut md = Metadata {
             xmp: m.metadata.xmp.clone(),
             exif: self.opt_blob(&m.metadata.exif)?,
@@ -458,6 +572,18 @@ impl Loader<'_> {
                 psd_raw: self.opt_blob(&p.psd_raw)?,
             });
         }
+        let mut patterns = Vec::with_capacity(m.patterns.len());
+        for p in &m.patterns {
+            patterns.push(Pattern {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                width: p.width,
+                height: p.height,
+                surface: self.surface(&p.surface)?,
+            });
+        }
+        let layer_comps = m.layer_comps.iter().map(|c| self.comp(c)).collect::<Result<Vec<_>>>()?;
+        let last_document_state = m.last_document_state.as_ref().map(|c| self.comp(c)).transpose()?;
         let id = if self.preserve_ids {
             self.max_id = self.max_id.max(m.id);
             DocId(m.id)
@@ -481,6 +607,24 @@ impl Loader<'_> {
             paths,
             work_path: m.work_path.clone(),
             clipping_path: m.clipping_path.clone(),
+            quick_mask,
+            patterns,
+            color_table: m.color_table.clone(),
+            duotone: m.duotone.clone(),
+            layer_comps,
+            last_applied_comp: m.last_applied_comp,
+            last_document_state,
+        })
+    }
+
+    fn channel(&mut self, c: &ChannelM) -> Result<AlphaChannel> {
+        Ok(AlphaChannel {
+            name: c.name.clone(),
+            surface: self.surface(&c.surface)?,
+            spot: c.spot,
+            color: c.color,
+            opacity: c.opacity,
+            indicates: c.indicates,
         })
     }
 }

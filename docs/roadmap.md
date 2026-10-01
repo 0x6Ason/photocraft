@@ -2,19 +2,41 @@
 
 Status legend: ✅ done · 🟡 in progress · ⬜ not started. Updated 2026-09-30.
 
-| M | Status | Notes |
+**Parity metric:** `cargo xtask parity` measures how much of Photoshop's menu tree is live and
+writes [`parity.md`](parity.md). It is the headline number for "how close are we", next to the PSD
+composite oracle and the test count.
+
+| M | Status | Where we are |
 |---|---|---|
-| M0 Skeleton | ✅ | workspace, xtask (layers/wasm/ci/stats/corpus), CI workflow |
-| M1 Foundation | ✅ | geom, color (27 blend modes), raster (COW tiles, any depth), doc, ops |
+| M0 Skeleton | ✅ | workspace, xtask (layers / wasm / ci / stats / corpus / parity), CI workflow |
+| M1 Foundation | ✅ | geom, color (27 blend modes), raster (COW tiles, any depth), doc, ops, cms (ICC) |
 | M2 PSD v1 | ✅ | photocraft-psd: 134/135 real files byte-exact round trip |
-| M3 Viewer app | 🟡 | egui shell with Pro/Studio/Classic themes, codecs (13 formats), io, native app; web build pending |
-| M4 Native format + engine | 🟡 | engine + command registry done; `.pcraft` bundle and CLI pending |
-| M5 GPU compositor | 🟡 | GPU canvas presentation (WGSL) done; GPU compositing pending |
-| M6 Paint + select | 🟡 | brush v1, eraser, marquee, move done; tablet input, lasso/wand, transform pending |
-| M7 Adjust + filters | 🟡 | 14 adjustment layers; filters pending |
-| M8 PSD v2 | 🟡 | adjustments, fills, raw-preserved text/smart/shape; composite oracle 82/135 |
-| M9 Text, vector, styles | 🟡 | layer effects in progress |
-| M10–M12 | ⬜ | smart features, automation/MCP, pro parity |
+| M3 Viewer app | ✅ | egui shell (Pro / Studio / Classic themes), 13+ codecs, native and web (trunk) builds |
+| M4 Native format + engine | ✅ | 500+ commands, `.pcraft` (incremental, autosave, crash recovery), CLI, persistent preferences |
+| M5 GPU compositor | 🟡 | wgpu compositor drives the canvas; layer effects, pattern fills and a few clip cases fall back to the CPU |
+| M6 Paint + select | 🟡 | brush engine, all selection tools, multi-layer selection, snapping + smart guides, free transform + warp; native tablet backends pending |
+| M7 Adjust + filters | 🟡 | 16 adjustment layers + destructive-only adjustments, 70+ filters incl. Blur Gallery, Actions record/replay, Fade |
+| M8 PSD v2 | 🟡 | adjustments (incl. Selective Color, Color Lookup), fills, effects, patterns, text, shapes, smart objects, alpha channels; oracle 102/170 |
+| M9 Text, vector, styles | 🟡 | type engine + Warp Text, shapes / pen / paths, all 10 effects on CPU; GPU effects pending |
+| M10 Smart features | 🟡 | classical Select Subject / Object, content-aware fill and scale, healing, auto-align / auto-blend; ML backend not started |
+| M11 Automation + formats | 🟡 | MCP (headless + live bridge), batch, Image Processor, prefs over MCP; DoD test passes (10 agent tasks over MCP, `automation/tests/agent_tasks.rs`); JP2 / DICOM / DPX / C2PA pending |
+| M12 Pro parity | 🟡 | CMYK / Lab / Indexed / Bitmap / Duotone, ICC + soft proofing, channels + Quick Mask, smart-object stack modes; print, HDR, photomerge, timeline, artboards, layer comps pending |
+
+**Menu parity: 518 / 625 (82.9%)** on 2026-10-01, up from 224 (35.8%) the day before. See [`parity.md`](parity.md).
+
+## Current focus (infrastructure before the long tail)
+
+Landed on 2026-10-01: multi-layer selection, live smart objects + smart filters, alpha channels +
+Quick Mask, patterns, Warp, preferences, snapping, ~33 filters, the remaining core adjustments.
+
+Next:
+1. **Fidelity**: the PSD oracle (102/170). Linked-pattern phase origin, layer effects (bevel,
+   satin, multi-stroke), grayscale adjustments; PSD link groups; Photoshop smart filters in `SoLd`.
+2. **Layer Comps and Artboards** (File/Layer/View items and export depend on them).
+3. **GPU layer effects** (the last big CPU fallback on the canvas).
+4. **Puppet Warp, Perspective Warp, Liquify, Vanishing Point, Camera Raw / Lens Correction**.
+5. **Panels**: Patterns, Styles, Glyphs, Character/Paragraph Styles, Timeline; Custom Shape tool.
+6. Print, Photomerge, Merge to HDR, video layers.
 
 ## Milestone definitions
 
@@ -36,4 +58,3 @@ Each milestone has a **definition of done (DoD)** and must leave `main` green on
 | **M11** | Automation + formats | MCP server, batch, scripting, remaining formats (JP2, DICOM, DPX…), C2PA | An agent completes 10 scripted edit tasks via MCP |
 | **M12** | Pro parity | CMYK/Lab UI, print, HDR display, photomerge/HDR merge, timeline, layer comps, artboards, symmetry, neural filters | `xtask parity` ≥ 90% of Photoshop menu checklist |
 
-**Today's target: M0 + M1 + M2 + an M3 vertical slice.**

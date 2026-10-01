@@ -110,6 +110,9 @@ pub fn remap_document(doc: &mut Document, map: &dyn Fn(i32, i32) -> (i32, i32)) 
         }
     }
     rec(&mut doc.layers, map);
+    for ch in doc.channels.iter_mut().chain(doc.quick_mask.as_mut()) {
+        ch.surface = remap_surface(&ch.surface, map);
+    }
     if let Some(sel) = &doc.selection {
         doc.selection = Some(remap_surface(sel, map));
     }

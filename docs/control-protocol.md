@@ -17,10 +17,10 @@ The transport is `apps/photocraft/src/control_server.rs`, and the handlers are i
 
 ## Methods
 
-- `engine.execute {command, params}`: run any engine or UI command by id
+- `engine.execute {command, params}`: run any engine or UI command by id. Engine commands run directly with their default params and never open a dialog. Use `ui.menu.invoke` for menu-click behaviour, which opens a command's dialog when no params are given
 - `engine.commands`: list commands with enablement
-- `ui.inspect`: full UI state (tool, panels, views, dialogs, windows, menu tree, window size)
-- `ui.set {tool?, panels?, dockTabs?, maskTarget?, zoom?, center?, dark?}`: change UI state
+- `ui.inspect`: full UI state (tool, panels, views, dialogs, windows, menu tree, window size). `view` holds the View/Window/Type preferences: `screen_mode`, `extras`, `show` and `snap_to` flags, `flip_horizontal`, `arrange` (Window › Arrange layout), pixel aspect, font preview size, language options
+- `ui.set {tool?, panels?, dockTabs?, maskTarget?, zoom?, center?, fit?, theme?, brushSize?, brushSection?, brushTab?}`: change UI state (`brushSection` indexes the Brush Settings sections, `brushTab` 0 = Brush Settings, 1 = Brushes)
 - `ui.menu.invoke {id}` / `ui.menu.list`: activate a menu item by id; list the menu tree
 - `ui.dialog.open {kind, fields?}` / `ui.dialog.set {dialog, field, value}` / `ui.dialog.confirm {dialog}` / `ui.dialog.cancel {dialog}`
 - `ui.window.open {document?}` / `ui.window.close {window}`: extra document windows
@@ -42,6 +42,8 @@ The transport is `apps/photocraft/src/control_server.rs`, and the handlers are i
 |---|---|
 | `file.new` | `{"width":1920,"height":1080,"mode":"rgb","depth":8,"background":"white"}` |
 | `layer.new.layer` | `{"name":"Ink"}` |
+| `layer.select` | `{"layer":id,"mode":"replace\|toggle\|range\|add"}`: ⌘-click = toggle, ⇧-click = range; `document.inspect` reports `selectedLayers` and a per-layer `selected` flag |
+| `channel.target` / `channel.setVisible` | Channels panel target and eyes (`"composite"`, colour name, alpha index or name, `"quickMask"`). `document.inspect` (and `channel.list`) report `channels`: composite/colour/alpha rows with visibility, channel options, `quickMask`, `target`. Pixel commands without a `target` param follow the targeted channel |
 | `layer.setProps` | `{"layer":id?,"name":…,"visible":…,"opacity":0..1,"blend":"Multiply"}` |
 | `layer.newAdjustmentLayer.hueSaturation` | `{"hue":30,"saturation":10}` |
 | `paint.stroke` | `{"points":[[x,y,pressure],…],"size":20,"color":"#ff0000"}` |
@@ -50,6 +52,48 @@ The transport is `apps/photocraft/src/control_server.rs`, and the handlers are i
 | `document.pixel` | `{"x":10,"y":10}`: composite RGBA |
 
 UI-level commands (`file.open`, `file.save`, `view.zoomIn`, `window.theme.pro`, `edit.search`, …) are also accepted by `engine.execute` and `ui.menu.invoke`.
+
+## Preferences
+
+Preferences (Edit › Preferences, grouped like Photoshop's dialog sections) live in the engine, so
+the same commands work in the app, the CLI and headless MCP. Paths are dotted camelCase keys:
+`<section>.<key>`, with sections `general`, `interface`, `workspace`, `tools`, `historyLog`,
+`fileHandling`, `export`, `performance`, `scratchDisks`, `cursors`, `transparencyAndGamut`,
+`unitsAndRulers`, `guidesGridAndSlices`, `plugIns`, `type`, `enhancedControls`, `rawDefaults`,
+`integrations`, plus `shortcuts.<command id>`, `menus` (`hidden`, `colors.<id>`), `toolbar`
+(`hidden`, `order`) and `colorSettings` (Edit › Color Settings).
+
+| Command | Params |
+|---|---|
+| `prefs.get` | `{"path":"performance.historyStates"}`; no path returns everything |
+| `prefs.set` | `{"path":"cursors.painting","value":"precise"}` or `{"values":{"unitsAndRulers.rulers":"cm","guidesGridAndSlices.gridColor":"#ff8800"}}`. Values are validated (choices, ranges, `#rrggbb` colours, shortcut syntax); a batch applies all or nothing. A section path takes an object and merges it key by key |
+| `prefs.reset` | `{"path":"performance"}` (a section or key); no path resets everything |
+| `edit.preferences.<section>` | the section's values; in the app (no params) it opens the Preferences dialog on that section |
+| `edit.keyboardShortcuts` | `{"set":{"edit.fill":"Cmd+Shift+F"},"reset":true\|["id",…],"removeConflicts":true,"filter":"blur","list":false}`: returns overrides, matching commands and conflicts. A shortcut moved to another command is removed from its old owner unless `removeConflicts` is false. `""` removes a shortcut, `null` restores the default. In the app it opens Keyboard Shortcuts and Menus |
+| `edit.menus` / `edit.toolbar` | `{"hide":["edit.fade"],"show":[…],"color":{"edit.fill":"red"},"reset":false}` / `{"hidden":["Sponge"],"order":[…]}` |
+| `edit.colorSettings` | `{"workingRgb":"display-p3","workingCmyk":"coated-cmyk","workingGray":"sgray","policyRgb":"preserve\|convert\|off",…,"askOnMismatch":true,"intent":"perceptual","bpc":true}`; honoured when opening files (`file.openAs`, the app's File › Open) and by Image › Mode and "working" profile specs. `color.profileMismatch {"action":"preserve\|convert\|discard\|assignWorking"}` answers the mismatch prompt |
+
+Values the app honours live: history states (every open document), effect-cache budget, interface
+theme, canvas colour and border, checkerboard size and colours (CPU and GPU canvas), gamut warning
+colour and opacity, guide/grid/smart-guide colours and styles, grid spacing and subdivisions, ruler
+units (rulers, Info panel, Image Size default unit), image interpolation (Image Size default),
+painting and other cursors, zoom with scroll wheel, Use Shift Key for Tool Switch, keyboard
+shortcuts, hidden and coloured menu items, autosave interval and crash recovery, and the history
+log text file. GPU on/off and the GPU tile size apply at the next launch.
+
+The desktop app stores them in `preferences.json` in the platform config directory (macOS
+`~/Library/Application Support/Photocraft`, Windows `%APPDATA%\Photocraft`, Linux
+`$XDG_CONFIG_HOME/photocraft`; override with `PHOTOCRAFT_CONFIG_DIR`); autosaves go to its
+`Recovery` folder. The web build keeps them in `localStorage`.
+
+## Snapping
+
+With View › Snap on, tool gestures snap to the View › Snap To targets (guides and grid while they
+are shown, layer edges and centres, document bounds and centre, selection edges) within 8 screen
+pixels: Move tool drags (the moved layers' bounds), marquee, crop, shape, type-box and pen points,
+Free Transform handles and drags inside the box, and guides. Holding Ctrl disables snapping for
+the drag. With View › Show › Smart Guides on, the Move tool also snaps to other layers and draws
+magenta alignment lines. `ui.pointer` drives the same code, so agents get identical results.
 
 ## MCP bridge
 

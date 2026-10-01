@@ -1,0 +1,154 @@
+//! Pattern paint: Pattern Overlay, pattern strokes and pattern fill layers.
+//!
+//! A pattern tiles the plane from an origin (the layer's frame when linked, else the canvas
+//! origin, plus the phase), scaled and rotated about that origin. Samples are bilinear with
+//! wrap-around on premultiplied colour, so integer placements at 100 % reproduce the tile
+//! exactly and scaled ones stay seamless.
+
+use photocraft_doc::{Pattern, Rect};
+
+/// A pattern converted once to straight-alpha RGBA for sampling.
+pub struct Tile {
+    w: usize,
+    h: usize,
+    /// Premultiplied RGBA.
+    px: Vec<[f32; 4]>,
+}
+
+impl Tile {
+    pub fn new(p: &Pattern) -> Option<Tile> {
+        if p.is_empty() {
+            return None;
+        }
+        let (w, h) = (p.width as usize, p.height as usize);
+        let mut px = vec![[0.0f32; 4]; w * h];
+        p.surface.read_rgba_into(p.rect(), &mut px);
+        for q in &mut px {
+            for c in 0..3 {
+                q[c] *= q[3];
+            }
+        }
+        Some(Tile { w, h, px })
+    }
+
+    #[inline]
+    fn at(&self, x: i64, y: i64) -> [f32; 4] {
+        let xi = x.rem_euclid(self.w as i64) as usize;
+        let yi = y.rem_euclid(self.h as i64) as usize;
+        self.px[yi * self.w + xi]
+    }
+
+    /// Bilinear, wrapping sample at continuous tile coordinates (pixel centres at `i + 0.5`).
+    /// Returns straight alpha.
+    pub fn sample(&self, u: f64, v: f64) -> [f32; 4] {
+        let (u, v) = (u - 0.5, v - 0.5);
+        let (x0, y0) = (u.floor(), v.floor());
+        let (fx, fy) = ((u - x0) as f32, (v - y0) as f32);
+        let (x0, y0) = (x0 as i64, y0 as i64);
+        let mut acc = [0.0f32; 4];
+        for (dy, wy) in [(0, 1.0 - fy), (1, fy)] {
+            if wy == 0.0 {
+                continue;
+            }
+            for (dx, wx) in [(0, 1.0 - fx), (1, fx)] {
+                if wx == 0.0 {
+                    continue;
+                }
+                let p = self.at(x0 + dx, y0 + dy);
+                let k = wx * wy;
+                for c in 0..4 {
+                    acc[c] += p[c] * k;
+                }
+            }
+        }
+        if acc[3] <= 0.0 {
+            return [0.0; 4];
+        }
+        [acc[0] / acc[3], acc[1] / acc[3], acc[2] / acc[3], acc[3].min(1.0)]
+    }
+}
+
+/// Where a pattern sits: document point → tile coordinates.
+#[derive(Clone, Copy, Debug)]
+pub struct Placement {
+    origin: (f64, f64),
+    /// Inverse rotation (cos, sin) and inverse scale.
+    cs: (f64, f64),
+    inv_scale: f64,
+}
+
+impl Placement {
+    /// `frame`: the layer's frame (used when `link`); `phase` in pixels; `scale` as a fraction;
+    /// `angle` in degrees counter-clockwise.
+    pub fn new(frame: Rect, link: bool, phase: (f32, f32), scale: f32, angle: f32) -> Placement {
+        let base = if link && !frame.is_empty() { (f64::from(frame.x0), f64::from(frame.y0)) } else { (0.0, 0.0) };
+        let origin = (base.0 + f64::from(phase.0), base.1 + f64::from(phase.1));
+        let s = f64::from(scale);
+        let inv_scale = if s.is_finite() && s > 1e-3 { 1.0 / s } else { 1.0 };
+        let a = f64::from(angle).to_radians();
+        Placement { origin, cs: (a.cos(), a.sin()), inv_scale }
+    }
+
+    /// Tile coordinates of the document point `(x, y)`.
+    #[inline]
+    pub fn map(&self, x: f64, y: f64) -> (f64, f64) {
+        let (dx, dy) = (x - self.origin.0, y - self.origin.1);
+        // Undo a counter-clockwise rotation (y points down on screen).
+        let (c, s) = self.cs;
+        let (rx, ry) = (dx * c - dy * s, dx * s + dy * c);
+        (rx * self.inv_scale, ry * self.inv_scale)
+    }
+}
+
+/// Renders `tile` over `rect` (row-major straight RGBA).
+pub fn render(tile: &Tile, place: &Placement, rect: Rect) -> Vec<[f32; 4]> {
+    let mut out = Vec::with_capacity(rect.width() as usize * rect.height() as usize);
+    for y in rect.y0..rect.y1 {
+        for x in rect.x0..rect.x1 {
+            let (u, v) = place.map(f64::from(x) + 0.5, f64::from(y) + 0.5);
+            out.push(tile.sample(u, v));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use photocraft_doc::{PixelFormat, Surface};
+
+    fn checker() -> Pattern {
+        let mut s = Surface::new(PixelFormat::RGBA8);
+        s.fill_rect(Rect::new(0, 0, 4, 4), &[1.0, 0.0, 0.0, 1.0]);
+        s.fill_rect(Rect::new(0, 0, 2, 2), &[0.0, 0.0, 1.0, 1.0]);
+        s.fill_rect(Rect::new(2, 2, 4, 4), &[0.0, 0.0, 1.0, 1.0]);
+        Pattern::new("checker", s, 4, 4)
+    }
+
+    #[test]
+    fn identity_placement_tiles_exactly() {
+        let t = Tile::new(&checker()).unwrap();
+        let p = Placement::new(Rect::new(0, 0, 10, 10), false, (0.0, 0.0), 1.0, 0.0);
+        let px = render(&t, &p, Rect::new(-4, 0, 8, 1));
+        assert_eq!(px[0], [0.0, 0.0, 1.0, 1.0]); // x = -4 wraps to 0
+        assert_eq!(px[6], [1.0, 0.0, 0.0, 1.0]); // x = 2
+        assert_eq!(px[8], [0.0, 0.0, 1.0, 1.0]); // x = 4
+    }
+
+    #[test]
+    fn link_phase_scale_and_angle_move_the_origin() {
+        let t = Tile::new(&checker()).unwrap();
+        let linked = Placement::new(Rect::new(2, 0, 10, 10), true, (0.0, 0.0), 1.0, 0.0);
+        assert_eq!(render(&t, &linked, Rect::new(2, 0, 3, 1))[0], [0.0, 0.0, 1.0, 1.0]);
+        let phased = Placement::new(Rect::EMPTY, false, (2.0, 0.0), 1.0, 0.0);
+        assert_eq!(render(&t, &phased, Rect::new(2, 0, 3, 1))[0], [0.0, 0.0, 1.0, 1.0]);
+        let scaled = Placement::new(Rect::EMPTY, false, (0.0, 0.0), 2.0, 0.0);
+        let row = render(&t, &scaled, Rect::new(0, 1, 8, 2));
+        assert_eq!(row[2], [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(row[6], [1.0, 0.0, 0.0, 1.0]);
+        // 90°: x and y swap roles.
+        let rot = Placement::new(Rect::EMPTY, false, (0.0, 0.0), 1.0, 90.0);
+        let (u, v) = rot.map(1.0, 3.0);
+        assert!((u - -3.0).abs() < 1e-9 && (v - 1.0).abs() < 1e-9, "{u},{v}");
+    }
+}

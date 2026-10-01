@@ -194,11 +194,7 @@ pub fn gen_doc(mode: ColorMode, depth: SampleType, f: Features) -> Document {
         d.metadata.psd_resources.push((4000, String::new(), Arc::new(vec![9, 9, 9])));
         d.guides.horizontal.push(5.5);
         d.guides.vertical.push(12.0);
-        d.channels.push(AlphaChannel {
-            name: "Selection".into(),
-            surface: mask_surface(depth, d.bounds(), 0.0, 3),
-            spot: None,
-        });
+        d.channels.push(AlphaChannel::new("Selection", mask_surface(depth, d.bounds(), 0.0, 3)));
     }
     d
 }

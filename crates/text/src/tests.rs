@@ -748,3 +748,106 @@ fn variable_font_axes() {
     let heavy = ink(&mut e, 800.0);
     assert!(heavy > light * 1.5, "{light} → {heavy}");
 }
+
+#[test]
+fn warp_bends_rendered_text_and_outlines() {
+    use photocraft_doc::text::TextWarp;
+    let mut e = TextEngine::new();
+    let mut t = point("WARPED TEXT", 24.0);
+    t.transform = Affine::translate(20.0, 60.0);
+    let fmt = PixelFormat::RGBA8;
+    let (_, flat) = e.render(&t, 72.0, fmt);
+    t.warp = Some(TextWarp {
+        style: "warpArc".into(),
+        value: 60.0,
+        horizontal: true,
+        ..Default::default()
+    });
+    let (layout, arced) = e.render(&t, 72.0, fmt);
+    // An arc pushes the ends down: the warped ink is taller and pixels differ.
+    assert!(
+        arced.rect.height() > flat.rect.height() + 10,
+        "{:?} vs {:?}",
+        arced.rect,
+        flat.rect
+    );
+    assert!(alpha_sum(&arced.surface, arced.rect) > 0.0);
+    // Outlines follow the same warp: the first glyph's outline sits lower than the middle one's.
+    let warp = crate::render::layout_warp(&layout, t.warp.as_ref());
+    let outs = crate::render::outlines(&layout, &t.transform, warp.as_ref());
+    assert_eq!(
+        outs.len(),
+        layout.glyphs.iter().filter(|g| g.id != 0).count() - 1,
+        "space has no outline"
+    );
+    let low_y = |els: &Vec<crate::render::PathEl>| {
+        els.iter()
+            .filter_map(|e| match e {
+                crate::render::PathEl::MoveTo(p) | crate::render::PathEl::LineTo(p) => Some(p[1]),
+                _ => None,
+            })
+            .fold(f64::MIN, f64::max)
+    };
+    assert!(low_y(&outs[0]) > low_y(&outs[outs.len() / 2]) + 5.0);
+    // Unwarped outlines stay within the flat raster's bounds.
+    let flat_outs = crate::render::outlines(&layout, &t.transform, None);
+    let r = flat.rect;
+    for els in &flat_outs {
+        for el in els {
+            if let crate::render::PathEl::MoveTo(p) | crate::render::PathEl::LineTo(p) = el {
+                assert!(
+                    p[0] >= f64::from(r.x0)
+                        && p[0] <= f64::from(r.x1)
+                        && p[1] >= f64::from(r.y0)
+                        && p[1] <= f64::from(r.y1)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn psd_round_trips_antialias_opentype_and_warp() {
+    use photocraft_doc::text::{AntiAlias, TextWarp};
+    let style = CharStyle {
+        font_family: "Inter".into(),
+        size_pt: 20.0,
+        features: vec![
+            FontFeature {
+                tag: "swsh".into(),
+                value: 1,
+            },
+            FontFeature {
+                tag: "frac".into(),
+                value: 1,
+            },
+        ],
+        discretionary_ligatures: true,
+        ..Default::default()
+    };
+    for aa in [
+        AntiAlias::Windows,
+        AntiAlias::WindowsLcd,
+        AntiAlias::Crisp,
+        AntiAlias::None,
+    ] {
+        let mut t = styled("1/2 Swash", style.clone());
+        t.antialias = aa;
+        t.warp = Some(TextWarp {
+            style: "warpFlag".into(),
+            value: -35.0,
+            horizontal_distortion: 10.0,
+            vertical_distortion: 0.0,
+            horizontal: false,
+        });
+        let bytes = crate::psd::build_tysh(&t, 72.0, None);
+        let back = crate::psd::text_layer_from_tysh(&bytes, 72.0).unwrap();
+        assert_eq!(back.antialias, aa);
+        assert_eq!(back.warp, t.warp);
+        let st = &back.char_runs()[0].style;
+        assert!(st.discretionary_ligatures);
+        let mut tags: Vec<&str> = st.features.iter().map(|f| f.tag.as_str()).collect();
+        tags.sort_unstable();
+        assert_eq!(tags, ["frac", "swsh"]);
+    }
+}

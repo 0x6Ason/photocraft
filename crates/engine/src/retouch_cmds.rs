@@ -54,7 +54,7 @@ fn parse_brush(s: &Session, p: &Value, cmd: &str) -> Result<(Stroke, LayerId)> {
         .iter()
         .filter_map(|v| {
             let a = v.as_array()?;
-            Some(StrokePoint { x: a.first()?.as_f64()?, y: a.get(1)?.as_f64()?, pressure: a.get(2).and_then(Value::as_f64).unwrap_or(1.0) as f32 })
+            Some(StrokePoint::new(a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2).and_then(Value::as_f64).unwrap_or(1.0) as f32))
         })
         .collect();
     if pts.is_empty() {

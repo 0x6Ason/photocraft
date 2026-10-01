@@ -83,11 +83,22 @@ fn main() {
                         println!("{}{key}:", "  ".repeat(depth));
                         walk(sub, depth + 1);
                     }
+                    photocraft_psd::descriptor::Value::Text(t) => println!("{}{key} = {:?}", "  ".repeat(depth), t.to_string_lossy()),
+                    photocraft_psd::descriptor::Value::List(items) if items.iter().all(|i| matches!(i, photocraft_psd::descriptor::Value::Descriptor(_))) => {
+                        println!("{}{key} = [{} items]", "  ".repeat(depth), items.len());
+                        for (i, it) in items.iter().enumerate() {
+                            if let photocraft_psd::descriptor::Value::Descriptor(sub) = it {
+                                println!("{}[{i}]:", "  ".repeat(depth + 1));
+                                walk(sub, depth + 2);
+                            }
+                        }
+                    }
                     _ => println!("{}{key} = {}", "  ".repeat(depth), format!("{v:?}").chars().take(600).collect::<String>()),
                 }
             }
         }
         for rec in file.layers() {
+            println!("-- layer {:?}", String::from_utf8_lossy(&rec.name));
             if let Some(b) = rec.block(b"lfx2").or(rec.block(b"lmfx"))
                 && let Ok((vd, _)) = photocraft_psd::descriptor::VersionedDescriptor::parse_prefix(&b.data[4..])
             {
@@ -120,6 +131,23 @@ fn main() {
         let image = photocraft_codecs::Image::from_raw((w * 3) as u32, h as u32, photocraft_codecs::ChannelLayout::Rgba, photocraft_codecs::SampleType::U8, img).unwrap();
         std::fs::write(&out, photocraft_codecs::encode(&image, photocraft_codecs::Format::Png, &Default::default()).unwrap()).unwrap();
         println!("wrote {out}");
+        return;
+    }
+    if std::env::args().nth(3).as_deref() == Some("worst") {
+        // The N worst pixels (premultiplied max channel error), with coordinates.
+        let w = doc.size.width as usize;
+        let n: usize = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(20);
+        let mut v: Vec<(f32, usize)> = ours
+            .iter()
+            .zip(&merged)
+            .enumerate()
+            .map(|(i, (a, b))| ((0..4).map(|c| (a[c] * a[3] - b[c] * b[3]).abs()).fold((a[3] - b[3]).abs(), f32::max), i))
+            .collect();
+        v.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (d, i) in v.into_iter().take(n) {
+            let (a, b) = (ours[i], merged[i]);
+            println!("({:4},{:4}) d={:5.1} ours {:?} ps {:?}", i % w, i / w, d * 255.0, a.map(|v| (v * 255.0).round()), b.map(|v| (v * 255.0).round()));
+        }
         return;
     }
     if std::env::args().nth(3).as_deref() == Some("row") {

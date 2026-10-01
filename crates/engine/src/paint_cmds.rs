@@ -42,8 +42,7 @@ fn bucket(s: &mut Session, p: &Value) -> Result<Value> {
     let filled = s.edit("Paint Bucket", |doc, active| {
         let area = doc.bounds();
         let sel = doc.selection.clone();
-        let id = active.ok_or(EngineError::Other("no active layer".into()))?;
-        let surf = crate::commands::paint_surface(doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?, p)?;
+        let (surf, _) = crate::channel_cmds::target_surface(doc, *active, p)?;
         let ok = bucket_fill(surf, area, (x, y), tol, contiguous, aa, c, opacity, sel.as_ref());
         surf.prune();
         Ok(ok)
@@ -74,8 +73,7 @@ fn gradient(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit("Gradient", |doc, active| {
         let sel = doc.selection.clone();
         let area = sel.as_ref().map(|m| m.content_bounds()).filter(|r| !r.is_empty()).unwrap_or_else(|| doc.bounds()).intersect(&doc.bounds());
-        let id = active.ok_or(EngineError::Other("no active layer".into()))?;
-        let surf = crate::commands::paint_surface(doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?, p)?;
+        let (surf, _) = crate::channel_cmds::target_surface(doc, *active, p)?;
         paint_gradient(surf, area, from, to, shape, &stops, reverse, opacity, blend, sel.as_ref());
         Ok(())
     })?;
@@ -90,7 +88,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Paint Bucket",
             menu: &[],
             shortcut: None,
-            params: r##"{"x":px,"y":px,"tolerance":0..255=32,"contiguous":bool=true,"antiAlias":bool=true,"color":"#rrggbb"=foreground,"opacity":1..100=100}"##,
+            params: r##"{"x":px,"y":px,"tolerance":0..255=32,"contiguous":bool=true,"antiAlias":bool=true,"color":"#rrggbb"=foreground,"opacity":1..100=100,"target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target}"##,
             enabled: crate::commands::has_paintable,
             run: bucket,
             journal: true,
@@ -100,7 +98,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Gradient",
             menu: &[],
             shortcut: None,
-            params: r##"{"from":[x,y],"to":[x,y],"style":"linear|radial|angle|reflected|diamond"="linear","colors":["#rrggbb",…]=[foreground,background],"reverse":bool=false,"opacity":1..100=100,"mode":"normal|multiply|…"="normal"}"##,
+            params: r##"{"from":[x,y],"to":[x,y],"style":"linear|radial|angle|reflected|diamond"="linear","colors":["#rrggbb",…]=[foreground,background],"reverse":bool=false,"opacity":1..100=100,"mode":"normal|multiply|…"="normal","target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target}"##,
             enabled: crate::commands::has_paintable,
             run: gradient,
             journal: true,

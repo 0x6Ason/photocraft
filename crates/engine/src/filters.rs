@@ -36,6 +36,13 @@ fn undefined(p: &Value) -> UndefinedAreas {
 pub fn params_for(id: &str, p: &Value) -> Option<FilterParams> {
     Some(match id {
         "filter.blur.gaussianBlur" => FilterParams::GaussianBlur { radius: f(p, "radius", 1.0).clamp(0.1, 1000.0) },
+        // One-step presets (no dialog), tuned to match Photoshop's fixed-strength filters.
+        "filter.blur.blur" => FilterParams::GaussianBlur { radius: 0.6 },
+        "filter.blur.blurMore" => FilterParams::GaussianBlur { radius: 1.4 },
+        "filter.sharpen.sharpen" => FilterParams::UnsharpMask { amount: 60.0, radius: 0.5, threshold: 0.0 },
+        "filter.sharpen.sharpenMore" => FilterParams::UnsharpMask { amount: 150.0, radius: 0.6, threshold: 0.0 },
+        "filter.sharpen.sharpenEdges" => FilterParams::UnsharpMask { amount: 100.0, radius: 0.8, threshold: 6.0 },
+        "filter.noise.despeckle" => FilterParams::SurfaceBlur { radius: 2.0, threshold: 12.0 },
         "filter.blur.boxBlur" => FilterParams::BoxBlur { radius: f(p, "radius", 1.0).clamp(1.0, 2000.0) },
         "filter.blur.motionBlur" => FilterParams::MotionBlur { angle: f(p, "angle", 0.0), distance: f(p, "distance", 10.0).clamp(1.0, 2000.0) },
         "filter.blur.radialBlur" => FilterParams::RadialBlur {
@@ -106,11 +113,35 @@ pub fn params_for(id: &str, p: &Value) -> Option<FilterParams> {
         "filter.distort.polarCoordinates" => FilterParams::PolarCoordinates {
             mode: if s(p, "mode", "rectangularToPolar") == "polarToRectangular" { PolarMode::PolarToRectangular } else { PolarMode::RectangularToPolar },
         },
-        _ => return None,
+        _ => return crate::filters_ext::params_for(id, p),
     })
 }
 
-fn has_filterable_layer(s: &Session) -> std::result::Result<(), String> {
+/// Runs filter command `id` with JSON `params` on `surf` (the pixel function behind every
+/// `filter.*` command; smart filters re-run it on re-render). `bounds` frames distortions;
+/// `selection` limits the result. Like layer filters, neighbourhood filters repeat the edge pixels
+/// of `canvas` ∪ the surface's content instead of fading in transparency, and the output is
+/// clipped to it. `None` for ids that aren't pixel filters.
+pub fn apply_filter_to_surface(
+    id: &str,
+    params: &Value,
+    surf: &photocraft_raster::Surface,
+    bounds: photocraft_geom::Rect,
+    selection: Option<&photocraft_raster::Surface>,
+    canvas: photocraft_geom::Rect,
+) -> Option<photocraft_raster::Surface> {
+    let fp = params_for(id, params)?;
+    let sel_bounds = selection.map(photocraft_raster::Surface::content_bounds);
+    let content = surf.content_bounds();
+    let area = algo::output_area(&fp, content, bounds, sel_bounds);
+    Some(algo::apply_in(surf, &fp, area, bounds, selection, canvas.union(&content)))
+}
+
+pub(crate) fn has_filterable_layer(s: &Session) -> std::result::Result<(), String> {
+    // A targeted alpha channel or Quick Mask is filtered instead of the layer (channel_cmds).
+    if crate::channel_cmds::edits_channel(s) {
+        return Ok(());
+    }
     let d = s.active().ok_or("no document open")?;
     let id = d.active_layer.ok_or("no active layer")?;
     let l = d.doc.layer(id).ok_or("no active layer")?;
@@ -121,8 +152,12 @@ fn has_filterable_layer(s: &Session) -> std::result::Result<(), String> {
     }
 }
 
-fn run_filter(s: &mut Session, id: &str, p: &Value) -> Result<Value> {
-    let fp = params_for(id, p).ok_or_else(|| EngineError::Other(format!("unknown filter {id}")))?;
+pub(crate) fn run_filter(s: &mut Session, id: &str, p: &Value) -> Result<Value> {
+    // Session state some filters read (colours) becomes explicit params; external inputs resolve here.
+    let prepared = crate::filters_ext::prepare(s, id, p);
+    let p = &prepared;
+    let mut fp = params_for(id, p).ok_or_else(|| EngineError::Other(format!("unknown filter {id}")))?;
+    crate::filters_ext::resolve(s, &mut fp, p)?;
     let layer = match p.get("layer").and_then(Value::as_u64) {
         Some(l) => photocraft_doc::LayerId(l),
         None => s.active().and_then(|d| d.active_layer).ok_or(EngineError::Other("no active layer".into()))?,
@@ -136,18 +171,30 @@ fn run_filter(s: &mut Session, id: &str, p: &Value) -> Result<Value> {
         let selection = doc.selection.clone();
         let sel_bounds = selection.as_ref().map(photocraft_raster::Surface::content_bounds);
         // Distortions centre on the selection when there is one, else the canvas.
-        let bounds = sel_bounds.filter(|b| !b.is_empty()).unwrap_or_else(|| doc.bounds());
+        let doc_bounds = doc.bounds();
+        let bounds = sel_bounds.filter(|b| !b.is_empty()).unwrap_or(doc_bounds);
+        // Neighbourhood filters repeat edge pixels at the canvas edge (or past it, where the
+        // layer has off-canvas pixels) instead of fading in transparency, as Photoshop does.
+        if let Some(surf) = crate::channel_cmds::channel_surface_for_filter(doc, p)? {
+            let content = surf.content_bounds();
+            let area = algo::output_area(&fp, content, bounds, sel_bounds);
+            *surf = algo::apply_in(surf, &fp, area, bounds, selection.as_ref(), doc_bounds.union(&content));
+            return Ok(());
+        }
         let l = doc.layer_mut(layer).ok_or(EngineError::NoLayer(layer))?;
+        crate::filters_ext::resolve_in_layer(&mut fp, l, bounds);
         let surf = match &mut l.content {
             LayerContent::Raster(surf) => surf,
-            LayerContent::Smart(sm) => {
-                sm.smart_filters.push(SmartFilter { command: id.to_string(), params: params.clone(), blend: photocraft_color::BlendMode::Normal, opacity: 1.0, visible: true });
-                sm.cache.as_mut().ok_or_else(|| EngineError::Other("smart object has no pixels".into()))?
+            LayerContent::Smart(_) => {
+                // Non-destructive: record the filter and re-render the smart object from its source.
+                let sf = SmartFilter { command: id.to_string(), params: params.clone(), blend: photocraft_color::BlendMode::Normal, opacity: 1.0, visible: true };
+                return crate::smart_cmds::add_smart_filter(doc, layer, sf, selection.as_ref());
             }
             _ => return Err(EngineError::Other("not a pixel layer".into())),
         };
-        let area = algo::output_area(&fp, surf.content_bounds(), bounds, sel_bounds);
-        *surf = algo::apply(surf, &fp, area, bounds, selection.as_ref());
+        let content = surf.content_bounds();
+        let area = algo::output_area(&fp, content, bounds, sel_bounds);
+        *surf = algo::apply_in(surf, &fp, area, bounds, selection.as_ref(), doc_bounds.union(&content));
         Ok(())
     })?;
     Ok(json!({ "layer": layer.0, "filter": serde_json::to_value(&fp).unwrap_or(Value::Null) }))
@@ -172,6 +219,12 @@ macro_rules! filter_cmd {
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         filter_cmd!("filter.blur.gaussianBlur", "Gaussian Blur…", ["Filter", "Blur"], r##"{"radius":0.1..1000=1}"##),
+        filter_cmd!("filter.blur.blur", "Blur", ["Filter", "Blur"], "{}"),
+        filter_cmd!("filter.blur.blurMore", "Blur More", ["Filter", "Blur"], "{}"),
+        filter_cmd!("filter.sharpen.sharpen", "Sharpen", ["Filter", "Sharpen"], "{}"),
+        filter_cmd!("filter.sharpen.sharpenMore", "Sharpen More", ["Filter", "Sharpen"], "{}"),
+        filter_cmd!("filter.sharpen.sharpenEdges", "Sharpen Edges", ["Filter", "Sharpen"], "{}"),
+        filter_cmd!("filter.noise.despeckle", "Despeckle", ["Filter", "Noise"], "{}"),
         filter_cmd!("filter.blur.boxBlur", "Box Blur…", ["Filter", "Blur"], r##"{"radius":1..2000=1}"##),
         filter_cmd!("filter.blur.motionBlur", "Motion Blur…", ["Filter", "Blur"], r##"{"angle":-360..360=0,"distance":1..2000=10}"##),
         filter_cmd!("filter.blur.radialBlur", "Radial Blur…", ["Filter", "Blur"], r##"{"amount":1..100=10,"method":"spin|zoom","centerX":0..1=0.5,"centerY":0..1=0.5}"##),
@@ -380,6 +433,10 @@ mod tests {
                     smart_filters: vec![],
                     cache: Some(cache),
                     psd_raw: None,
+                    filters_enabled: true,
+                    filter_mask: None,
+                    warp: None,
+                    stack_mode: None,
                 }),
             );
             *active = Some(doc.insert_above(*active, l));

@@ -15,11 +15,12 @@
 
 pub mod adjust;
 pub mod effects;
+pub mod pattern;
 pub mod psblend;
 
 use photocraft_color::blend::BlendMode;
 use psblend as blend;
-use photocraft_doc::{Document, Fill, Layer, LayerContent};
+use photocraft_doc::{Document, Fill, Layer, LayerContent, Pattern};
 use photocraft_geom::Rect;
 use photocraft_raster::{Rgba8Image, Surface};
 
@@ -75,7 +76,7 @@ pub fn render(doc: &Document, rect: Rect) -> Buffer {
 
 /// [`render`] with an explicit tile size (tests check tile independence).
 pub fn render_tiled(doc: &Document, rect: Rect, tile: i32) -> Buffer {
-    let cx = Ctx { canvas: doc.bounds(), transfer: adjust::Transfer::for_mode(doc.mode), light: doc.global_light };
+    let cx = Ctx { canvas: doc.bounds(), transfer: adjust::Transfer::for_mode(doc.mode), light: doc.global_light, patterns: &doc.patterns };
     if rect.width() as i32 <= tile && rect.height() as i32 <= tile {
         let mut buf = Buffer::transparent(rect);
         composite_stack(&doc.layers, &mut buf, &cx);
@@ -123,7 +124,7 @@ pub fn flatten(doc: &Document) -> Buffer {
 /// Render an arbitrary subset: a single layer (e.g. for thumbnails), isolated.
 pub fn render_layer(layer: &Layer, rect: Rect) -> Buffer {
     let mut buf = Buffer::transparent(rect);
-    composite_stack(std::slice::from_ref(layer), &mut buf, &Ctx { canvas: rect, transfer: adjust::Transfer::Srgb, light: photocraft_doc::GlobalLight::default() });
+    composite_stack(std::slice::from_ref(layer), &mut buf, &Ctx { canvas: rect, transfer: adjust::Transfer::Srgb, light: photocraft_doc::GlobalLight::default(), patterns: &[] });
     buf
 }
 
@@ -167,13 +168,15 @@ pub fn thumbnail(doc: &Document, max_side: u32) -> Rgba8Image {
 
 /// Composite a sibling list (bottom→top) onto `backdrop`.
 /// Rendering context shared down the tree.
-struct Ctx {
+struct Ctx<'a> {
     /// Document canvas: fill layers and gradients are laid out relative to it, never to the render rect.
     canvas: Rect,
     /// Tone transfer used by adjustments that work in linear light.
     transfer: adjust::Transfer,
     /// Global light for layer effects.
     light: photocraft_doc::GlobalLight,
+    /// The document's patterns (pattern fills and overlays).
+    patterns: &'a [Pattern],
 }
 
 fn composite_stack(layers: &[Layer], backdrop: &mut Buffer, cx: &Ctx) {
@@ -207,6 +210,7 @@ fn dissolve_noise(x: i32, y: i32) -> f32 {
 /// for fill layers).
 fn layer_bounds(layer: &Layer, canvas: Rect) -> Rect {
     match &layer.content {
+        LayerContent::Group(g) if g.artboard.is_some() => g.artboard.as_ref().map_or(Rect::EMPTY, |a| a.rect),
         LayerContent::Group(g) => g.children.iter().filter(|c| c.visible).fold(Rect::EMPTY, |acc, c| {
             let b = layer_bounds(c, canvas);
             if b.is_empty() { acc } else if acc.is_empty() { b } else { acc.union(&b) }
@@ -248,7 +252,7 @@ fn render_content(layer: &Layer, rect: Rect, cx: &Ctx) -> Option<Buffer> {
         LayerContent::Fill(f) => match &layer.fill_cache {
             // Photoshop's own rendering, valid while the fill is unchanged.
             Some(c) if c.fill == *f => surface_to_buffer(&c.surface, rect),
-            _ => render_fill(f, rect, fill_frame(layer, cx.canvas)),
+            _ => render_fill(f, rect, fill_frame(layer, cx.canvas), cx.patterns),
         },
         LayerContent::Adjustment(_) => return None,
         _ => match layer.surface() {
@@ -297,7 +301,7 @@ pub fn fill_frame(layer: &Layer, canvas: Rect) -> Rect {
     frame
 }
 
-fn render_fill(f: &Fill, rect: Rect, canvas: Rect) -> Buffer {
+fn render_fill(f: &Fill, rect: Rect, canvas: Rect, patterns: &[Pattern]) -> Buffer {
     match f {
         Fill::Solid(c) => {
             let rgb = c.to_rgb();
@@ -315,8 +319,11 @@ fn render_fill(f: &Fill, rect: Rect, canvas: Rect) -> Buffer {
             }
             b
         }
-        // Patterns render once the pattern library lands; transparent until then.
-        Fill::Pattern { .. } => Buffer::transparent(rect),
+        // Laid out from the layer's frame when linked; transparent if the pattern is missing.
+        Fill::Pattern { name, scale, id, angle, link, phase } => match photocraft_doc::pattern::find(patterns, id, name).and_then(pattern::Tile::new) {
+            Some(tile) => Buffer { rect, px: pattern::render(&tile, &pattern::Placement::new(canvas, *link, *phase, *scale, *angle), rect) },
+            None => Buffer::transparent(rect),
+        },
     }
 }
 
@@ -364,6 +371,42 @@ fn empty_in(layer: &Layer, rect: Rect) -> bool {
 
 /// Composite `layer` (plus its clipping group) onto `backdrop`.
 fn composite_layer(layer: &Layer, clipped: &[Layer], backdrop: &mut Buffer, cx: &Ctx) {
+    if let LayerContent::Group(g) = &layer.content
+        && let Some(ab) = &g.artboard
+    {
+        composite_artboard(layer, ab, clipped, backdrop, cx);
+        return;
+    }
+    composite_layer_plain(layer, clipped, backdrop, cx);
+}
+
+/// An artboard: its background and the group, composited only inside the board (contents and
+/// effects outside it are clipped away; the backdrop there is untouched).
+fn composite_artboard(layer: &Layer, ab: &photocraft_doc::Artboard, clipped: &[Layer], backdrop: &mut Buffer, cx: &Ctx) {
+    let board = ab.rect.intersect(&backdrop.rect);
+    if board.is_empty() {
+        return;
+    }
+    let (bw, w) = (board.width() as usize, backdrop.rect.width() as usize);
+    let row0 = |y: i32| (y - backdrop.rect.y0) as usize * w + (board.x0 - backdrop.rect.x0) as usize;
+    let mut sub = Buffer::transparent(board);
+    for y in board.y0..board.y1 {
+        let o = row0(y);
+        let so = (y - board.y0) as usize * bw;
+        sub.px[so..so + bw].copy_from_slice(&backdrop.px[o..o + bw]);
+    }
+    if let Some(bg) = ab.background.rgba() {
+        blend_into(&mut sub, &Buffer::filled(board, bg), BlendMode::Normal, 1.0);
+    }
+    composite_layer_plain(layer, clipped, &mut sub, cx);
+    for y in board.y0..board.y1 {
+        let o = row0(y);
+        let so = (y - board.y0) as usize * bw;
+        backdrop.px[o..o + bw].copy_from_slice(&sub.px[so..so + bw]);
+    }
+}
+
+fn composite_layer_plain(layer: &Layer, clipped: &[Layer], backdrop: &mut Buffer, cx: &Ctx) {
     let rect = backdrop.rect;
     if empty_in(layer, rect) {
         return;
@@ -456,7 +499,7 @@ fn composite_layer(layer: &Layer, clipped: &[Layer], backdrop: &mut Buffer, cx: 
             composite_atop(c, &mut content, cx);
         }
         let maps = effect_maps(layer, cx);
-        effects::composite_with_effects(layer, &content, backdrop, &maps, layer_bounds(layer, cx.canvas));
+        effects::composite_with_effects(layer, &content, backdrop, &maps, layer_bounds(layer, cx.canvas), cx.patterns);
         return;
     }
     if let Some((mut content, stroke)) = shape_parts(layer, clipped, rect, cx) {
@@ -522,6 +565,7 @@ fn layer_identity(layer: &Layer, h: &mut std::collections::hash_map::DefaultHash
             for c in &g.children {
                 layer_identity(c, h);
             }
+            format!("{:?}", g.artboard).hash(h);
         }
         LayerContent::Fill(f) => format!("{f:?}").hash(h),
         LayerContent::Adjustment(a) => format!("{a:?}").hash(h),
@@ -552,7 +596,35 @@ struct FxCache {
     bytes: usize,
 }
 
-const FX_CACHE_BUDGET: usize = 768 << 20;
+/// Default effect-cache budget (Preferences › Performance can change it).
+pub const DEFAULT_FX_CACHE_BUDGET: usize = 768 << 20;
+static FX_CACHE_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(DEFAULT_FX_CACHE_BUDGET);
+
+/// Set the memory budget (bytes) of the layer-effect map cache; entries over it are evicted
+/// oldest-first on the next build.
+pub fn set_effect_cache_budget(bytes: usize) {
+    FX_CACHE_BUDGET.store(bytes.max(1 << 20), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current effect-cache budget in bytes.
+pub fn effect_cache_budget() -> usize {
+    FX_CACHE_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bytes currently held by the effect-map cache.
+pub fn effect_cache_bytes() -> usize {
+    fx_cache().lock().unwrap_or_else(|e| e.into_inner()).bytes
+}
+
+/// Drop every cached effect map (Edit › Purge › All). Returns the bytes released.
+pub fn purge_effect_cache() -> usize {
+    let mut c = fx_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let freed = c.bytes;
+    c.map.clear();
+    c.order.clear();
+    c.bytes = 0;
+    freed
+}
 
 fn fx_cache() -> &'static std::sync::Mutex<FxCache> {
     static C: std::sync::OnceLock<std::sync::Mutex<FxCache>> = std::sync::OnceLock::new();
@@ -600,7 +672,8 @@ fn effect_maps(layer: &Layer, cx: &Ctx) -> std::sync::Arc<effects::FxMaps> {
     let maps = entry.maps.clone();
     // Evict the oldest entries over budget (never the one just used).
     let mut c = fx_cache().lock().unwrap_or_else(|e| e.into_inner());
-    while c.bytes > FX_CACHE_BUDGET && c.order.len() > 1 {
+    let budget = effect_cache_budget();
+    while c.bytes > budget && c.order.len() > 1 {
         let Some(old) = c.order.pop_front() else { break };
         if old == key {
             c.order.push_back(old);
@@ -637,7 +710,7 @@ fn composite_atop(layer: &Layer, base: &mut Buffer, cx: &Ctx) {
         let Some(content) = render_content(layer, big, cx) else { return };
         let mut opaque = Buffer { rect, px: base.px.iter().map(|p| [p[0], p[1], p[2], 1.0]).collect() };
         let maps = effect_maps(layer, cx);
-        effects::composite_with_effects(layer, &content, &mut opaque, &maps, layer_bounds(layer, cx.canvas));
+        effects::composite_with_effects(layer, &content, &mut opaque, &maps, layer_bounds(layer, cx.canvas), cx.patterns);
         for (p, o) in base.px.iter_mut().zip(&opaque.px) {
             if p[3] > 0.0 {
                 *p = [o[0], o[1], o[2], p[3]];

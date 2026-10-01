@@ -95,6 +95,13 @@ impl History {
         self.undo.len()
     }
 
+    /// Forget the most recent undo state and every redo state (Edit › Purge › Undo): the
+    /// last step can no longer be undone and its pixels are released.
+    pub fn purge_last(&mut self) -> bool {
+        self.redo.clear();
+        self.undo.pop_back().is_some()
+    }
+
     pub fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();

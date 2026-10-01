@@ -186,8 +186,8 @@ impl Clut {
             if w == 0.0 {
                 continue;
             }
-            for k in 0..o {
-                out[k] += w * self.data[off + k];
+            for (k, v) in out[..o].iter_mut().enumerate() {
+                *v += w * self.data[off + k];
             }
         }
     }

@@ -130,7 +130,30 @@ fn adjustments() -> Vec<Adjustment> {
         Adjustment::GradientMap { stops: vec![(0.0, [0.0, 0.0, 0.0]), (1.0, [1.0, 1.0, 1.0])], reverse: true },
         Adjustment::ColorBalance { shadows: [20.0, -10.0, 5.0], midtones: [-15.0, 10.0, 30.0], highlights: [0.0, 5.0, -20.0], preserve_luminosity: true },
         Adjustment::ColorBalance { shadows: [10.0, 0.0, 0.0], midtones: [0.0, 0.0, 0.0], highlights: [0.0, 0.0, 10.0], preserve_luminosity: false },
+        Adjustment::SelectiveColor { relative: true, adjustments: selective() },
+        Adjustment::SelectiveColor { relative: false, adjustments: selective() },
+        lookup(17, false, false),
+        lookup(5, true, false),
+        lookup(33, false, true),
     ]
+}
+
+fn selective() -> [[f32; 4]; 9] {
+    std::array::from_fn(|r| std::array::from_fn(|k| ((r * 4 + k) as f32 * 37.0) % 200.0 - 100.0))
+}
+
+/// A warped (non-identity) 3D LUT so interpolation differences show.
+fn lookup(n: usize, tetrahedral: bool, dither: bool) -> Adjustment {
+    let mut t = Vec::with_capacity(n * n * n * 3);
+    for b in 0..n {
+        for g in 0..n {
+            for r in 0..n {
+                let (r, g, b) = (r as f32 / (n - 1) as f32, g as f32 / (n - 1) as f32, b as f32 / (n - 1) as f32);
+                t.extend([(r * r * 0.8 + b * 0.2).min(1.0), g.sqrt(), (1.0 - r) * 0.3 + b * 0.7]);
+            }
+        }
+    }
+    Adjustment::ColorLookup { name: "test".into(), lut: Some(std::sync::Arc::new(t)), size: n as u32, tetrahedral, dither }
 }
 
 #[test]

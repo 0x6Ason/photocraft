@@ -255,3 +255,50 @@ fn adam7_idat(
     z.write_all(&raw).map_err(|e| CodecError::encode(F, e))?;
     z.finish().map_err(|e| CodecError::encode(F, e))
 }
+
+/// Writes an 8-bit palette PNG (PNG-8): `indices` row-major, `palette` RGB entries (≤ 256),
+/// optional fully transparent entry (`tRNS`). Used for Indexed Color documents.
+pub fn encode_indexed(width: u32, height: u32, indices: &[u8], palette: &[[u8; 3]], transparent: Option<u8>) -> Result<Vec<u8>, CodecError> {
+    if width == 0 || height == 0 || indices.len() != width as usize * height as usize {
+        return Err(CodecError::InvalidImage("index data does not match the size".into()));
+    }
+    if palette.is_empty() || palette.len() > 256 || indices.iter().any(|&i| usize::from(i) >= palette.len()) {
+        return Err(CodecError::InvalidImage("palette must have 1..=256 entries covering every index".into()));
+    }
+    let mut info = png::Info::with_size(width, height);
+    info.color_type = png::ColorType::Indexed;
+    info.bit_depth = png::BitDepth::Eight;
+    info.palette = Some(palette.iter().flatten().copied().collect::<Vec<u8>>().into());
+    if let Some(t) = transparent.filter(|&t| usize::from(t) < palette.len()) {
+        let mut trns = vec![255u8; usize::from(t) + 1];
+        trns[usize::from(t)] = 0;
+        info.trns = Some(trns.into());
+    }
+    let mut out = Vec::new();
+    {
+        let encoder = png::Encoder::with_info(&mut out, info).map_err(|e| CodecError::encode(F, e))?;
+        let mut writer = encoder.write_header().map_err(|e| CodecError::encode(F, e))?;
+        writer.write_image_data(indices).map_err(|e| CodecError::encode(F, e))?;
+        writer.finish().map_err(|e| CodecError::encode(F, e))?;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod indexed_tests {
+    use super::*;
+
+    #[test]
+    fn png8_roundtrips_through_the_decoder() {
+        let pal = [[255, 0, 0], [0, 0, 255], [0, 0, 0]];
+        let idx = [0u8, 1, 2, 1, 0, 2];
+        let bytes = encode_indexed(3, 2, &idx, &pal, Some(2)).unwrap();
+        let img = decode(&bytes, &Limits::default()).unwrap();
+        assert_eq!(img.dimensions(), (3, 2));
+        let px = img.convert(ChannelLayout::Rgba, SampleType::U8);
+        assert_eq!(&px.data()[..8], &[255, 0, 0, 255, 0, 0, 255, 255]);
+        assert_eq!(px.data()[11], 0, "transparent entry");
+        assert!(encode_indexed(3, 2, &[9; 6], &pal, None).is_err());
+        assert!(encode_indexed(3, 3, &idx, &pal, None).is_err());
+    }
+}

@@ -18,7 +18,7 @@ use crate::blocks;
 use crate::pixels::{interleave, max_sample, sample_for_depth, zero_sample};
 
 /// Resources that are mapped to document fields or regenerated on export.
-pub(crate) const MAPPED_RESOURCES: [u16; 16] = [
+pub(crate) const MAPPED_RESOURCES: [u16; 19] = [
     ids::GLOBAL_ANGLE,
     ids::GLOBAL_ALTITUDE,
     ids::RESOLUTION_INFO,
@@ -35,6 +35,9 @@ pub(crate) const MAPPED_RESOURCES: [u16; 16] = [
     1006, // pascal alpha names
     1069, // layer selection ids
     1072, // layer group(s) enabled id
+    crate::channel_map::DISPLAY_INFO,
+    crate::channel_map::DISPLAY_INFO_OLD,
+    crate::channel_map::QUICK_MASK_INFO,
 ];
 
 /// Blocks regenerated from document fields on export; not kept in
@@ -217,6 +220,10 @@ impl Ctx<'_> {
                 smart_filters: Vec::new(),
                 cache: Some(self.record_surface(rec, &name)),
                 psd_raw: principal(k),
+                filters_enabled: true,
+                filter_mask: None,
+                warp: rec.block(k).and_then(|b| blocks::parse_placed_warp(k, &b.data)),
+                stack_mode: None,
             })
         } else if (vector_key.is_some() && (fill_key.is_some() || rec.block(b"vstk").is_some())) || rec.block(b"vscg").is_some() {
             let fill = fill_key.and_then(|k| rec.block(k).and_then(|b| blocks::parse_fill(k, &b.data)));
@@ -287,7 +294,8 @@ impl Ctx<'_> {
                     let children = self.build(children);
                     let sd = rec.section_divider();
                     let expanded = sd.is_none_or(|s| s.kind != photocraft_psd::SectionType::ClosedFolder);
-                    let mut l = Layer::new(rec.name(), LayerContent::Group(Group { children, expanded }));
+                    let artboard = crate::comps_map::ARTBOARD_KEYS.iter().find_map(|k| rec.block(k)).and_then(|b| crate::comps_map::parse_artboard(&b.data));
+                    let mut l = Layer::new(rec.name(), LayerContent::Group(Group { children, expanded, artboard }));
                     l.psd_blocks = preserved_blocks(rec);
                     self.apply_common(&mut l, rec, sd.and_then(|s| s.blend_mode));
                     self.apply_vector_mask(&mut l, rec);
@@ -397,6 +405,7 @@ pub fn psd_to_document(file: &PsdFile) -> (Document, Vec<String>) {
     for b in &file.global_blocks {
         doc.metadata.psd_global_blocks.push((b.signature, b.key, Arc::new(b.data.clone())));
     }
+    doc.patterns = crate::pattern_map::from_global_blocks(&doc);
 
     let fmt = doc.pixel_format();
     let cc = fmt.mode.color_channels();
@@ -465,8 +474,17 @@ pub fn psd_to_document(file: &PsdFile) -> (Document, Vec<String>) {
         } else {
             cx.warn(format!("{:?} {}-bit document converted to {:?} 8-bit for editing", h.color_mode, h.depth, fmt.mode));
         }
-        if !file.color_mode_data.is_empty() {
-            cx.warn("color mode data (palette / duotone curves) is not preserved");
+        if h.color_mode == PsdMode::Indexed && file.color_mode_data.len() >= 768 {
+            // Planar palette: 256 reds, 256 greens, 256 blues (the Color Table).
+            let m = &file.color_mode_data;
+            let colors = (0..256).map(|i| [m[i], m[256 + i], m[512 + i]]).collect();
+            doc.color_table = Some(photocraft_doc::ColorTable { colors, transparent: None });
+        } else if h.color_mode == PsdMode::Duotone && !file.color_mode_data.is_empty() {
+            // The duotone ink block is undocumented: keep it raw; the image shows as its gray plate.
+            doc.duotone = Some(photocraft_doc::Duotone { inks: vec![photocraft_doc::DuotoneInk::new("Black", [0.0; 3])], psd_raw: Some(file.color_mode_data.clone()) });
+            cx.warn("duotone inks are not interpreted (shown as grayscale)");
+        } else if !file.color_mode_data.is_empty() {
+            cx.warn("color mode data is not preserved");
         }
         let rgba = file.composite_rgba8().or_else(|_| {
             // Multichannel: show the first channels as RGB.
@@ -511,9 +529,27 @@ pub fn psd_to_document(file: &PsdFile) -> (Document, Vec<String>) {
             s.write_interleaved(canvas, &be_to_ne_plane(p, depth, n));
             s.prune();
             let name = names.get(k).cloned().unwrap_or_else(|| format!("Alpha {}", k + 1));
-            doc.channels.push(AlphaChannel { name, surface: s, spot: None });
+            doc.channels.push(AlphaChannel::new(name, s));
+        }
+        // Channel options (overlay colour, opacity, colour indicates) and spot inks.
+        if let Some(r) = file.resource(crate::channel_map::DISPLAY_INFO) {
+            crate::channel_map::apply_display_info(&r.data, true, &mut doc.channels);
+        } else if let Some(r) = file.resource(crate::channel_map::DISPLAY_INFO_OLD) {
+            crate::channel_map::apply_display_info(&r.data, false, &mut doc.channels);
+        }
+        // Saved in Quick Mask mode: that channel becomes the document's Quick Mask again.
+        if let Some(r) = file.resource(crate::channel_map::QUICK_MASK_INFO)
+            && r.data.len() >= 2
+            && let Some(k) = usize::from(u16::from_be_bytes([r.data[0], r.data[1]])).checked_sub(first)
+            && k < doc.channels.len()
+        {
+            doc.quick_mask = Some(doc.channels.remove(k));
         }
     }
+
+    // Layer comps (resource 1065 + per-layer `cmls`); the raw data stays for verbatim export.
+    let raw_comps = doc.metadata.psd_resources.iter().find(|(id, _, _)| *id == crate::comps_map::LAYER_COMPS).map(|(_, _, d)| d.clone());
+    (doc.layer_comps, doc.last_applied_comp, doc.last_document_state) = crate::comps_map::comps_from_psd(raw_comps.as_deref().map(Vec::as_slice), &doc);
 
     (doc, cx.warnings)
 }

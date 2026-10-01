@@ -210,6 +210,16 @@ pub fn rich_doc(mode: ColorMode, depth: SampleType) -> Document {
             }],
             cache: Some(cache),
             psd_raw: None,
+            filters_enabled: false,
+            filter_mask: Some(LayerMask {
+                surface: Surface::with_default(PixelFormat::GRAY8, &[1.0]),
+                enabled: true,
+                linked: false,
+                density: 0.75,
+                feather: 0.0,
+            }),
+            warp: Some(photocraft_geom::warp::Warp::custom(photocraft_geom::warp::BezierMesh::identity([0.0, 0.0, 48.0, 24.0], 2, 1), [0.0, 0.0, 48.0, 24.0])),
+            stack_mode: Some(photocraft_doc::StackMode::Median),
         }),
     );
     let linked = Layer::new(
@@ -222,6 +232,10 @@ pub fn rich_doc(mode: ColorMode, depth: SampleType) -> Document {
             smart_filters: vec![],
             cache: None,
             psd_raw: Some(blob(12, 8)),
+            filters_enabled: true,
+            filter_mask: None,
+            warp: None,
+            stack_mode: None,
         }),
     );
     d.layers
@@ -229,16 +243,21 @@ pub fn rich_doc(mode: ColorMode, depth: SampleType) -> Document {
 
     let mut ch = Surface::new(PixelFormat::GRAY8.with_sample(depth));
     scribble(&mut ch, 13, false);
+    let mut alpha = AlphaChannel::new("Alpha 1", ch.clone());
+    alpha.color = Color::rgb(0.0, 0.5, 1.0);
+    alpha.opacity = 0.35;
+    alpha.indicates = photocraft_doc::ColorIndicates::SelectedAreas;
+    d.channels.push(alpha);
     d.channels.push(AlphaChannel {
-        name: "Alpha 1".into(),
-        surface: ch.clone(),
-        spot: None,
-    });
-    d.channels.push(AlphaChannel {
-        name: "Spot".into(),
-        surface: ch,
         spot: Some((Color::rgb(1.0, 0.0, 0.5), 0.7)),
+        ..AlphaChannel::new("Spot", ch.clone())
     });
+    d.quick_mask = Some(AlphaChannel::new("Quick Mask", ch));
+    let mut pat = Surface::new(PixelFormat::new(photocraft_color::ColorMode::Rgb, photocraft_color::SampleType::U16, true));
+    scribble(&mut pat, 21, false);
+    d.patterns.push(photocraft_doc::Pattern::new("$$$/Patterns/Test=Scribble", pat, 32, 24));
+    d.color_table = Some(photocraft_doc::ColorTable { colors: vec![[0, 0, 0], [255, 128, 0]], transparent: Some(1) });
+    d.duotone = Some(photocraft_doc::Duotone { inks: vec![photocraft_doc::DuotoneInk::new("Black", [0.0; 3]), photocraft_doc::DuotoneInk::new("PANTONE 151 C", [1.0, 0.5, 0.0])], psd_raw: Some(vec![1, 2, 3]) });
     d.guides = Guides {
         horizontal: vec![10.0, 20.5],
         vertical: vec![100.25],

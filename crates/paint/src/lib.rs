@@ -1,58 +1,67 @@
-//! Brush engine v1: round dabs with hardness, spacing, pressure dynamics and stroke smoothing.
+//! Brush engine: Photoshop-grade brushes (computed and sampled tips, Shape Dynamics, Scattering,
+//! Texture, Dual Brush, Color Dynamics, Transfer, Brush Pose, Noise, Wet Edges, Build-up,
+//! Smoothing) plus the dab machinery shared by the retouching tools.
 //!
 //! Strokes are data ([`Stroke`]) so they can be recorded, replayed by automation, and tested
-//! deterministically. Dabs composite with "build-up up to stroke opacity" semantics: within one stroke,
-//! coverage accumulates with `max`, so overlapping dabs don't darken beyond the stroke's opacity
-//! (Photoshop's behaviour for Opacity, versus Flow which builds up).
+//! deterministically: every jitter is a hash of the brush seed and the dab index ([`rng`]).
+//! Dabs composite with "build-up up to stroke opacity" semantics: within one stroke, coverage
+//! accumulates with flow towards each dab's opacity ceiling, and the stroke composites once at the
+//! stroke opacity (Photoshop's Opacity versus Flow).
+//!
+//! Module map: [`brush`] (the serde model), [`dynamics`] (points → dabs), [`render`] (dabs →
+//! stroke buffer → pixels), [`presets`] (built-ins), [`mixer`] (Mixer Brush), [`replace`] (Color
+//! Replacement), [`retouch`] (sequential/accumulating helpers for the retouch tools).
 #![forbid(unsafe_code)]
 
 use photocraft_geom::{Point, Rect};
-use photocraft_raster::{Surface, to_rgba};
+use photocraft_raster::Surface;
 use serde::{Deserialize, Serialize};
 
+pub mod brush;
+pub mod dynamics;
+pub mod mixer;
+pub mod presets;
+pub mod procedural;
+pub mod render;
+pub mod replace;
 pub mod retouch;
+pub mod rng;
+pub mod tile;
 
+pub use brush::{
+    BrushPreset, BrushSettings, ColorDynamics, Control, DualBrush, Dynamic, MaskMode, Pattern, PatternStyle, Pose, Scattering, ShapeDynamics, Smoothing, Texture, TipShape, Transfer,
+};
+pub use render::{BrushContext, StrokeRenderer, render_stroke};
+pub use tile::GrayTile;
+
+/// One input sample. Missing stylus data defaults to "mouse": full pressure, no tilt/rotation.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct StrokePoint {
     pub x: f64,
     pub y: f64,
     /// 0..1, 1 for mouse.
     pub pressure: f32,
+    /// Degrees -90..90 (W3C Pointer Events `tiltX`/`tiltY`).
+    pub tilt_x: f32,
+    pub tilt_y: f32,
+    /// Barrel rotation in degrees 0..360.
+    pub rotation: f32,
+    /// Airbrush stylus wheel 0..1.
+    pub wheel: f32,
+    /// Timestamp in milliseconds (airbrush build-up and smoothing catch-up).
+    pub time: f64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct BrushSettings {
-    /// Diameter in pixels.
-    pub size: f32,
-    /// 0 (soft) ..1 (hard).
-    pub hardness: f32,
-    /// Spacing between dabs as a fraction of the diameter.
-    pub spacing: f32,
-    /// Maximum coverage for the whole stroke.
-    pub opacity: f32,
-    /// Per-dab coverage.
-    pub flow: f32,
-    pub pressure_size: bool,
-    pub pressure_opacity: bool,
-    /// Straight RGBA colour (display RGB).
-    pub color: [f32; 4],
-    /// Erase instead of paint.
-    pub erase: bool,
-}
-
-impl Default for BrushSettings {
+impl Default for StrokePoint {
     fn default() -> Self {
-        Self {
-            size: 20.0,
-            hardness: 1.0,
-            spacing: 0.1,
-            opacity: 1.0,
-            flow: 1.0,
-            pressure_size: true,
-            pressure_opacity: false,
-            color: [0.0, 0.0, 0.0, 1.0],
-            erase: false,
-        }
+        Self { x: 0.0, y: 0.0, pressure: 1.0, tilt_x: 0.0, tilt_y: 0.0, rotation: 0.0, wheel: 1.0, time: 0.0 }
+    }
+}
+
+impl StrokePoint {
+    pub fn new(x: f64, y: f64, pressure: f32) -> Self {
+        Self { x, y, pressure, ..Default::default() }
     }
 }
 
@@ -62,48 +71,41 @@ pub struct Stroke {
     pub points: Vec<StrokePoint>,
 }
 
-/// A dab placed along the stroke.
+/// A dab placed along the stroke (after dynamics).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Dab {
     pub center: Point,
     pub radius: f32,
+    /// Flow: per-dab build-up amount.
     pub alpha: f32,
+    /// Radians, counter-clockwise.
+    pub angle: f32,
+    pub roundness: f32,
+    pub flip_x: bool,
+    pub flip_y: bool,
+    /// Opacity ceiling this dab builds up to (Transfer › Opacity).
+    pub opacity: f32,
+    /// Straight RGBA paint colour (Color Dynamics).
+    pub color: [f32; 4],
+    /// Texture depth for per-tip texturing.
+    pub depth: f32,
+    /// Position in the stroke (0 = first).
+    pub index: u64,
 }
 
-/// Place dabs along the polyline at `spacing × diameter` intervals, interpolating pressure.
-pub fn dabs(stroke: &Stroke) -> Vec<Dab> {
-    let b = &stroke.brush;
-    let mut out = Vec::new();
-    let Some(first) = stroke.points.first() else { return out };
-    let radius_at = |p: f32| {
-        let s = if b.pressure_size { b.size * p.clamp(0.0, 1.0) } else { b.size };
-        (s / 2.0).max(0.5)
-    };
-    let alpha_at = |p: f32| b.flow * if b.pressure_opacity { p.clamp(0.0, 1.0) } else { 1.0 };
-    out.push(Dab { center: Point::new(first.x, first.y), radius: radius_at(first.pressure), alpha: alpha_at(first.pressure) });
-    let mut carry = 0.0f64;
-    for w in stroke.points.windows(2) {
-        let (a, c) = (w[0], w[1]);
-        let (dx, dy) = (c.x - a.x, c.y - a.y);
-        let len = (dx * dx + dy * dy).sqrt();
-        if len <= 0.0 {
-            continue;
-        }
-        let mut t = carry;
-        loop {
-            let pr = a.pressure + (c.pressure - a.pressure) * (t / len) as f32;
-            let step = (radius_at(pr) as f64 * 2.0 * b.spacing.max(0.01) as f64).max(0.5);
-            t += step;
-            if t > len {
-                carry = t - len - step;
-                carry = carry.max(0.0);
-                break;
-            }
-            let f = t / len;
-            let pr = a.pressure + (c.pressure - a.pressure) * f as f32;
-            out.push(Dab { center: Point::new(a.x + dx * f, a.y + dy * f), radius: radius_at(pr), alpha: alpha_at(pr) });
-        }
+impl Dab {
+    /// A plain round dab.
+    pub fn round(center: Point, radius: f32, alpha: f32) -> Self {
+        Self { center, radius, alpha, angle: 0.0, roundness: 1.0, flip_x: false, flip_y: false, opacity: 1.0, color: [0.0, 0.0, 0.0, 1.0], depth: 1.0, index: 0 }
     }
+}
+
+/// All primary dabs of a stroke (smoothing, pose, spacing, build-up and dynamics applied).
+pub fn dabs(stroke: &Stroke) -> Vec<Dab> {
+    let mut g = dynamics::DabGenerator::new(&stroke.brush, 1.0);
+    let (mut out, mut dual) = (Vec::new(), Vec::new());
+    g.push(&stroke.points, &mut out, &mut dual);
+    g.finish(&mut out, &mut dual);
     out
 }
 
@@ -129,49 +131,7 @@ pub fn dab_coverage(d: f32, radius: f32, hardness: f32) -> f32 {
 /// Rasterize a stroke onto `target`, optionally limited by a selection (grayscale coverage surface).
 /// Returns the damaged rectangle.
 pub fn apply_stroke(target: &mut Surface, stroke: &Stroke, selection: Option<&Surface>, lock_transparency: bool) -> Rect {
-    let b = &stroke.brush;
-    if stroke.points.is_empty() {
-        return Rect::EMPTY;
-    }
-    // Accumulate stroke coverage (dabs × flow build up), then composite once at stroke opacity.
-    let (bounds, cov) = retouch::stroke_coverage(stroke);
-    let w = bounds.width() as usize;
-    let fmt = target.format();
-    let mut region = target.read_region(bounds);
-    let n = fmt.channels();
-    for (i, c) in cov.iter().enumerate() {
-        let x = bounds.x0 + (i % w) as i32;
-        let y = bounds.y0 + (i / w) as i32;
-        let sel = selection.map_or(1.0, |s| s.sample_channel(x, y, 0));
-        let k = (c * b.opacity * sel).min(1.0);
-        if k <= 0.0 {
-            continue;
-        }
-        let px = &mut region[i * n..(i + 1) * n];
-        let dst = to_rgba(&fmt, px);
-        let out = if b.erase {
-            [dst[0], dst[1], dst[2], dst[3] * (1.0 - k)]
-        } else {
-            let sa = b.color[3] * k;
-            let oa = sa + dst[3] * (1.0 - sa);
-            let mut o = [0.0f32; 4];
-            if oa > 0.0 {
-                for ch in 0..3 {
-                    o[ch] = (b.color[ch] * sa + dst[ch] * dst[3] * (1.0 - sa)) / oa;
-                }
-            }
-            o[3] = if lock_transparency { dst[3] } else { oa };
-            if lock_transparency && dst[3] <= 0.0 {
-                continue;
-            }
-            o
-        };
-        let mut enc = [0.0f32; 8];
-        photocraft_raster::from_rgba_into(&fmt, out, &mut enc);
-        px.copy_from_slice(&enc[..n]);
-    }
-    target.write_region(bounds, &region);
-    bounds
+    render_stroke(target, &stroke.brush, &stroke.points, selection, lock_transparency, 1.0)
 }
 
 /// Exponential moving-average smoothing of input points (Photoshop's "Smoothing" %, simplified).
@@ -182,7 +142,7 @@ pub fn smooth(points: &[StrokePoint], amount: f32) -> Vec<StrokePoint> {
     for p in points {
         let n = match cur {
             None => *p,
-            Some(c) => StrokePoint { x: c.x + (p.x - c.x) * a, y: c.y + (p.y - c.y) * a, pressure: p.pressure },
+            Some(c) => StrokePoint { x: c.x + (p.x - c.x) * a, y: c.y + (p.y - c.y) * a, ..*p },
         };
         out.push(n);
         cur = Some(n);
@@ -201,7 +161,7 @@ mod tests {
     fn stroke(points: &[(f64, f64)], size: f32) -> Stroke {
         Stroke {
             brush: BrushSettings { size, pressure_size: false, ..Default::default() },
-            points: points.iter().map(|&(x, y)| StrokePoint { x, y, pressure: 1.0 }).collect(),
+            points: points.iter().map(|&(x, y)| StrokePoint::new(x, y, 1.0)).collect(),
         }
     }
 
@@ -285,7 +245,7 @@ mod tests {
 
     #[test]
     fn smoothing_keeps_endpoints() {
-        let pts: Vec<StrokePoint> = (0..20).map(|i| StrokePoint { x: i as f64, y: if i % 2 == 0 { 0.0 } else { 10.0 }, pressure: 1.0 }).collect();
+        let pts: Vec<StrokePoint> = (0..20).map(|i| StrokePoint::new(i as f64, if i % 2 == 0 { 0.0 } else { 10.0 }, 1.0)).collect();
         let s = smooth(&pts, 0.8);
         assert_eq!(s.first(), pts.first());
         assert_eq!(s.last(), pts.last());
@@ -306,3 +266,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod brush_tests;

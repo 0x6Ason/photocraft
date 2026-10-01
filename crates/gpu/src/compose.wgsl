@@ -278,6 +278,86 @@ fn posterize(v: f32, n: f32) -> f32 {
     return floor(bin * 255.0 / (n - 1.0)) / 255.0;
 }
 
+// Document pixel being adjusted (for ordered dither).
+var<private> adj_px: vec2<i32>;
+
+fn lut_at(i: i32) -> f32 {
+    return textureLoad(lut_tex, vec2(i % 4096, i / 4096), 0).r;
+}
+
+fn lut3(n: i32, r: i32, g: i32, b: i32) -> vec3<f32> {
+    let i = ((b * n + g) * n + r) * 3;
+    return vec3(lut_at(i), lut_at(i + 1), lut_at(i + 2));
+}
+
+fn bayer4(p: vec2<i32>) -> f32 {
+    var m = array<f32, 16>(0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
+    return (m[(p.y & 3) * 4 + (p.x & 3)] + 0.5) / 16.0 - 0.5;
+}
+
+// compose::adjust::lut3d_sample
+fn color_lookup(c: vec3<f32>, n: i32, tetra: bool) -> vec3<f32> {
+    let m = f32(n - 1);
+    let pos = clamp(c, vec3(0.0), vec3(1.0)) * m;
+    let i0 = min(vec3<i32>(floor(pos)), vec3(n - 2));
+    let f = pos - vec3<f32>(i0);
+    let r = i0.x;
+    let g = i0.y;
+    let b = i0.z;
+    if (tetra) {
+        let c000 = lut3(n, r, g, b);
+        let c111 = lut3(n, r + 1, g + 1, b + 1);
+        if (f.x > f.y) {
+            if (f.y > f.z) {
+                return (1.0 - f.x) * c000 + (f.x - f.y) * lut3(n, r + 1, g, b) + (f.y - f.z) * lut3(n, r + 1, g + 1, b) + f.z * c111;
+            } else if (f.x > f.z) {
+                return (1.0 - f.x) * c000 + (f.x - f.z) * lut3(n, r + 1, g, b) + (f.z - f.y) * lut3(n, r + 1, g, b + 1) + f.y * c111;
+            }
+            return (1.0 - f.z) * c000 + (f.z - f.x) * lut3(n, r, g, b + 1) + (f.x - f.y) * lut3(n, r + 1, g, b + 1) + f.y * c111;
+        }
+        if (f.z > f.y) {
+            return (1.0 - f.z) * c000 + (f.z - f.y) * lut3(n, r, g, b + 1) + (f.y - f.x) * lut3(n, r, g + 1, b + 1) + f.x * c111;
+        } else if (f.z > f.x) {
+            return (1.0 - f.y) * c000 + (f.y - f.z) * lut3(n, r, g + 1, b) + (f.z - f.x) * lut3(n, r, g + 1, b + 1) + f.x * c111;
+        }
+        return (1.0 - f.y) * c000 + (f.y - f.x) * lut3(n, r, g + 1, b) + (f.x - f.z) * lut3(n, r + 1, g + 1, b) + f.z * c111;
+    }
+    let c00 = mix(lut3(n, r, g, b), lut3(n, r + 1, g, b), f.x);
+    let c10 = mix(lut3(n, r, g + 1, b), lut3(n, r + 1, g + 1, b), f.x);
+    let c01 = mix(lut3(n, r, g, b + 1), lut3(n, r + 1, g, b + 1), f.x);
+    let c11 = mix(lut3(n, r, g + 1, b + 1), lut3(n, r + 1, g + 1, b + 1), f.x);
+    return mix(mix(c00, c10, f.y), mix(c01, c11, f.y), f.z);
+}
+
+// compose::adjust::selective_color (ranges × CMYK percentages in LUT row 0)
+fn selective_color(c: vec3<f32>, relative: bool) -> vec3<f32> {
+    let mx = max(max(c.r, c.g), c.b);
+    let mn = min(min(c.r, c.g), c.b);
+    let md = c.r + c.g + c.b - mx - mn;
+    var w: array<f32, 9>;
+    w[0] = select(0.0, mx - md, c.r >= mx);
+    w[1] = select(0.0, md - mn, c.b <= mn);
+    w[2] = select(0.0, mx - md, c.g >= mx);
+    w[3] = select(0.0, md - mn, c.r <= mn);
+    w[4] = select(0.0, mx - md, c.b >= mx);
+    w[5] = select(0.0, md - mn, c.g <= mn);
+    w[6] = max((mn - 0.5) * 2.0, 0.0);
+    w[7] = clamp(1.0 - abs(mx - 0.5) - abs(mn - 0.5), 0.0, 1.0);
+    w[8] = max((0.5 - mx) * 2.0, 0.0);
+    var delta = vec3(0.0);
+    for (var r = 0; r < 9; r++) {
+        if (w[r] <= 0.0) { continue; }
+        let k = lut_at(r * 4 + 3) / 100.0;
+        for (var i = 0; i < 3; i++) {
+            let a = lut_at(r * 4 + i) / 100.0;
+            var d = a + k;
+            if (relative) { d = d * (1.0 - c[i]); }
+            delta[i] += d * w[r];
+        }
+    }
+    return clamp(c - delta, vec3(0.0), vec3(1.0));
+}
+
 fn adjust(c: vec3<f32>) -> vec3<f32> {
     let p0 = op.p0;
     let p1 = op.p1;
@@ -369,6 +449,12 @@ fn adjust(c: vec3<f32>) -> vec3<f32> {
                 let l1 = max(gray(o), 1e-6);
                 return clamp(o * l / l1, vec3(0.0), vec3(1.0));
             }
+            return o;
+        }
+        case 15: { return selective_color(c, p0.x > 0.5); }                       // Selective color
+        case 16: {                                                             // Color lookup (3D LUT)
+            var o = color_lookup(c, i32(p0.x), p0.y > 0.5);
+            if (p0.z > 0.5) { o = clamp(o + bayer4(adj_px) / 255.0, vec3(0.0), vec3(1.0)); }
             return o;
         }
         default: { return c; }
@@ -466,8 +552,10 @@ fn fs_atop(in: VOut) -> @location(0) vec4<f32> {
 // Adjustment applied to A (transparent pixels untouched).
 @fragment
 fn fs_adjust(in: VOut) -> @location(0) vec4<f32> {
-    let c = textureLoad(tex_a, local(in.pos), 0);
+    let p = local(in.pos);
+    let c = textureLoad(tex_a, p, 0);
     if (c.a <= 0.0) { return c; }
+    adj_px = doc_px(p);
     return vec4(adjust(c.rgb), c.a);
 }
 
