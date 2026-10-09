@@ -105,13 +105,16 @@ fn undo_redo_and_last_document_state() {
 #[test]
 fn ordinary_layout_edits_become_the_last_document_state() {
     for depth in [8, 16, 32] {
-        for params in [json!({"visible": false}), json!({"opacity": 0.25}), json!({"blend": "multiply"})] {
+        for (command, mut params) in [
+            ("layer.translate", json!({"dx": 9, "dy": 3})),
+            ("layer.setProps", json!({"visible": false})),
+            ("layer.setProps", json!({"opacity": 0.25})),
+            ("layer.setProps", json!({"blend": "multiply"})),
+        ] {
             let (mut s, a, _) = session(depth);
             s.execute("layerComp.new", json!({})).unwrap();
-            let mut params = params;
             params["layer"] = json!(a.0);
-            s.execute("layer.setProps", params).unwrap();
-            s.execute("layer.translate", json!({"layer": a.0, "dx": 9, "dy": 3})).unwrap();
+            s.execute(command, params).unwrap();
             let edited = capture_states(doc(&s));
             s.execute("layerComp.apply", json!({})).unwrap();
             assert_ne!(capture_states(doc(&s)), edited);
