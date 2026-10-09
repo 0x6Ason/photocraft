@@ -730,7 +730,6 @@ fn save_for_web(s: &mut Session, p: &Value) -> Result<Value> {
         .collect();
     let single = p.get("path").and_then(Value::as_str).filter(|v| !v.is_empty());
     let dir = p.get("dir").and_then(Value::as_str).filter(|v| !v.is_empty());
-    s.file_menu.last_web = Some(p.clone());
     // Estimate only (the dialog's annotations): the whole image, or each chosen slice.
     if single.is_none() && dir.is_none() {
         let o = optimize(&buf.px, bw, wdoc.bounds(), &st, icc, xmp.as_deref(), dpi, false)?;
@@ -739,6 +738,7 @@ fn save_for_web(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(path) = single.filter(|_| dir.is_none() && (all.len() == 1 || p.get("slices").is_none())) {
         let o = optimize(&buf.px, bw, wdoc.bounds(), &st, icc, xmp.as_deref(), dpi, false)?;
         write_file(path, &o.bytes)?;
+        s.file_menu.last_web = Some(p.clone());
         crate::automate_cmds::fire_event(s, "export");
         return Ok(json!({"files": [path], "bytes": o.bytes.len(), "width": o.width, "height": o.height, "colors": o.colors}));
     }
@@ -827,6 +827,7 @@ fn save_for_web(s: &mut Session, p: &Value) -> Result<Value> {
         write_file(&hp, page.as_bytes())?;
         html_path = Some(hp);
     }
+    s.file_menu.last_web = Some(p.clone());
     crate::automate_cmds::fire_event(s, "export");
     Ok(json!({"files": files, "html": html_path, "bytes": total, "slices": chosen.len(), "width": wdoc.size.width, "height": wdoc.size.height}))
 }

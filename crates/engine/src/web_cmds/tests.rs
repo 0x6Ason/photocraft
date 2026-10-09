@@ -58,6 +58,30 @@ fn estimates_every_format_at_every_depth() {
 }
 
 #[test]
+fn only_successful_exports_replace_the_last_web_settings() {
+    for depth in [8, 16, 32] {
+        let mut s = session(depth);
+        let dir = tmp(&format!("last-settings-{depth}"));
+        let saved = json!({"format": "png24", "path": format!("{dir}/saved.png"), "percent": 50});
+        s.execute("file.export.saveForWebLegacy", saved.clone()).unwrap();
+        assert_eq!(s.file_menu.last_web.as_ref(), Some(&saved));
+        // Opening/previewing and then cancelling must not commit new settings.
+        s.execute("file.export.saveForWebLegacy", json!({"format": "gif", "colors": 8})).unwrap();
+        assert_eq!(s.file_menu.last_web.as_ref(), Some(&saved));
+        // A file where a directory is needed makes both export routes fail reliably.
+        let blocked = format!("{dir}/not-a-directory");
+        std::fs::write(&blocked, b"keep").unwrap();
+        for p in [json!({"format": "gif", "path": format!("{blocked}/image.gif")}), json!({"format": "gif", "dir": blocked, "html": true})] {
+            assert!(s.execute("file.export.saveForWebLegacy", p).is_err());
+            assert_eq!(s.file_menu.last_web.as_ref(), Some(&saved));
+        }
+        let slices = json!({"format": "gif", "dir": dir, "html": true});
+        s.execute("file.export.saveForWebLegacy", slices.clone()).unwrap();
+        assert_eq!(s.file_menu.last_web.as_ref(), Some(&slices));
+    }
+}
+
+#[test]
 fn gif_and_png8_keep_transparency_and_palette() {
     let dir = tmp("gif");
     let mut s = session(8);

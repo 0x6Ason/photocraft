@@ -183,11 +183,12 @@ pub fn open_web(app: &mut PhotocraftApp) -> u64 {
     f.insert("__web".into(), json!(true));
     f.insert("__label".into(), json!("Save for Web (Legacy)"));
     f.insert("__view".into(), json!("2up"));
-    // Start from the last settings, like Photoshop.
+    // Reuse the last successful export's encoding settings, not another document's size,
+    // output location or selected slice numbers. Each dialog starts at the current image size.
     let last = app.session.file_menu.last_web.clone().unwrap_or_else(|| json!({"format": "jpeg", "quality": 60}));
     if let Value::Object(m) = last {
         for (k, v) in m {
-            if !matches!(k.as_str(), "path" | "dir") {
+            if !matches!(k.as_str(), "path" | "dir" | "width" | "height" | "percent" | "numbers") {
                 f.insert(k, v);
             }
         }
@@ -757,6 +758,26 @@ mod tests {
         let d = app.ui.dialog_mut(r["dialog"].as_u64().unwrap()).unwrap();
         assert_eq!(d.fields["format"], "gif");
         assert!(!d.fields.contains_key("path"));
+    }
+
+    #[test]
+    fn save_for_web_uses_the_current_documents_size() {
+        let (mut app, ctx) = app();
+        app.session.file_menu.last_web = Some(json!({
+            "format": "jpeg", "quality": 82, "width": 48, "height": 32, "percent": 50,
+            "path": "previous.jpg", "dir": "previous", "numbers": [3]
+        }));
+        app.run("file.new", json!({"width": 32, "height": 24})).unwrap();
+        let r = crate::menus::invoke(&mut app, &ctx, "file.export.saveForWebLegacy", json!({})).unwrap();
+        let fields = app.ui.dialog_mut(r["dialog"].as_u64().unwrap()).unwrap().fields.clone();
+        assert_eq!(fields["quality"], 82);
+        assert_eq!(fields["percent"], 100.0);
+        for key in ["path", "dir", "width", "height", "numbers"] {
+            assert!(!fields.contains_key(key), "{key} belongs to the previous document");
+        }
+        let estimate = app.run("file.export.saveForWebLegacy", params(&fields)).unwrap();
+        assert_eq!(estimate["width"], 32);
+        assert_eq!(estimate["height"], 24);
     }
 
     #[test]
