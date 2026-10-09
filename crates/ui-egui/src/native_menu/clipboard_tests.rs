@@ -134,7 +134,8 @@ fn native_paste_release_ownership_follows_rebound_shortcuts() {
     app.run("edit.copy", json!({})).unwrap();
     app.sync_views();
     let events = install(&mut app);
-    app.run("edit.keyboardShortcuts", json!({"set": {"edit.paste": "F6", "view.zoomIn": "Cmd+V"}})).unwrap();
+    // Shell commands use the same opt-in as the Keyboard Shortcuts dialog.
+    app.run("edit.keyboardShortcuts", json!({"set": {"edit.paste": "F6", "view.zoomIn": "Cmd+V"}, "allowUnknown": true})).unwrap();
     sync(&mut app, &ctx);
     key(&events, "Cmd+V");
     frame(&mut app, &ctx, vec![release("Cmd+V")]);
@@ -147,7 +148,7 @@ fn native_paste_release_ownership_follows_rebound_shortcuts() {
 
     // Removing the last native ⌘V binding restores the non-native image fallback. This is
     // important for commands assigned to ⌘V that do not have a native menu item.
-    app.run("edit.keyboardShortcuts", json!({"set": {"view.zoomIn": "", "tools.swapColors": "Cmd+V"}})).unwrap();
+    app.run("edit.keyboardShortcuts", json!({"set": {"view.zoomIn": "", "tools.swapColors": "Cmd+V"}, "allowUnknown": true})).unwrap();
     sync(&mut app, &ctx);
     frame(&mut app, &ctx, vec![release("Cmd+V")]);
     assert_ran(&ctx, &["tools.swapColors"]);
