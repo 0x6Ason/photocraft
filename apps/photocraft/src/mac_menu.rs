@@ -220,12 +220,12 @@ pub fn install(ctx: &egui::Context, app: &photocraft_ui_egui::PhotocraftApp) -> 
     let bar = native_menu::photocraft_layout(&photocraft_ui_egui::menus::menu_items(app), lang, language).bar;
     // Never crash for a menu: if AppKit refuses, keep the in-window menus.
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut menu = MacMenu::new(ctx);
-        menu.sync(&bar);
+        let mut menu = native_menu::NativeMenu::new(Box::new(MacMenu::new(ctx)));
+        menu.sync_bar(&bar);
         menu
     }));
     match built {
-        Ok(menu) => Some(native_menu::NativeMenu::new(Box::new(menu))),
+        Ok(menu) => Some(menu),
         Err(_) => {
             log::warn!("couldn't install the macOS menu bar; using the in-window menus");
             None

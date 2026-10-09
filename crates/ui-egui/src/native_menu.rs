@@ -618,6 +618,8 @@ pub trait Backend {
 /// The native menu bar, while PhotoCraft uses one (the in-window menus are hidden then).
 pub struct NativeMenu {
     backend: Box<dyn Backend>,
+    /// Key equivalents installed in the native menu, including disabled items.
+    key_equivalents: Vec<egui::KeyboardShortcut>,
     /// Hash of the state the menus were last built from.
     state: Option<u64>,
     clicks: Vec<String>,
@@ -628,7 +630,24 @@ pub struct NativeMenu {
 
 impl NativeMenu {
     pub fn new(backend: Box<dyn Backend>) -> NativeMenu {
-        NativeMenu { backend, state: None, clicks: Vec::new(), dirty: true, logged: false }
+        NativeMenu { backend, key_equivalents: Vec::new(), state: None, clicks: Vec::new(), dirty: true, logged: false }
+    }
+
+    /// Install/update the bar and remember which keys AppKit owns. The clipboard's image-paste
+    /// fallback must not turn their key releases into additional presses (#1638).
+    pub fn sync_bar(&mut self, bar: &MenuBar) {
+        self.key_equivalents = bar
+            .items()
+            .into_iter()
+            .filter_map(|it| it.shortcut.as_deref())
+            .filter(|sc| Chord::parse(sc).is_some_and(|c| c.native_ok()))
+            .filter_map(crate::shortcuts::parse)
+            .collect();
+        self.backend.sync(bar);
+    }
+
+    pub(crate) fn owns_key(&self, key: Key, modifiers: Modifiers) -> bool {
+        self.key_equivalents.iter().any(|sc| crate::shortcuts::key_matches(sc, key, modifiers))
     }
 
     /// Before egui sees this frame's input: key equivalents become the key presses they were,
@@ -701,7 +720,7 @@ pub fn sync(app: &mut PhotocraftApp, ctx: &egui::Context) {
         }
         menu.logged = true;
     }
-    menu.backend.sync(&layout.bar);
+    menu.sync_bar(&layout.bar);
     menu.state = Some(state);
     menu.dirty = false;
 }
@@ -726,6 +745,9 @@ fn state_hash(app: &PhotocraftApp, input: Option<u64>) -> u64 {
     s.prefs().interface.language.hash(&mut h);
     h.finish()
 }
+
+#[cfg(test)]
+mod clipboard_tests;
 
 #[cfg(test)]
 mod tests {
