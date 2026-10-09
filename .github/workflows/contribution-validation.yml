@@ -1,0 +1,83 @@
+name: October contribution validation
+
+on:
+  push:
+    branches: [validation/oct9-contributions]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  command-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: contribution-command-checks
+      - name: Check command parity and adversarial input on each submitted engine change
+        run: |
+          for revision in 763271bb54b06b3d2ac3120105da653904d764d2 8d6b1c13bead6b8bb7011c14a7349561d8b40d88 3780d03ae5bf8880783ff74fa72b5c4ada1dc3d0; do
+            git checkout --detach "$revision"
+            cargo xtask parity
+            git diff --exit-code -- docs/parity.md
+            cargo test -p photocraft-engine --test panic_hunt -- --ignored
+          done
+
+  panel-screenshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      WGPU_BACKEND: vulkan
+      XDG_RUNTIME_DIR: /tmp/photocraft-runtime
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: contribution-panel-screenshots
+      - name: Install offscreen rendering dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev mesa-vulkan-drivers
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+      - name: Render the same tab click on the base and submitted change
+        run: |
+          cp .github/validation/oct9_dock_snapshots.rs "$RUNNER_TEMP/dock-snapshots.rs"
+          for revision in e2bb2bd68106a7b40316a36ae4b8d5d44cb5f76d 30ad60e382bd337ea75e9c6e8b82e7f6fa19122d; do
+            git checkout --detach "$revision"
+            python3 - <<'PY'
+          from pathlib import Path
+          import os
+          path = Path('crates/ui-egui/src/dock_tests.rs')
+          source = path.read_text()
+          old = 'Harness::builder().with_size(size).with_step_dt(1.0 / 60.0).build_ui_state('
+          assert source.count(old) == 1
+          source = source.replace(old, 'Harness::builder().with_size(size).with_step_dt(1.0 / 60.0).wgpu().build_ui_state(')
+          source += Path(os.environ['RUNNER_TEMP'], 'dock-snapshots.rs').read_text()
+          path.write_text(source)
+          PY
+            PHOTOCRAFT_DOCK_SNAPSHOTS="$RUNNER_TEMP/panel-evidence/$revision" cargo test -p photocraft-ui-egui oct9_render_collapsed_panel_click -- --ignored --nocapture
+            git restore crates/ui-egui/src/dock_tests.rs
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: collapsed-panel-before-after
+          path: ${{ runner.temp }}/panel-evidence/
+          if-no-files-found: error
+          retention-days: 30
