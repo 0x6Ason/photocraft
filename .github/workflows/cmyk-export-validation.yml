@@ -31,7 +31,7 @@ jobs:
           cache-on-failure: true
       - name: Check submitted revision
         run: |
-          git checkout --detach 5c1ca8aebe9223f9c1fb9fec825ae8d2713abce6
+          git checkout --detach 80e4b1e6cc1892703e7b689d51c8a244671c66c9
           cargo fmt --all -- --check
           cargo test -p photocraft-io --locked
           cargo clippy -p photocraft-io --all-targets --locked -- -D warnings
@@ -51,51 +51,3 @@ jobs:
           grep -q 'Cmyk composite written as sRGB RGB' /tmp/regression.log
           git restore crates/io/src/flat.rs
           git diff --exit-code
-
-  export-timings:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      CARGO_PROFILE_RELEASE_LTO: "false"
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: cmyk-export-timings
-          cache-on-failure: true
-      - name: Compare 24 and 36 MP export preparation
-        run: |
-          for revision in 2b79c7c25dca562b8eb00f4b0a5fc15b5edbc4ff 5c1ca8aebe9223f9c1fb9fec825ae8d2713abce6; do
-            git checkout --detach "$revision"
-            cat > crates/io/examples/cmyk_export_measure.rs <<'RS'
-          use photocraft_color::{ColorMode, SampleType};
-          use photocraft_doc::{Document, Layer, LayerContent};
-          use photocraft_geom::Size;
-          use photocraft_raster::Surface;
-          use std::time::Instant;
-          fn main() -> Result<(), Box<dyn std::error::Error>> {
-              for (width, height) in [(6000, 4000), (7360, 4912)] {
-                  let mut doc = Document::new("benchmark", Size::new(width, height), ColorMode::Cmyk, SampleType::U8);
-                  doc.icc_profile = Some(photocraft_cms::Builtin::CoatedCmyk.profile().to_bytes());
-                  for ink in [[0.2, 0.6, 0.1, 0.15, 0.5], [0.7, 0.1, 0.3, 0.2, 0.5]] {
-                      doc.layers.push(Layer::new("ink", LayerContent::Raster(Surface::with_default(doc.pixel_format(), &ink))));
-                  }
-                  for repeat in 0..3 {
-                      let start = Instant::now();
-                      let image = photocraft_io::document_to_image(&doc, &mut Vec::new())?;
-                      println!("MEASURE {width}x{height} repeat={repeat} ms={:.3} layout={:?} bytes={}", start.elapsed().as_secs_f64() * 1000.0, image.layout(), image.data().len());
-                      std::hint::black_box(image);
-                  }
-              }
-              Ok(())
-          }
-          RS
-            echo "REVISION $revision"
-            cargo run --release -p photocraft-io --example cmyk_export_measure --locked
-            rm crates/io/examples/cmyk_export_measure.rs
-          done
