@@ -178,12 +178,15 @@ fn layered_cmyk_jpeg_mattes_in_ink_space_and_keeps_profile() {
         // JPEG has no alpha: CMYK white is zero ink, so each channel is multiplied by alpha.
         let a = alpha.to_normalized();
         let j = jpeg.to_normalized();
-        for (source, actual) in a.chunks_exact(5).zip(j.chunks_exact(4)) {
+        for (source, actual) in a.as_chunks::<5>().0.iter().zip(j.as_chunks::<4>().0) {
             for (ink, got) in source[..4].iter().zip(actual) {
                 assert!((ink * source[4] - got).abs() < 3.0 / 255.0, "{depth:?}: {source:?} -> {actual:?}");
             }
         }
-        assert!(j.chunks_exact(4).enumerate().filter(|(i, _)| i % 48 >= 32).all(|(_, p)| p.iter().all(|v| *v == 0.0)), "empty pixels become paper white");
+        assert!(
+            j.as_chunks::<4>().0.iter().enumerate().filter(|(i, _)| i % 48 >= 32).all(|(_, p)| p.iter().all(|v| *v == 0.0)),
+            "empty pixels become paper white"
+        );
     }
 }
 
