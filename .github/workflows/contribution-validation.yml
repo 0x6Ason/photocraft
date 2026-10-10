@@ -27,8 +27,44 @@ jobs:
           key: contribution-command-checks
       - name: Validate the submitted PR revision
         run: |
-          git checkout --detach 031990612e6070df5889d0346b32cc6823002922
+          git checkout --detach 3809675f8f39f0d376dd55c1668466845492f213
           cargo test -p photocraft-engine --lib filters::
           cargo test -p photocraft-engine --test panic_hunt -- --ignored
+          cargo test -p photocraft-ui-egui --lib filter_dialog::tests::core_filter_previews_keep_minimum_settings_after_downsampling
           cargo xtask parity
           git diff --exit-code -- docs/parity.md
+      - name: Render filter preview evidence
+        env:
+          XDG_RUNTIME_DIR: /tmp
+        run: |
+          python3 - <<'PY'
+          import struct, zlib
+          from pathlib import Path
+          width, height = 3000, 2000
+          rows = []
+          for y in range(height):
+              row = bytearray([0])
+              for x in range(width):
+                  row.extend((240, 180, 30) if (x // 5 + y // 7) % 2 else (25, 70, 145))
+              rows.append(row)
+          def chunk(kind, data):
+              return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+          png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+          png += chunk(b'IDAT', zlib.compress(b''.join(rows))) + chunk(b'IEND', b'')
+          Path('/tmp/filter-pattern.png').write_bytes(png)
+          PY
+          script='[["engine.execute",{"command":"prefs.set","params":{"path":"dialogs","value":{"filter.pixelate.mosaic":{"cellSize":2}}}}],["ui.menu.invoke",{"id":"filter.pixelate.mosaic"}]]'
+          for revision in c2907e6fd022c4f11c3d5eed284c68d769093bf3 3809675f8f39f0d376dd55c1668466845492f213; do
+            git checkout --detach "$revision"
+            cargo run -p photocraft-ui-egui --example snapshot -- --out "/tmp/preview-$revision.png" --size 1100x760 --scale 1 --open /tmp/filter-pattern.png --script "$script" --settle-ms 3000
+          done
+          python3 - <<'PY'
+          import base64
+          from pathlib import Path
+          for path in sorted(Path('/tmp').glob('preview-*.png')):
+              print('BEGIN_PNG ' + path.name)
+              encoded = base64.b64encode(path.read_bytes()).decode()
+              for i in range(0, len(encoded), 4096):
+                  print('PNG_DATA ' + encoded[i:i+4096])
+              print('END_PNG ' + path.name)
+          PY
