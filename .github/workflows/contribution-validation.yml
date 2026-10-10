@@ -25,6 +25,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: contribution-command-checks
+          cache-on-failure: true
+      - name: Install software Vulkan for offscreen snapshots
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers
       - name: Validate the submitted PR revision
         run: |
           git checkout --detach 3809675f8f39f0d376dd55c1668466845492f213
