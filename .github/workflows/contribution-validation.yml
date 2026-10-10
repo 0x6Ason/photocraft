@@ -1,0 +1,34 @@
+name: Core filter contribution validation
+
+on:
+  push:
+    branches: [validation/oct10-core-filters]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  command-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: contribution-command-checks
+      - name: Validate the submitted PR revision
+        run: |
+          git checkout --detach 031990612e6070df5889d0346b32cc6823002922
+          cargo test -p photocraft-engine --lib filters::
+          cargo test -p photocraft-engine --test panic_hunt -- --ignored
+          cargo xtask parity
+          git diff --exit-code -- docs/parity.md
